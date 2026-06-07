@@ -38,6 +38,8 @@ DEFAULT_OVERSHOOT = 6.0
 DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
 DEFAULT_FLOOR_MAX = 80.0
+DEFAULT_FLOOR_TARGET = 74.0
+FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 
 
 def compute_target(outdoor: float, base: float, overshoot: float,
@@ -148,38 +150,81 @@ class OutdoorResetController:
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
             entity_id = f"climate.{zone_name}_{zone_name}"
-            offset = self.params.zone_offsets.get(zone_name, 0.0)
-            zone_target = self.zone_target(offset)
 
-            # Safety cap: check floor temp
+            # Read current floor temp
             floor_entity_id = f"sensor.{zone_name}_floor_temperature"
             floor_state = self.hass.states.get(floor_entity_id)
+            floor_temp = None
             if floor_state and floor_state.state not in ("unavailable", "unknown"):
                 try:
                     floor_temp = float(floor_state.state)
-                    if floor_temp >= self.params.floor_max:
-                        _LOGGER.warning(
-                            "Floor temp %.1f°F >= max %.1f°F for %s, turning off",
-                            floor_temp, self.params.floor_max, zone_name,
-                        )
-                        await self.hass.services.async_call(
-                            "climate", "turn_off",
-                            {"entity_id": entity_id},
-                            blocking=True,
-                        )
-                        continue
                 except (ValueError, TypeError):
                     pass
 
+            # Safety cap: turn off if floor exceeds max
+            if floor_temp is not None and floor_temp >= self.params.floor_max:
+                _LOGGER.warning(
+                    "Floor temp %.1f°F >= max %.1f°F for %s, turning off",
+                    floor_temp, self.params.floor_max, zone_name,
+                )
+                await self.hass.services.async_call(
+                    "climate", "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=True,
+                )
+                continue
+
+            # Determine setpoint based on control mode
+            floor_mode = self.params.floor_control_enabled.get(zone_name, False)
+
+            if floor_mode:
+                # Floor control mode: target a specific floor temperature
+                floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                zone_target = self._compute_floor_mode_setpoint(
+                    floor_temp, floor_target, zone_name
+                )
+            else:
+                # Room control mode: use outdoor reset curve + offset
+                offset = self.params.zone_offsets.get(zone_name, 0.0)
+                zone_target = self.zone_target(offset)
+
             _LOGGER.debug(
-                "Setting %s to %.1f°F (outdoor=%.1f, base_target=%.1f, offset=%.1f)",
-                zone_name, zone_target, outdoor, target, offset,
+                "Setting %s to %.1f°F (mode=%s, outdoor=%.1f)",
+                zone_name, zone_target, "floor" if floor_mode else "room", outdoor,
             )
             await self.hass.services.async_call(
                 "climate", "set_temperature",
                 {"entity_id": entity_id, "temperature": zone_target, "hvac_mode": "heat"},
                 blocking=True,
             )
+
+    def _compute_floor_mode_setpoint(
+        self, floor_temp: float | None, floor_target: float, zone_name: str
+    ) -> float:
+        """Compute the THM room setpoint to achieve a desired floor temperature.
+
+        Since the THM controls based on room temp, we adjust the room setpoint
+        to drive the floor to the desired temperature:
+        - Floor below target: set room setpoint higher to call for more heat
+        - Floor at target: set room setpoint to maintain
+        - Floor above target: reduce room setpoint to let it coast down
+        """
+        if floor_temp is None:
+            return floor_target + FLOOR_CONTROL_GAIN
+
+        error = floor_target - floor_temp
+        if error > 1.0:
+            # Floor is cold — drive harder
+            setpoint = floor_target + FLOOR_CONTROL_GAIN
+        elif error < -1.0:
+            # Floor is too warm — back off
+            setpoint = floor_target - 2.0
+        else:
+            # Floor is close to target — maintain
+            setpoint = floor_target + 1.0
+
+        # Clamp to reasonable range
+        return round(max(65.0, min(setpoint, self.params.floor_max - 2)), 1)
 
 
 class OutdoorResetParams:
@@ -193,6 +238,8 @@ class OutdoorResetParams:
         self.design_outdoor: float = DEFAULT_DESIGN_OUTDOOR
         self.floor_max: float = DEFAULT_FLOOR_MAX
         self.zone_offsets: dict[str, float] = {}
+        self.floor_control_enabled: dict[str, bool] = {}
+        self.floor_targets: dict[str, float] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +299,12 @@ def get_number_entities(
                 f"Zone Offset: {thm.name}", 0, -5, 5, 0.5,
             )
         )
+        entities.append(
+            OutdoorResetFloorTargetEntity(
+                coordinator, controller, zone_name,
+                f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, 80, 0.5,
+            )
+        )
 
     return entities
 
@@ -278,8 +331,14 @@ def get_switch_entities(
     coordinator: SensorlinxCoordinator,
     controller: OutdoorResetController,
 ) -> list[SwitchEntity]:
-    """Return the enable/disable switch."""
-    return [OutdoorResetEnableSwitch(coordinator, controller)]
+    """Return the enable/disable switch and per-zone floor mode switches."""
+    entities: list[SwitchEntity] = [OutdoorResetEnableSwitch(coordinator, controller)]
+    for thm in coordinator.get_thm_devices():
+        zone_name = thm.name.lower().replace(" ", "_")
+        entities.append(
+            OutdoorResetFloorModeSwitch(coordinator, controller, zone_name, thm.name)
+        )
+    return entities
 
 
 # ---------------------------------------------------------------------------
@@ -532,4 +591,97 @@ class OutdoorResetEnableSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.enabled = False
+        self.async_write_ha_state()
+
+
+class OutdoorResetFloorModeSwitch(SwitchEntity):
+    """Per-zone switch: when ON, targets floor temperature instead of room temperature."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:heat-wave"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        zone_name: str,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._attr_name = f"Floor Control Mode: {zone_name}"
+        self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_mode_{zone_key}"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.floor_control_enabled.get(self._zone_key, False)
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.floor_control_enabled[self._zone_key] = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.floor_control_enabled[self._zone_key] = False
+        self.async_write_ha_state()
+
+
+class OutdoorResetFloorTargetEntity(RestoreNumber):
+    """Per-zone floor temperature target (used when floor control mode is ON)."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:heat-wave"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        name: str,
+        default: float,
+        min_val: float,
+        max_val: float,
+        step: float,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._default = default
+        self._attr_name = name
+        self._attr_native_min_value = min_val
+        self._attr_native_max_value = max_val
+        self._attr_native_step = step
+        self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_target_{zone_key}"
+        self._attr_native_value = default
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last and last.native_value is not None:
+            self._attr_native_value = last.native_value
+        self._controller.params.floor_targets[self._zone_key] = self._attr_native_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.floor_targets[self._zone_key] = value
         self.async_write_ha_state()
