@@ -7,3 +7,10 @@ captures/
 .DS_Store
 .idea/
 .vscode/
+tmp_*
+*_out.txt
+cloud_check.txt
+ha_alive.txt
+*.json
+!custom_components/**/manifest.json
+!hacs.json
