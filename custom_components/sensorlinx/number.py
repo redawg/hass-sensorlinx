@@ -15,6 +15,7 @@ from pysensorlinx import Temperature, ZonDevice
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .helpers import zon_device_info
+from .outdoor_reset import get_number_entities
 
 
 async def async_setup_entry(
@@ -22,12 +23,18 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up ZON number entities."""
+    """Set up ZON number entities and outdoor reset parameter entities."""
     coordinator: SensorlinxCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
+    entities = [
         SensorlinxAuxSetpointNumber(coordinator, device_data)
         for device_data in coordinator.get_zon_devices()
-    )
+    ]
+
+    controller = hass.data[DOMAIN].get(f"{entry.entry_id}_outdoor_reset")
+    if controller:
+        entities.extend(get_number_entities(coordinator, controller))
+
+    async_add_entities(entities)
 
 
 class SensorlinxAuxSetpointNumber(CoordinatorEntity[SensorlinxCoordinator], NumberEntity):

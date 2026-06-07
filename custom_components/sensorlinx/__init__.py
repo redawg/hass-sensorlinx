@@ -13,6 +13,7 @@ from pysensorlinx import InvalidCredentialsError, LoginError, Sensorlinx
 from .const import CONF_BUILDING_ID, DOMAIN
 from .coordinator import SensorlinxCoordinator
 from .external_control import SensorlinxExternalControl
+from .outdoor_reset import async_setup_outdoor_reset
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,9 +44,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     external_control = SensorlinxExternalControl(hass, entry, coordinator)
     await external_control.async_setup()
 
+    outdoor_reset = await async_setup_outdoor_reset(hass, entry, coordinator)
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
     hass.data[DOMAIN][f"{entry.entry_id}_external"] = external_control
+    hass.data[DOMAIN][f"{entry.entry_id}_outdoor_reset"] = outdoor_reset
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -62,6 +66,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        outdoor_reset = hass.data[DOMAIN].pop(f"{entry.entry_id}_outdoor_reset", None)
+        if outdoor_reset is not None:
+            outdoor_reset.async_unload()
         external: SensorlinxExternalControl | None = hass.data[DOMAIN].pop(
             f"{entry.entry_id}_external", None
         )

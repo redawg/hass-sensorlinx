@@ -14,6 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .helpers import thm_device_info, zon_device_info
+from .outdoor_reset import get_sensor_entities
 
 
 async def async_setup_entry(
@@ -35,6 +36,10 @@ async def async_setup_entry(
 
     for device_data in coordinator.get_zon_devices():
         entities.append(SensorlinxActiveZonesSensor(coordinator, device_data))
+
+    controller = hass.data[DOMAIN].get(f"{entry.entry_id}_outdoor_reset")
+    if controller:
+        entities.extend(get_sensor_entities(coordinator, controller))
 
     async_add_entities(entities)
 

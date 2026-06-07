@@ -1,0 +1,408 @@
+# Outdoor Reset Heating Curve for HBX SensorLinx Radiant Floors
+#
+# Adjusts THM zone setpoints based on outdoor temperature using a linear
+# heating curve. Includes a floor temperature safety cap (80°F for wood).
+#
+# Formula:
+#   target = base + overshoot * ((shutdown - T_outdoor) / (shutdown - design_outdoor))
+#   Clamped to [base, base + overshoot]
+
+# ---------------------------------------------------------------------------
+# Configurable parameters (adjustable from the HA UI)
+# ---------------------------------------------------------------------------
+input_number:
+  heating_curve_base:
+    name: "Heating Curve: Base Comfort Temp"
+    min: 65
+    max: 75
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-low
+    mode: slider
+
+  heating_curve_overshoot:
+    name: "Heating Curve: Overshoot (extra degrees for fast warmup)"
+    min: 0
+    max: 12
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:thermometer-chevron-up
+    mode: slider
+
+  heating_curve_shutdown_temp:
+    name: "Heating Curve: Outdoor Shutdown Temp"
+    min: 55
+    max: 75
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:weather-sunny
+    mode: slider
+
+  heating_curve_design_outdoor:
+    name: "Heating Curve: Design Outdoor Temp (coldest day)"
+    min: 0
+    max: 40
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:snowflake
+    mode: slider
+
+  floor_temp_max:
+    name: "Heating Curve: Max Floor Temp (safety cap)"
+    min: 75
+    max: 85
+    step: 1
+    unit_of_measurement: "°F"
+    icon: mdi:alert-octagon
+    mode: slider
+
+  heating_curve_offset_laundry:
+    name: "Zone Offset: Laundry"
+    min: -5
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:tune-vertical
+    mode: slider
+
+  heating_curve_offset_living_room:
+    name: "Zone Offset: Living Room"
+    min: -5
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:tune-vertical
+    mode: slider
+
+  heating_curve_offset_main_area:
+    name: "Zone Offset: Main Area"
+    min: -5
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:tune-vertical
+    mode: slider
+
+  heating_curve_offset_main_office:
+    name: "Zone Offset: Main Office"
+    min: -5
+    max: 5
+    step: 0.5
+    unit_of_measurement: "°F"
+    icon: mdi:tune-vertical
+    mode: slider
+
+# ---------------------------------------------------------------------------
+# Input boolean: master enable/disable for the outdoor reset system
+# ---------------------------------------------------------------------------
+input_boolean:
+  outdoor_reset_enabled:
+    name: "Outdoor Reset: Enabled"
+    icon: mdi:thermostat-auto
+
+# ---------------------------------------------------------------------------
+# Template sensors
+# ---------------------------------------------------------------------------
+template:
+  - sensor:
+      - name: "Floor Heating Target Setpoint"
+        unique_id: floor_heating_target_setpoint
+        unit_of_measurement: "°F"
+        device_class: temperature
+        state_class: measurement
+        icon: mdi:thermostat
+        state: >-
+          {% set outdoor = states('sensor.home_weather_station_temperature') | float(50) %}
+          {% set base = states('input_number.heating_curve_base') | float(70) %}
+          {% set overshoot = states('input_number.heating_curve_overshoot') | float(6) %}
+          {% set shutdown = states('input_number.heating_curve_shutdown_temp') | float(65) %}
+          {% set design = states('input_number.heating_curve_design_outdoor') | float(25) %}
+          {% set range = shutdown - design %}
+          {% if range <= 0 %}
+            {{ base }}
+          {% elif outdoor >= shutdown %}
+            {{ base }}
+          {% elif outdoor <= design %}
+            {{ base + overshoot }}
+          {% else %}
+            {{ (base + overshoot * ((shutdown - outdoor) / range)) | round(1) }}
+          {% endif %}
+        attributes:
+          outdoor_temp: "{{ states('sensor.home_weather_station_temperature') }}"
+          curve_base: "{{ states('input_number.heating_curve_base') }}"
+          curve_overshoot: "{{ states('input_number.heating_curve_overshoot') }}"
+          curve_shutdown: "{{ states('input_number.heating_curve_shutdown_temp') }}"
+          curve_design_outdoor: "{{ states('input_number.heating_curve_design_outdoor') }}"
+
+      - name: "Floor Heating Target: Laundry"
+        unique_id: floor_heating_target_laundry
+        unit_of_measurement: "°F"
+        device_class: temperature
+        icon: mdi:thermostat
+        state: >-
+          {% set target = states('sensor.floor_heating_target_setpoint') | float(70) %}
+          {% set offset = states('input_number.heating_curve_offset_laundry') | float(0) %}
+          {{ (target + offset) | round(1) }}
+
+      - name: "Floor Heating Target: Living Room"
+        unique_id: floor_heating_target_living_room
+        unit_of_measurement: "°F"
+        device_class: temperature
+        icon: mdi:thermostat
+        state: >-
+          {% set target = states('sensor.floor_heating_target_setpoint') | float(70) %}
+          {% set offset = states('input_number.heating_curve_offset_living_room') | float(0) %}
+          {{ (target + offset) | round(1) }}
+
+      - name: "Floor Heating Target: Main Area"
+        unique_id: floor_heating_target_main_area
+        unit_of_measurement: "°F"
+        device_class: temperature
+        icon: mdi:thermostat
+        state: >-
+          {% set target = states('sensor.floor_heating_target_setpoint') | float(70) %}
+          {% set offset = states('input_number.heating_curve_offset_main_area') | float(0) %}
+          {{ (target + offset) | round(1) }}
+
+      - name: "Floor Heating Target: Main Office"
+        unique_id: floor_heating_target_main_office
+        unit_of_measurement: "°F"
+        device_class: temperature
+        icon: mdi:thermostat
+        state: >-
+          {% set target = states('sensor.floor_heating_target_setpoint') | float(70) %}
+          {% set offset = states('input_number.heating_curve_offset_main_office') | float(0) %}
+          {{ (target + offset) | round(1) }}
+
+# ---------------------------------------------------------------------------
+# Automations
+# ---------------------------------------------------------------------------
+automation:
+  # Main automation: update THM setpoints based on outdoor reset curve
+  - id: outdoor_reset_update_setpoints
+    alias: "Outdoor Reset: Update Zone Setpoints"
+    description: >-
+      Periodically adjusts radiant floor zone setpoints based on the outdoor
+      reset heating curve. Runs every 15 minutes or when outdoor temp changes
+      by more than 2°F.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "/15"
+      - platform: state
+        entity_id: sensor.home_weather_station_temperature
+        for: "00:02:00"
+      - platform: state
+        entity_id: input_boolean.outdoor_reset_enabled
+        to: "on"
+    condition:
+      - condition: state
+        entity_id: input_boolean.outdoor_reset_enabled
+        state: "on"
+      - condition: not
+        conditions:
+          - condition: state
+            entity_id: sensor.home_weather_station_temperature
+            state: "unavailable"
+          - condition: state
+            entity_id: sensor.home_weather_station_temperature
+            state: "unknown"
+    action:
+      - variables:
+          outdoor: "{{ states('sensor.home_weather_station_temperature') | float(50) }}"
+          shutdown: "{{ states('input_number.heating_curve_shutdown_temp') | float(65) }}"
+      - choose:
+          # If outdoor temp is above shutdown, turn off all zones
+          - conditions:
+              - condition: template
+                value_template: "{{ outdoor >= shutdown }}"
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id:
+                    - climate.laundry_laundry
+                    - climate.living_room_living_room
+                    - climate.main_area_main_area
+                    - climate.main_office_main_office
+        default:
+          # Apply calculated setpoints to each zone
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.laundry_laundry
+            data:
+              temperature: "{{ states('sensor.floor_heating_target_laundry') | float(70) }}"
+              hvac_mode: heat
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.living_room_living_room
+            data:
+              temperature: "{{ states('sensor.floor_heating_target_living_room') | float(70) }}"
+              hvac_mode: heat
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.main_area_main_area
+            data:
+              temperature: "{{ states('sensor.floor_heating_target_main_area') | float(70) }}"
+              hvac_mode: heat
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.main_office_main_office
+            data:
+              temperature: "{{ states('sensor.floor_heating_target_main_office') | float(70) }}"
+              hvac_mode: heat
+
+  # Safety cap: reduce setpoint or turn off if floor temp too high
+  - id: outdoor_reset_floor_safety_cap
+    alias: "Outdoor Reset: Floor Temperature Safety Cap"
+    description: >-
+      Monitors floor temperature sensors. If any floor exceeds (max - 2°F),
+      reduces that zone's setpoint. If it reaches max, turns the zone off.
+    mode: queued
+    max: 4
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.laundry_floor_temperature
+        above: input_number.floor_temp_max
+        id: laundry_max
+      - platform: numeric_state
+        entity_id: sensor.living_room_floor_temperature
+        above: input_number.floor_temp_max
+        id: living_room_max
+      - platform: numeric_state
+        entity_id: sensor.main_area_floor_temperature
+        above: input_number.floor_temp_max
+        id: main_area_max
+      - platform: numeric_state
+        entity_id: sensor.main_office_floor_temperature
+        above: input_number.floor_temp_max
+        id: main_office_max
+    condition:
+      - condition: state
+        entity_id: input_boolean.outdoor_reset_enabled
+        state: "on"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: laundry_max
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.laundry_laundry
+              - action: persistent_notification.create
+                data:
+                  title: "Floor Safety Cap"
+                  message: "Laundry floor exceeded {{ states('input_number.floor_temp_max') }}°F — zone turned off."
+          - conditions:
+              - condition: trigger
+                id: living_room_max
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.living_room_living_room
+              - action: persistent_notification.create
+                data:
+                  title: "Floor Safety Cap"
+                  message: "Living Room floor exceeded {{ states('input_number.floor_temp_max') }}°F — zone turned off."
+          - conditions:
+              - condition: trigger
+                id: main_area_max
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.main_area_main_area
+              - action: persistent_notification.create
+                data:
+                  title: "Floor Safety Cap"
+                  message: "Main Area floor exceeded {{ states('input_number.floor_temp_max') }}°F — zone turned off."
+          - conditions:
+              - condition: trigger
+                id: main_office_max
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.main_office_main_office
+              - action: persistent_notification.create
+                data:
+                  title: "Floor Safety Cap"
+                  message: "Main Office floor exceeded {{ states('input_number.floor_temp_max') }}°F — zone turned off."
+
+  # Safety cap recovery: re-enable zone when floor cools below threshold
+  - id: outdoor_reset_floor_safety_recovery
+    alias: "Outdoor Reset: Floor Safety Recovery"
+    description: >-
+      When a zone was turned off by the safety cap and the floor cools back
+      below (max - 3°F), re-enable it at the calculated setpoint.
+    mode: queued
+    max: 4
+    trigger:
+      - platform: template
+        value_template: >-
+          {{ states('sensor.laundry_floor_temperature') | float(0) <
+             (states('input_number.floor_temp_max') | float(80) - 3) and
+             is_state('climate.laundry_laundry', 'off') }}
+        id: laundry_recover
+      - platform: template
+        value_template: >-
+          {{ states('sensor.living_room_floor_temperature') | float(0) <
+             (states('input_number.floor_temp_max') | float(80) - 3) and
+             is_state('climate.living_room_living_room', 'off') }}
+        id: living_room_recover
+      - platform: template
+        value_template: >-
+          {{ states('sensor.main_area_floor_temperature') | float(0) <
+             (states('input_number.floor_temp_max') | float(80) - 3) and
+             is_state('climate.main_area_main_area', 'off') }}
+        id: main_area_recover
+      - platform: template
+        value_template: >-
+          {{ states('sensor.main_office_floor_temperature') | float(0) <
+             (states('input_number.floor_temp_max') | float(80) - 3) and
+             is_state('climate.main_office_main_office', 'off') }}
+        id: main_office_recover
+    condition:
+      - condition: state
+        entity_id: input_boolean.outdoor_reset_enabled
+        state: "on"
+    action:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: laundry_recover
+            sequence:
+              - action: climate.set_temperature
+                target:
+                  entity_id: climate.laundry_laundry
+                data:
+                  temperature: "{{ states('sensor.floor_heating_target_laundry') | float(70) }}"
+                  hvac_mode: heat
+          - conditions:
+              - condition: trigger
+                id: living_room_recover
+            sequence:
+              - action: climate.set_temperature
+                target:
+                  entity_id: climate.living_room_living_room
+                data:
+                  temperature: "{{ states('sensor.floor_heating_target_living_room') | float(70) }}"
+                  hvac_mode: heat
+          - conditions:
+              - condition: trigger
+                id: main_area_recover
+            sequence:
+              - action: climate.set_temperature
+                target:
+                  entity_id: climate.main_area_main_area
+                data:
+                  temperature: "{{ states('sensor.floor_heating_target_main_area') | float(70) }}"
+                  hvac_mode: heat
+          - conditions:
+              - condition: trigger
+                id: main_office_recover
+            sequence:
+              - action: climate.set_temperature
+                target:
+                  entity_id: climate.main_office_main_office
+                data:
+                  temperature: "{{ states('sensor.floor_heating_target_main_office') | float(70) }}"
+                  hvac_mode: heat
