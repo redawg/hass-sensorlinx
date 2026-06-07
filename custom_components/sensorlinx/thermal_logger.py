@@ -39,7 +39,7 @@ from .outdoor_reset import OutdoorResetController, OUTDOOR_TEMP_ENTITY
 
 _LOGGER = logging.getLogger(__name__)
 
-LOG_DIR = "/config/sensorlinx_thermal_log"
+LOG_DIR = "/config/www/sensorlinx_thermal_log"
 SAMPLE_INTERVAL = timedelta(minutes=5)
 
 
