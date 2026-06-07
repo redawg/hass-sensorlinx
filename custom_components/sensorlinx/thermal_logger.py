@@ -17,8 +17,16 @@ Data captured per sample:
   - heating_curve_params (base, overshoot, shutdown, design_outdoor)
   - zone_offset (°F)
   - outdoor_reset_enabled (bool)
+  - ecobee_mode (main HVAC mode: heat/cool/off/heat_cool)
+  - ecobee_action (main HVAC action: heating/cooling/idle)
+  - ecobee_temp (ecobee current temperature reading)
+  - ecobee_setpoint (ecobee target temperature)
+  - ecobee_humidity (current humidity %)
+  - ecobee_fan (fan mode: auto/on)
+  - ecobee_sensors (dict of remote sensor temps)
+  - occupancy (dict of occupancy states per area)
 
-Stored at: /config/sensorlinx_thermal_log/thermal_YYYY-MM.jsonl
+Stored at: /config/www/sensorlinx_thermal_log/thermal_YYYY-MM.jsonl
 One file per month, one JSON line per sample interval.
 """
 
@@ -28,7 +36,6 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
@@ -41,6 +48,21 @@ _LOGGER = logging.getLogger(__name__)
 
 LOG_DIR = "/config/www/sensorlinx_thermal_log"
 SAMPLE_INTERVAL = timedelta(minutes=5)
+
+# Ecobee / main HVAC entities
+ECOBEE_CLIMATE_ENTITY = "climate.main_floor"
+ECOBEE_REMOTE_SENSORS = {
+    "main_floor": "sensor.main_floor_current_temperature",
+    "upstairs": "sensor.upstairs_temperature",
+    "office": "sensor.office_temperature",
+    "family_room": "sensor.family_room_temperature",
+}
+ECOBEE_HUMIDITY_ENTITY = "sensor.main_floor_current_humidity"
+OCCUPANCY_SENSORS = {
+    "main_floor": "binary_sensor.main_floor_occupancy",
+    "upstairs": "binary_sensor.upstairs_occupancy",
+    "family_room": "binary_sensor.family_room_occupancy",
+}
 
 
 class ThermalDataLogger:
@@ -90,6 +112,9 @@ class ThermalDataLogger:
         timestamp = datetime.now().isoformat()
         params = self.controller.params
 
+        # Collect ecobee / main HVAC state (shared across all zone samples)
+        ecobee_data = self._get_ecobee_state()
+
         samples = []
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
@@ -123,6 +148,7 @@ class ThermalDataLogger:
                 "floor_max": params.floor_max,
                 "zone_offset": offset,
                 "enabled": params.enabled,
+                **ecobee_data,
             }
             samples.append(sample)
 
@@ -137,6 +163,53 @@ class ThermalDataLogger:
                     f.write(json.dumps(sample, separators=(",", ":")) + "\n")
         except OSError as e:
             _LOGGER.warning("Failed to write thermal log: %s", e)
+
+    def _get_ecobee_state(self) -> dict[str, Any]:
+        """Collect ecobee main HVAC state, remote sensors, and occupancy."""
+        result: dict[str, Any] = {}
+
+        # Main climate entity
+        ecobee = self.hass.states.get(ECOBEE_CLIMATE_ENTITY)
+        if ecobee and ecobee.state not in ("unavailable", "unknown"):
+            attrs = ecobee.attributes
+            result["ecobee_mode"] = ecobee.state
+            result["ecobee_action"] = attrs.get("hvac_action")
+            result["ecobee_temp"] = attrs.get("current_temperature")
+            result["ecobee_setpoint"] = attrs.get("temperature")
+            result["ecobee_humidity"] = attrs.get("current_humidity")
+            result["ecobee_fan"] = attrs.get("fan_mode")
+        else:
+            result["ecobee_mode"] = None
+            result["ecobee_action"] = None
+            result["ecobee_temp"] = None
+            result["ecobee_setpoint"] = None
+            result["ecobee_humidity"] = None
+            result["ecobee_fan"] = None
+
+        # Remote sensor temperatures
+        sensor_temps = {}
+        for name, entity_id in ECOBEE_REMOTE_SENSORS.items():
+            state = self.hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                try:
+                    sensor_temps[name] = float(state.state)
+                except (ValueError, TypeError):
+                    sensor_temps[name] = None
+            else:
+                sensor_temps[name] = None
+        result["ecobee_sensors"] = sensor_temps
+
+        # Occupancy
+        occupancy = {}
+        for name, entity_id in OCCUPANCY_SENSORS.items():
+            state = self.hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                occupancy[name] = state.state == "on"
+            else:
+                occupancy[name] = None
+        result["occupancy"] = occupancy
+
+        return result
 
     def _get_outdoor_temp(self) -> float | None:
         """Get outdoor temperature from weather station."""
