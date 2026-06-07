@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to SensorLinx",
+        "description": "Enter the same email and password you use in the SensorLinx Android app.",
+        "data": {
+          "username": "Email",
+          "password": "Password"
+        }
+      },
+      "building": {
+        "title": "Select building",
+        "description": "Your account has multiple buildings. Choose which one to import into Home Assistant.",
+        "data": {
+          "building_id": "Building"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the SensorLinx cloud API.",
+      "invalid_auth": "Invalid email or password.",
+      "no_buildings": "No buildings were found on this account.",
+      "building_not_found": "The selected building could not be found."
+    },
+    "abort": {
+      "already_configured": "This building is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "External switches",
+        "description": "Link physical Home Assistant switches that power your hot-water heater and radiant-floor controller. When a linked switch turns off, SensorLinx thermostats and hot-water demand are suppressed in the cloud; turning the switch back on restores the previous settings.",
+        "data": {
+          "hot_water_switch_entity_id": "Hot water heater switch",
+          "radiant_floor_switch_entity_id": "Radiant floor controller switch",
+          "heated_floor_controller_entity_id": "Heated floor controller (switch or light)"
+        }
+      }
+    }
+  }
+}
