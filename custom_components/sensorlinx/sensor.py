@@ -15,6 +15,7 @@ from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .helpers import thm_device_info, zon_device_info
 from .outdoor_reset import get_sensor_entities
+from .thermal_logger import ThermalDataLogger
 
 
 async def async_setup_entry(
@@ -40,6 +41,10 @@ async def async_setup_entry(
     controller = hass.data[DOMAIN].get(f"{entry.entry_id}_outdoor_reset")
     if controller:
         entities.extend(get_sensor_entities(coordinator, controller))
+
+    thermal_logger = hass.data[DOMAIN].get(f"{entry.entry_id}_thermal_logger")
+    if thermal_logger:
+        entities.append(ThermalLogStatusSensor(thermal_logger))
 
     async_add_entities(entities)
 
@@ -232,3 +237,57 @@ class SensorlinxOutdoorTemperatureSensor(SensorlinxSensorBase):
         if isinstance(weather, dict) and weather.get("temp") is not None:
             return float(weather["temp"])
         return None
+
+
+class ThermalLogStatusSensor(SensorEntity):
+    """Reports the status of thermal data collection for AI training."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Thermal Log Samples"
+    _attr_icon = "mdi:database-clock"
+    _attr_state_class = "total_increasing"
+
+    def __init__(self, logger: ThermalDataLogger) -> None:
+        self._logger = logger
+        self._attr_unique_id = "sensorlinx_thermal_log_samples"
+        self._sample_count = 0
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def native_value(self) -> int:
+        """Return approximate sample count from current month's log."""
+        import os
+        path = self._logger._log_path
+        try:
+            if os.path.exists(path):
+                size = os.path.getsize(path)
+                return size // 200  # ~200 bytes per sample line
+        except OSError:
+            pass
+        return 0
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose log file path and interval for diagnostics."""
+        import os
+        path = self._logger._log_path
+        size_kb = 0
+        try:
+            if os.path.exists(path):
+                size_kb = round(os.path.getsize(path) / 1024, 1)
+        except OSError:
+            pass
+        return {
+            "log_path": path,
+            "sample_interval_minutes": 5,
+            "log_size_kb": size_kb,
+            "zones_per_sample": len(self._logger.coordinator.get_thm_devices()),
+        }

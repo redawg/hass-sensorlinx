@@ -14,6 +14,7 @@ from .const import CONF_BUILDING_ID, DOMAIN
 from .coordinator import SensorlinxCoordinator
 from .external_control import SensorlinxExternalControl
 from .outdoor_reset import async_setup_outdoor_reset
+from .thermal_logger import async_setup_thermal_logger
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,11 +46,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await external_control.async_setup()
 
     outdoor_reset = await async_setup_outdoor_reset(hass, entry, coordinator)
+    thermal_logger = await async_setup_thermal_logger(hass, coordinator, outdoor_reset)
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
     hass.data[DOMAIN][f"{entry.entry_id}_external"] = external_control
     hass.data[DOMAIN][f"{entry.entry_id}_outdoor_reset"] = outdoor_reset
+    hass.data[DOMAIN][f"{entry.entry_id}_thermal_logger"] = thermal_logger
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -66,6 +69,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        thermal_logger = hass.data[DOMAIN].pop(f"{entry.entry_id}_thermal_logger", None)
+        if thermal_logger is not None:
+            thermal_logger.async_unload()
         outdoor_reset = hass.data[DOMAIN].pop(f"{entry.entry_id}_outdoor_reset", None)
         if outdoor_reset is not None:
             outdoor_reset.async_unload()
