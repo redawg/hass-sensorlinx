@@ -162,7 +162,13 @@ class SensorlinxClimateEntity(CoordinatorEntity[SensorlinxCoordinator], ClimateE
         await self.coordinator.async_request_refresh()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Set target temperature."""
+        """Set target temperature, optionally switching HVAC mode first."""
+        hvac_mode = kwargs.get("hvac_mode")
+        if hvac_mode is not None:
+            hvac_mode_enum = HVACMode(hvac_mode)
+            if hvac_mode_enum != self.hvac_mode:
+                await self.async_set_hvac_mode(hvac_mode_enum)
+
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is None:
             return
