@@ -188,6 +188,17 @@ class OutdoorResetController:
                 offset = self.params.zone_offsets.get(zone_name, 0.0)
                 zone_target = self.zone_target(offset)
 
+            # Deadband: skip if climate entity already at this setpoint (avoids churn)
+            climate_state = self.hass.states.get(entity_id)
+            if climate_state:
+                current_setpoint = climate_state.attributes.get("temperature")
+                current_mode = climate_state.state
+                if (current_mode == "heat"
+                        and current_setpoint is not None
+                        and abs(float(current_setpoint) - zone_target) < 0.5):
+                    _LOGGER.debug("Skipping %s - already at %.1f°F", zone_name, zone_target)
+                    continue
+
             _LOGGER.debug(
                 "Setting %s to %.1f°F (mode=%s, outdoor=%.1f)",
                 zone_name, zone_target, "floor" if floor_mode else "room", outdoor,
