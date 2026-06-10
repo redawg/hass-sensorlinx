@@ -38,7 +38,8 @@ DEFAULT_OVERSHOOT = 6.0
 DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
 DEFAULT_FLOOR_MAX = 80.0
-DEFAULT_FLOOR_TARGET = 74.0
+DEFAULT_FLOOR_TARGET = 70.0
+DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 
 
@@ -178,8 +179,9 @@ class OutdoorResetController:
             floor_mode = self.params.floor_control_enabled.get(zone_name, False)
 
             if floor_mode:
-                # Floor control mode: target a specific floor temperature
-                floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                # Floor control mode: dynamic floor target based on outdoor temp
+                base_floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
                 zone_target = self._compute_floor_mode_setpoint(
                     floor_temp, floor_target, zone_name
                 )
@@ -208,6 +210,23 @@ class OutdoorResetController:
                 {"entity_id": entity_id, "temperature": zone_target, "hvac_mode": "heat"},
                 blocking=True,
             )
+
+    def _dynamic_floor_target(self, base_target: float, outdoor: float) -> float:
+        """Compute dynamic floor target: base in mild weather, base+boost in cold.
+
+        At shutdown temp: floor target = base (e.g. 70F)
+        At design outdoor: floor target = base + boost (e.g. 72F)
+        Linear interpolation between.
+        """
+        temp_range = self.params.shutdown - self.params.design_outdoor
+        if temp_range <= 0:
+            return base_target
+        if outdoor >= self.params.shutdown:
+            return base_target
+        if outdoor <= self.params.design_outdoor:
+            return base_target + self.params.floor_boost
+        ratio = (self.params.shutdown - outdoor) / temp_range
+        return round(base_target + self.params.floor_boost * ratio, 1)
 
     def _compute_floor_mode_setpoint(
         self, floor_temp: float | None, floor_target: float, zone_name: str
@@ -251,6 +270,7 @@ class OutdoorResetParams:
         self.zone_offsets: dict[str, float] = {}
         self.floor_control_enabled: dict[str, bool] = {}
         self.floor_targets: dict[str, float] = {}
+        self.floor_boost: float = DEFAULT_FLOOR_BOOST
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +319,11 @@ def get_number_entities(
             coordinator, controller, "floor_temp_max",
             "Max Floor Temp (Safety Cap)", DEFAULT_FLOOR_MAX, 75, 85, 1,
             "mdi:alert-octagon",
+        ),
+        OutdoorResetNumberEntity(
+            coordinator, controller, "floor_boost",
+            "Floor Boost (Cold Weather)", DEFAULT_FLOOR_BOOST, 0, 5, 0.5,
+            "mdi:thermometer-chevron-up",
         ),
     ]
 
@@ -423,6 +448,8 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.design_outdoor = self._attr_native_value
         elif self._key == "floor_temp_max":
             params.floor_max = self._attr_native_value
+        elif self._key == "floor_boost":
+            params.floor_boost = self._attr_native_value
 
 
 class OutdoorResetZoneOffsetEntity(RestoreNumber):
