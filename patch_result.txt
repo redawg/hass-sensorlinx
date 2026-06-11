@@ -1,0 +1,4 @@
+Patched ATHM-8008 cngOvr=1 offMode=0 (heat)
+Patched ATHM-7979 cngOvr=1 offMode=0 (heat)
+Patched ATHM-8014 cngOvr=1 offMode=0 (heat)
+Patched ATHM-7969 cngOvr=1 offMode=0 (heat)

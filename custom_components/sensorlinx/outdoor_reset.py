@@ -633,6 +633,20 @@ class OutdoorResetController:
             return None
         return round(supply - ret, 1)
 
+    @property
+    def actual_flow_rate(self) -> float | None:
+        """Read actual system flow rate from configured sensor (GPM)."""
+        entity_id = self.params.flow_rate_sensor
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
+
     def zone_flow_rate(self, zone_name: str) -> float:
         """Estimated flow rate for a zone based on valve count (GPM)."""
         valves = self.params.zone_valve_counts.get(zone_name, DEFAULT_VALVE_COUNT)
@@ -651,10 +665,19 @@ class OutdoorResetController:
         return round(WATER_BTU_FACTOR * flow * dt, 0)
 
     def total_system_btu(self) -> float | None:
-        """Total BTU/hr across all zones currently heating."""
+        """Total BTU/hr across all zones currently heating.
+
+        Uses actual flow sensor from tankless if available, otherwise
+        sums estimated per-zone flows for active zones.
+        """
         dt = self.delta_t
         if dt is None or dt <= 0:
             return None
+        actual_flow = self.actual_flow_rate
+        if actual_flow is not None:
+            if actual_flow <= 0:
+                return None
+            return round(WATER_BTU_FACTOR * actual_flow * dt, 0)
         total_flow = 0.0
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
@@ -693,6 +716,7 @@ class OutdoorResetParams:
         # Hydronic loop monitoring
         self.supply_temp_sensor: str | None = None  # sensor for water input temp
         self.return_temp_sensor: str | None = None  # sensor for water output temp
+        self.flow_rate_sensor: str | None = None  # actual GPM sensor (e.g. from tankless)
         self.zone_valve_counts: dict[str, int] = {}  # zone_name -> number of valves
         self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
 
@@ -722,6 +746,9 @@ async def async_setup_outdoor_reset(
     return_temp_sensor = entry.options.get("return_temp_sensor")
     if return_temp_sensor:
         params.return_temp_sensor = return_temp_sensor
+    flow_rate_sensor = entry.options.get("flow_rate_sensor")
+    if flow_rate_sensor:
+        params.flow_rate_sensor = flow_rate_sensor
 
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
@@ -746,6 +773,7 @@ async def async_setup_outdoor_reset(
     async def handle_set_hydronic_sensors(call):
         supply_sensor = call.data.get("supply_temp_sensor")
         return_sensor = call.data.get("return_temp_sensor")
+        flow_sensor = call.data.get("flow_rate_sensor")
         new_options = dict(entry.options)
         if supply_sensor:
             controller.params.supply_temp_sensor = supply_sensor
@@ -753,8 +781,14 @@ async def async_setup_outdoor_reset(
         if return_sensor:
             controller.params.return_temp_sensor = return_sensor
             new_options["return_temp_sensor"] = return_sensor
+        if flow_sensor:
+            controller.params.flow_rate_sensor = flow_sensor
+            new_options["flow_rate_sensor"] = flow_sensor
         hass.config_entries.async_update_entry(entry, options=new_options)
-        _LOGGER.info("Hydronic sensors: supply=%s, return=%s", supply_sensor, return_sensor)
+        _LOGGER.info(
+            "Hydronic sensors: supply=%s, return=%s, flow=%s",
+            supply_sensor, return_sensor, flow_sensor,
+        )
 
     hass.services.async_register(
         DOMAIN, "set_supply_entity", handle_set_supply_entity,
@@ -1525,6 +1559,8 @@ class HydronicDeltaTSensor(SensorEntity):
             "return_temp": self._controller.return_water_actual,
             "supply_sensor": self._controller.params.supply_temp_sensor or "not configured",
             "return_sensor": self._controller.params.return_temp_sensor or "not configured",
+            "flow_rate_sensor": self._controller.params.flow_rate_sensor or "not configured",
+            "actual_flow_gpm": self._controller.actual_flow_rate,
         }
 
 
@@ -1561,8 +1597,12 @@ class HydronicBtuSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        actual_flow = self._controller.actual_flow_rate
+        using_actual = actual_flow is not None
         attrs: dict[str, Any] = {
             "delta_t": self._controller.delta_t,
+            "flow_source": "actual (tankless sensor)" if using_actual else "estimated (valve count)",
+            "actual_flow_gpm": actual_flow,
             "flow_rate_per_valve_gpm": self._controller.params.flow_rate_per_valve,
         }
         for thm in self._coordinator.get_thm_devices():
