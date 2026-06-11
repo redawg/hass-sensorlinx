@@ -49,6 +49,10 @@ FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is bel
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
 SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
+BOOST_INLET_TOLERANCE = 2.0  # inlet within this of optimal ends boost
+TANKLESS_FAST_SCAN_INTERVAL = 15  # seconds during supply boost
+TANKLESS_NORMAL_SCAN_INTERVAL = 60  # seconds during normal operation
+BOOST_MONITOR_INTERVAL = timedelta(seconds=15)
 
 # Preheat defaults
 DEFAULT_THERMAL_LAG = 20.0  # minutes per degree F of floor temp rise
@@ -90,9 +94,16 @@ class OutdoorResetController:
         self.params = params
         self._unsub_interval = None
         self._unsub_state = None
+        self._unsub_zone_boost = None
+        self._unsub_inlet_boost = None
+        self._unsub_boost_monitor = None
         # Preheat: track outdoor temp history for trend prediction
         self._temp_history: deque[tuple[datetime, float]] = deque(maxlen=24)
         self._preheat_active: bool = False
+        # Supply water fast heat-up boost
+        self._supply_boost_active: bool = False
+        self._supply_boost_optimal: float | None = None
+        self._tankless_scan_interval: int | None = None
 
     @property
     def enabled(self) -> bool:
@@ -129,6 +140,16 @@ class OutdoorResetController:
         self._unsub_state = async_track_state_change_event(
             self.hass, [OUTDOOR_TEMP_ENTITY], self._async_on_outdoor_change
         )
+        zone_entities = self._zone_climate_entities()
+        if zone_entities:
+            self._unsub_zone_boost = async_track_state_change_event(
+                self.hass, zone_entities, self._async_on_zone_heating_change
+            )
+        inlet_entity = self.params.return_temp_sensor
+        if inlet_entity:
+            self._unsub_inlet_boost = async_track_state_change_event(
+                self.hass, [inlet_entity], self._async_on_inlet_temp_change
+            )
 
     @callback
     def async_unload(self) -> None:
@@ -137,6 +158,11 @@ class OutdoorResetController:
             self._unsub_interval()
         if self._unsub_state:
             self._unsub_state()
+        if self._unsub_zone_boost:
+            self._unsub_zone_boost()
+        if self._unsub_inlet_boost:
+            self._unsub_inlet_boost()
+        self._stop_boost_monitor()
 
     async def _async_update(self, _now=None) -> None:
         """Apply setpoints to all THM zones."""
@@ -293,6 +319,203 @@ class OutdoorResetController:
         # Clamp to reasonable range
         return round(max(65.0, min(setpoint, self.params.floor_max - 2)), 1)
 
+    @property
+    def supply_boost_active(self) -> bool:
+        """Whether supply water fast heat-up boost is active."""
+        return self._supply_boost_active
+
+    def _zone_climate_entities(self) -> list[str]:
+        return [
+            f"climate.{thm.name.lower().replace(' ', '_')}_{thm.name.lower().replace(' ', '_')}"
+            for thm in self.coordinator.get_thm_devices()
+        ]
+
+    def _climate_is_heating(self, state) -> bool:
+        if state is None or state.state in ("unavailable", "unknown"):
+            return False
+        if state.attributes.get("hvac_action") == "heating":
+            return True
+        return state.state == "heat"
+
+    def _any_zone_heating(self) -> bool:
+        for entity_id in self._zone_climate_entities():
+            if self._climate_is_heating(self.hass.states.get(entity_id)):
+                return True
+        return False
+
+    @callback
+    def _async_on_zone_heating_change(self, event) -> None:
+        """Start boost when a zone first calls for heat."""
+        self.hass.async_create_task(self._handle_zone_heating_change(event))
+
+    async def _handle_zone_heating_change(self, event) -> None:
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        was_heating = self._climate_is_heating(old_state)
+        is_heating = self._climate_is_heating(new_state)
+        if is_heating and not was_heating:
+            await self._async_start_supply_boost()
+        elif was_heating and not is_heating and not self._any_zone_heating():
+            await self._async_end_supply_boost(cancelled=True)
+
+    @callback
+    def _async_on_inlet_temp_change(self, event) -> None:
+        """Check boost completion when inlet temperature updates."""
+        if self._supply_boost_active:
+            self.hass.async_create_task(self._async_check_boost_progress())
+
+    def _start_boost_monitor(self) -> None:
+        if self._unsub_boost_monitor:
+            return
+        self._unsub_boost_monitor = async_track_time_interval(
+            self.hass, self._async_check_boost_progress, BOOST_MONITOR_INTERVAL
+        )
+
+    def _stop_boost_monitor(self) -> None:
+        if self._unsub_boost_monitor:
+            self._unsub_boost_monitor()
+            self._unsub_boost_monitor = None
+
+    async def _async_start_supply_boost(self) -> None:
+        """Crank tankless to max temp when a zone first calls for heat."""
+        if not self.params.supply_control_enabled or not self.params.supply_boost_enabled:
+            return
+        if self._supply_boost_active or not self.params.supply_entity_id:
+            return
+
+        outdoor = self.outdoor_temp
+        if outdoor is None:
+            return
+
+        optimal = self._compute_supply_water_temp(outdoor)
+        max_temp = self.params.supply_temp_max
+        if max_temp <= optimal + SUPPLY_DEADBAND:
+            return
+
+        inlet = self.return_water_actual
+        if inlet is not None and inlet >= optimal - BOOST_INLET_TOLERANCE:
+            _LOGGER.debug(
+                "Supply boost skipped: inlet %.1fF already near optimal %.1fF",
+                inlet, optimal,
+            )
+            return
+
+        self._supply_boost_active = True
+        self._supply_boost_optimal = optimal
+        _LOGGER.info(
+            "Supply boost START: zone heat demand, inlet=%s, optimal=%.1fF, max=%.1fF",
+            f"{inlet:.1f}F" if inlet is not None else "unknown",
+            optimal,
+            max_temp,
+        )
+        await self._async_set_supply_temperature(max_temp, force=True)
+        await self._async_set_tankless_scan_interval(TANKLESS_FAST_SCAN_INTERVAL)
+        self._start_boost_monitor()
+
+    async def _async_end_supply_boost(self, *, cancelled: bool = False) -> None:
+        """Restore optimal supply temp and normal tankless polling."""
+        if not self._supply_boost_active:
+            return
+
+        optimal = self._supply_boost_optimal
+        inlet = self.return_water_actual
+        self._supply_boost_active = False
+        self._supply_boost_optimal = None
+        self._stop_boost_monitor()
+
+        if cancelled:
+            _LOGGER.info("Supply boost CANCELLED: no zones heating")
+        else:
+            _LOGGER.info(
+                "Supply boost COMPLETE: inlet=%s, restoring optimal %.1fF",
+                f"{inlet:.1f}F" if inlet is not None else "unknown",
+                optimal or 0,
+            )
+
+        if optimal is not None:
+            await self._async_set_supply_temperature(optimal, force=True)
+        await self._async_set_tankless_scan_interval(TANKLESS_NORMAL_SCAN_INTERVAL)
+
+    async def _async_check_boost_progress(self, _now=None) -> None:
+        """End boost once inlet water reaches the optimal supply target."""
+        if not self._supply_boost_active:
+            return
+        if not self._any_zone_heating():
+            await self._async_end_supply_boost(cancelled=True)
+            return
+
+        inlet = self.return_water_actual
+        optimal = self._supply_boost_optimal
+        if inlet is None or optimal is None:
+            return
+
+        if inlet >= optimal - BOOST_INLET_TOLERANCE:
+            await self._async_end_supply_boost()
+
+    async def _async_set_tankless_scan_interval(self, seconds: int) -> None:
+        """Change Optimal Tankless cloud polling interval."""
+        if self._tankless_scan_interval == seconds:
+            return
+        if not self.hass.services.has_service("optimaltankless", "set_scan_interval"):
+            _LOGGER.debug("optimaltankless.set_scan_interval not available")
+            return
+        await self.hass.services.async_call(
+            "optimaltankless",
+            "set_scan_interval",
+            {"scan_interval": seconds},
+            blocking=True,
+        )
+        self._tankless_scan_interval = seconds
+        _LOGGER.info("Tankless scan interval set to %ds", seconds)
+
+    async def _async_set_supply_temperature(self, target: float, *, force: bool = False) -> bool:
+        """Command the supply water heater entity to a target temperature."""
+        entity_id = self.params.supply_entity_id
+        if not entity_id:
+            return False
+
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            _LOGGER.debug("Supply entity %s unavailable", entity_id)
+            return False
+
+        try:
+            if entity_id.startswith("climate."):
+                current = float(state.attributes.get("temperature", 0))
+            else:
+                current = float(state.state)
+        except (ValueError, TypeError):
+            current = 0.0
+
+        if not force and abs(current - target) < SUPPLY_DEADBAND:
+            return False
+
+        set_value = round(target) if entity_id.startswith("water_heater.") else target
+        _LOGGER.info("Setting supply %s to %sF (was %.1fF)", entity_id, set_value, current)
+
+        if entity_id.startswith("climate."):
+            await self.hass.services.async_call(
+                "climate", "set_temperature",
+                {"entity_id": entity_id, "temperature": set_value},
+                blocking=True,
+            )
+        elif entity_id.startswith("number."):
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": entity_id, "value": set_value},
+                blocking=True,
+            )
+        elif entity_id.startswith("water_heater."):
+            await self.hass.services.async_call(
+                "water_heater", "set_temperature",
+                {"entity_id": entity_id, "temperature": set_value},
+                blocking=True,
+            )
+        else:
+            _LOGGER.warning("Unsupported entity type for supply control: %s", entity_id)
+            return False
+        return True
+
     def _compute_supply_water_temp(self, outdoor: float) -> float:
         """Compute target supply water temperature based on outdoor temp.
 
@@ -318,60 +541,13 @@ class OutdoorResetController:
         """Adjust the water heater setpoint based on outdoor temperature."""
         if not self.params.supply_control_enabled:
             return
-        entity_id = self.params.supply_entity_id
-        if not entity_id:
+        if self._supply_boost_active:
             return
 
         target_supply = self._compute_supply_water_temp(outdoor)
-
-        # Determine entity type and read current value
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in ("unavailable", "unknown"):
-            _LOGGER.debug("Supply entity %s unavailable", entity_id)
-            return
-
-        # Deadband check
-        try:
-            if entity_id.startswith("climate."):
-                current = float(state.attributes.get("temperature", 0))
-            else:
-                current = float(state.state)
-        except (ValueError, TypeError):
-            current = 0.0
-
-        if abs(current - target_supply) < SUPPLY_DEADBAND:
-            _LOGGER.debug(
-                "Supply water: skipping %s (current=%.1f, target=%.1f)",
-                entity_id, current, target_supply,
-            )
-            return
-
-        _LOGGER.info(
-            "Supply water reset: outdoor=%.1f, setting %s to %.1fF",
-            outdoor, entity_id, target_supply,
-        )
-
-        # Call appropriate service based on entity domain
-        if entity_id.startswith("climate."):
-            await self.hass.services.async_call(
-                "climate", "set_temperature",
-                {"entity_id": entity_id, "temperature": target_supply},
-                blocking=True,
-            )
-        elif entity_id.startswith("number."):
-            await self.hass.services.async_call(
-                "number", "set_value",
-                {"entity_id": entity_id, "value": target_supply},
-                blocking=True,
-            )
-        elif entity_id.startswith("water_heater."):
-            await self.hass.services.async_call(
-                "water_heater", "set_temperature",
-                {"entity_id": entity_id, "temperature": target_supply},
-                blocking=True,
-            )
-        else:
-            _LOGGER.warning("Unsupported entity type for supply control: %s", entity_id)
+        await self._async_set_supply_temperature(target_supply)
+        if self._tankless_scan_interval != TANKLESS_NORMAL_SCAN_INTERVAL:
+            await self._async_set_tankless_scan_interval(TANKLESS_NORMAL_SCAN_INTERVAL)
 
     # ------------------------------------------------------------------
     # Preheat: start heating before outdoor drops below shutdown
@@ -714,6 +890,7 @@ class OutdoorResetParams:
         self.supply_temp_max: float = DEFAULT_SUPPLY_TEMP_MAX
         self.supply_entity_id: str | None = None  # set via text entity or config
         self.supply_control_enabled: bool = False
+        self.supply_boost_enabled: bool = True
         # Preheat
         self.preheat_enabled: bool = True
         self.thermal_lag: float = DEFAULT_THERMAL_LAG  # min per degree F
@@ -950,6 +1127,7 @@ def get_switch_entities(
     entities: list[SwitchEntity] = [
         OutdoorResetEnableSwitch(coordinator, controller),
         SupplyWaterControlSwitch(coordinator, controller),
+        SupplyWaterBoostSwitch(coordinator, controller),
         PreheatEnableSwitch(coordinator, controller),
     ]
     for thm in coordinator.get_thm_devices():
@@ -1447,6 +1625,55 @@ class SupplyWaterControlSwitch(SwitchEntity):
         self.async_write_ha_state()
 
 
+class SupplyWaterBoostSwitch(SwitchEntity):
+    """Enable fast heat-up boost when a zone first calls for heat."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Supply Water Boost Enabled"
+    _attr_icon = "mdi:rocket-launch"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_supply_water_boost_enabled"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.supply_boost_enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "boost_active": self._controller.supply_boost_active,
+            "boost_optimal_target": self._controller._supply_boost_optimal,
+            "fast_scan_seconds": TANKLESS_FAST_SCAN_INTERVAL,
+            "normal_scan_seconds": TANKLESS_NORMAL_SCAN_INTERVAL,
+        }
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.supply_boost_enabled = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.supply_boost_enabled = False
+        if self._controller.supply_boost_active:
+            await self._controller._async_end_supply_boost(cancelled=True)
+        self.async_write_ha_state()
+
+
 class SupplyWaterTargetSensor(SensorEntity):
     """Displays the calculated supply water temperature target."""
 
@@ -1489,6 +1716,10 @@ class SupplyWaterTargetSensor(SensorEntity):
             "supply_max": self._controller.params.supply_temp_max,
             "supply_entity_id": self._controller.params.supply_entity_id or "not configured",
             "supply_control_enabled": self._controller.params.supply_control_enabled,
+            "supply_boost_enabled": self._controller.params.supply_boost_enabled,
+            "supply_boost_active": self._controller.supply_boost_active,
+            "boost_optimal_target": self._controller._supply_boost_optimal,
+            "inlet_temp": self._controller.return_water_actual,
         }
 
 
