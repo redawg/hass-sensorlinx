@@ -260,7 +260,6 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize."""
-        self._config_entry = config_entry
         self._options: dict[str, Any] = {}
 
     async def async_step_init(
@@ -276,7 +275,7 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="init",
-            data_schema=_external_switch_schema(dict(self._config_entry.options)),
+            data_schema=_external_switch_schema(dict(self.config_entry.options)),
         )
 
     async def async_step_heating_source(
@@ -297,7 +296,7 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="heating_source",
             data_schema=_heating_source_schema(
-                water_heaters, dict(self._config_entry.options)
+                water_heaters, dict(self.config_entry.options)
             ),
         )
 
@@ -315,7 +314,7 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
 
         return self.async_show_form(
             step_id="zone_valves",
-            data_schema=_zone_valves_schema(zone_names, dict(self._config_entry.options)),
+            data_schema=_zone_valves_schema(zone_names, dict(self.config_entry.options)),
         )
 
     def _discover_water_heaters(self) -> dict[str, str]:
@@ -381,7 +380,7 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
     def _get_zone_names(self) -> list[tuple[str, str]]:
         """Get zone key/label pairs from the coordinator."""
         domain_data = self.hass.data.get(DOMAIN, {})
-        coordinator = domain_data.get(self._config_entry.entry_id)
+        coordinator = domain_data.get(self.config_entry.entry_id)
         if coordinator is None:
             return []
         zones: list[tuple[str, str]] = []
@@ -392,12 +391,17 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def _save_all_options(self) -> config_entries.ConfigFlowResult:
         """Persist all options and propagate to the outdoor reset controller."""
-        new_options = dict(self._config_entry.options)
+        new_options = dict(self.config_entry.options)
         new_options.update(self._options)
+
+        _LOGGER.info(
+            "Saving options flow result (%d keys): %s",
+            len(new_options), list(new_options.keys()),
+        )
 
         # Propagate to the outdoor reset controller if loaded
         domain_data = self.hass.data.get(DOMAIN, {})
-        controller = domain_data.get(f"{self._config_entry.entry_id}_outdoor_reset")
+        controller = domain_data.get(f"{self.config_entry.entry_id}_outdoor_reset")
         if controller is not None:
             if new_options.get(CONF_SUPPLY_ENTITY):
                 controller.params.supply_entity_id = new_options[CONF_SUPPLY_ENTITY]

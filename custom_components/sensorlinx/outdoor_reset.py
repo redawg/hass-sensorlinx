@@ -770,24 +770,36 @@ async def async_setup_outdoor_reset(
     async def handle_set_supply_entity(call):
         entity_id = call.data.get("entity_id")
         controller.params.supply_entity_id = entity_id
-        new_options = dict(entry.options)
+        live_entry = hass.config_entries.async_get_entry(entry.entry_id)
+        if live_entry is None:
+            _LOGGER.error("Cannot find config entry for options update")
+            return
+        new_options = dict(live_entry.options)
         new_options["supply_entity_id"] = entity_id
-        hass.config_entries.async_update_entry(entry, options=new_options)
+        hass.config_entries.async_update_entry(live_entry, options=new_options)
         _LOGGER.info("Supply water entity set to: %s", entity_id)
 
     async def handle_set_forecast_entity(call):
         entity_id = call.data.get("entity_id")
         controller.params.forecast_entity_id = entity_id
-        new_options = dict(entry.options)
+        live_entry = hass.config_entries.async_get_entry(entry.entry_id)
+        if live_entry is None:
+            _LOGGER.error("Cannot find config entry for options update")
+            return
+        new_options = dict(live_entry.options)
         new_options["forecast_entity_id"] = entity_id
-        hass.config_entries.async_update_entry(entry, options=new_options)
+        hass.config_entries.async_update_entry(live_entry, options=new_options)
         _LOGGER.info("Forecast entity set to: %s", entity_id)
 
     async def handle_set_hydronic_sensors(call):
         supply_sensor = call.data.get("supply_temp_sensor")
         return_sensor = call.data.get("return_temp_sensor")
         flow_sensor = call.data.get("flow_rate_sensor")
-        new_options = dict(entry.options)
+        live_entry = hass.config_entries.async_get_entry(entry.entry_id)
+        if live_entry is None:
+            _LOGGER.error("Cannot find config entry %s for options update", entry.entry_id)
+            return
+        new_options = dict(live_entry.options)
         if supply_sensor:
             controller.params.supply_temp_sensor = supply_sensor
             new_options["supply_temp_sensor"] = supply_sensor
@@ -797,9 +809,13 @@ async def async_setup_outdoor_reset(
         if flow_sensor:
             controller.params.flow_rate_sensor = flow_sensor
             new_options["flow_rate_sensor"] = flow_sensor
-        hass.config_entries.async_update_entry(entry, options=new_options)
         _LOGGER.info(
-            "Hydronic sensors: supply=%s, return=%s, flow=%s",
+            "Updating config entry options: %s (entry_id=%s)",
+            new_options, live_entry.entry_id,
+        )
+        hass.config_entries.async_update_entry(live_entry, options=new_options)
+        _LOGGER.info(
+            "Hydronic sensors set: supply=%s, return=%s, flow=%s",
             supply_sensor, return_sensor, flow_sensor,
         )
 
