@@ -175,9 +175,12 @@ automation:
           message: "Zone 3 floor heating is now active"
 ```
 
-## HACS install (optional)
+## HACS install (recommended)
 
-This repo includes `hacs.json`. Add it as a custom repository in HACS if you publish it to GitHub.
+1. HACS → Integrations → ⋮ → Custom repositories
+2. Add `https://github.com/redawg/hass-sensorlinx` as category **Integration**
+3. Search **HBX SensorLinx** → Download
+4. Restart Home Assistant → Add integration
 
 ## Credits
 

@@ -1,11 +1,12 @@
 {
   "domain": "sensorlinx",
   "name": "HBX SensorLinx",
-  "codeowners": ["@andre"],
+  "codeowners": ["@redawg"],
   "config_flow": true,
-  "documentation": "https://github.com/andre/hbx-sensorlinx-ha",
+  "documentation": "https://github.com/redawg/hass-sensorlinx",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/redawg/hass-sensorlinx/issues",
   "requirements": ["pysensorlinx>=0.5.5"],
   "version": "0.1.0"
 }
