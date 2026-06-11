@@ -371,22 +371,30 @@ class OutdoorResetController:
         """Record outdoor temp reading for trend analysis."""
         self._temp_history.append((datetime.now(), outdoor))
 
-    def _estimate_minutes_to_shutdown(self, outdoor: float) -> float | None:
-        """Estimate minutes until outdoor temp crosses shutdown threshold.
-
-        Uses linear regression on recent history, or forecast if available.
-        Returns None if temp is not dropping toward shutdown.
-        """
+    async def _estimate_minutes_to_shutdown_async(self, outdoor: float) -> float | None:
+        """Async version that checks forecast first, then falls back to trend."""
         shutdown = self.params.shutdown
-
-        # Already below shutdown — no preheat needed (normal heating active)
         if outdoor < shutdown:
             return 0.0
 
-        # Try forecast first
-        minutes_from_forecast = self._check_forecast_for_shutdown()
+        minutes_from_forecast = await self._check_forecast_for_shutdown()
         if minutes_from_forecast is not None:
             return minutes_from_forecast
+
+        return self._estimate_minutes_to_shutdown_trend(outdoor)
+
+    def _estimate_minutes_to_shutdown(self, outdoor: float) -> float | None:
+        """Sync trend-only estimate (used by sensor for attributes)."""
+        if outdoor < self.params.shutdown:
+            return 0.0
+        return self._estimate_minutes_to_shutdown_trend(outdoor)
+
+    def _estimate_minutes_to_shutdown_trend(self, outdoor: float) -> float | None:
+        """Estimate using trend analysis on recent outdoor temp history.
+
+        Returns None if temp is not dropping toward shutdown.
+        """
+        shutdown = self.params.shutdown
 
         # Fallback: trend-based using temp history
         if len(self._temp_history) < 4:
@@ -424,42 +432,91 @@ class OutdoorResetController:
         )
         return minutes_to_shutdown
 
-    def _check_forecast_for_shutdown(self) -> float | None:
-        """Check weather forecast entity for when temp will cross shutdown."""
-        forecast_entity = self.params.forecast_entity_id
-        if not forecast_entity:
+    async def _check_forecast_for_shutdown(self) -> float | None:
+        """Check weather forecast for when temp will cross shutdown.
+
+        Uses HA's weather.get_forecasts service (2024+) with fallback to
+        entity attributes. Tries forecast_entity_id first, then any available
+        weather entity.
+        """
+        forecast_entities = []
+        if self.params.forecast_entity_id:
+            forecast_entities.append(self.params.forecast_entity_id)
+
+        # Auto-discover weather entities as fallback
+        for state in self.hass.states.async_all("weather"):
+            if state.entity_id not in forecast_entities:
+                forecast_entities.append(state.entity_id)
+
+        if not forecast_entities:
             return None
 
-        state = self.hass.states.get(forecast_entity)
-        if state is None:
-            return None
+        for entity_id in forecast_entities:
+            result = await self._get_hourly_forecast(entity_id)
+            if result is not None:
+                return result
 
-        # Try to get forecast from attributes (older HA format)
-        forecast = state.attributes.get("forecast", [])
-        if not forecast:
-            return None
+        return None
 
+    async def _get_hourly_forecast(self, entity_id: str) -> float | None:
+        """Get hourly forecast from a weather entity and find shutdown crossing."""
         shutdown = self.params.shutdown
         now = datetime.now()
 
+        # Try HA 2024+ service call (weather.get_forecasts)
+        try:
+            response = await self.hass.services.async_call(
+                "weather", "get_forecasts",
+                {"entity_id": entity_id, "type": "hourly"},
+                blocking=True,
+                return_response=True,
+            )
+            if response and entity_id in response:
+                forecast = response[entity_id].get("forecast", [])
+                if forecast:
+                    return self._find_shutdown_crossing(forecast, shutdown, now)
+        except Exception as exc:
+            _LOGGER.debug("Forecast service call failed for %s: %s", entity_id, exc)
+
+        # Fallback: check entity attributes (older HA)
+        state = self.hass.states.get(entity_id)
+        if state and state.attributes.get("forecast"):
+            forecast = state.attributes["forecast"]
+            return self._find_shutdown_crossing(forecast, shutdown, now)
+
+        return None
+
+    def _find_shutdown_crossing(
+        self, forecast: list[dict], shutdown: float, now: datetime
+    ) -> float | None:
+        """Scan forecast entries to find when temp first drops below shutdown."""
         for entry in forecast:
             fc_time_str = entry.get("datetime")
             fc_temp = entry.get("temperature")
             if fc_time_str is None or fc_temp is None:
                 continue
 
+            # Convert forecast temp to F if needed (check unit)
             try:
-                fc_time = datetime.fromisoformat(fc_time_str.replace("Z", "+00:00"))
-                fc_time_local = fc_time.replace(tzinfo=None)
+                fc_temp_f = float(fc_temp)
             except (ValueError, TypeError):
                 continue
 
-            if fc_temp < shutdown:
-                minutes_away = (fc_time_local - now).total_seconds() / 60.0
+            if fc_temp_f < shutdown:
+                try:
+                    fc_time = datetime.fromisoformat(
+                        fc_time_str.replace("Z", "+00:00")
+                    )
+                    # Strip timezone for comparison with local now
+                    fc_time_naive = fc_time.replace(tzinfo=None)
+                    minutes_away = (fc_time_naive - now).total_seconds() / 60.0
+                except (ValueError, TypeError):
+                    continue
+
                 if minutes_away > 0:
                     _LOGGER.debug(
-                        "Preheat forecast: temp %.1f < shutdown %.1f at %s (%.0f min away)",
-                        fc_temp, shutdown, fc_time_str, minutes_away,
+                        "Preheat forecast: %.1f°F < shutdown %.1f°F at %s (%.0f min)",
+                        fc_temp_f, shutdown, fc_time_str, minutes_away,
                     )
                     return minutes_away
 
@@ -501,7 +558,7 @@ class OutdoorResetController:
 
         self._record_outdoor_temp(outdoor)
 
-        minutes_to_shutdown = self._estimate_minutes_to_shutdown(outdoor)
+        minutes_to_shutdown = await self._estimate_minutes_to_shutdown_async(outdoor)
         if minutes_to_shutdown is None:
             # Can't estimate — not cooling, no preheat needed
             if self._preheat_active:
