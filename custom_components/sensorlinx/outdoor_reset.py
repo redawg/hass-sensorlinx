@@ -46,8 +46,17 @@ DEFAULT_BASE = 70.0
 DEFAULT_OVERSHOOT = 6.0
 DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
-DEFAULT_FLOOR_MAX = 80.0
+DEFAULT_FLOOR_MAX = 80.0  # wood floor safety cap
+DEFAULT_TILE_FLOOR_MAX = 88.0  # tile zones (e.g. laundry) may run hotter
+TILE_FLOOR_ZONES = frozenset({"laundry"})
 DEFAULT_FLOOR_TARGET = 70.0
+
+
+def default_zone_floor_max(zone_key: str, wood_default: float = DEFAULT_FLOOR_MAX) -> float:
+    """Default per-zone floor safety cap."""
+    if zone_key in TILE_FLOOR_ZONES:
+        return DEFAULT_TILE_FLOOR_MAX
+    return wood_default
 DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 
@@ -155,6 +164,12 @@ class OutdoorResetController(NightSetbackMixin):
     def zone_target(self, zone_offset: float) -> float:
         return round(self.calculated_target + zone_offset, 1)
 
+    def zone_floor_max(self, zone_name: str) -> float:
+        """Per-zone floor safety cap (wood default 80F, tile zones higher)."""
+        if zone_name in self.params.zone_floor_max:
+            return self.params.zone_floor_max[zone_name]
+        return default_zone_floor_max(zone_name, self.params.floor_max)
+
     async def async_setup(self) -> None:
         """Start periodic updates."""
         self._unsub_interval = async_track_time_interval(
@@ -250,11 +265,12 @@ class OutdoorResetController(NightSetbackMixin):
                 except (ValueError, TypeError):
                     pass
 
-            # Safety cap: turn off if floor exceeds max
-            if floor_temp is not None and floor_temp >= self.params.floor_max:
+            # Safety cap: turn off if floor exceeds zone max
+            zone_cap = self.zone_floor_max(zone_name)
+            if floor_temp is not None and floor_temp >= zone_cap:
                 _LOGGER.warning(
                     "Floor temp %.1f°F >= max %.1f°F for %s, turning off",
-                    floor_temp, self.params.floor_max, zone_name,
+                    floor_temp, zone_cap, zone_name,
                 )
                 await self.hass.services.async_call(
                     "climate", "turn_off",
@@ -345,8 +361,9 @@ class OutdoorResetController(NightSetbackMixin):
             # Floor is close to target — maintain
             setpoint = floor_target + 1.0
 
-        # Clamp to reasonable range
-        return round(max(65.0, min(setpoint, self.params.floor_max - 2)), 1)
+        # Clamp to reasonable range below zone safety cap
+        cap = self.zone_floor_max(zone_name)
+        return round(max(65.0, min(setpoint, cap - 2)), 1)
 
     @property
     def supply_boost_active(self) -> bool:
@@ -971,6 +988,7 @@ class OutdoorResetParams:
         self.shutdown: float = DEFAULT_SHUTDOWN
         self.design_outdoor: float = DEFAULT_DESIGN_OUTDOOR
         self.floor_max: float = DEFAULT_FLOOR_MAX
+        self.zone_floor_max: dict[str, float] = {}
         self.zone_offsets: dict[str, float] = {}
         self.floor_control_enabled: dict[str, bool] = {}
         self.floor_targets: dict[str, float] = {}
@@ -1041,6 +1059,12 @@ async def async_setup_outdoor_reset(
         elif key.startswith("floor_mode_"):
             zone_key = key[len("floor_mode_"):]
             params.floor_control_enabled[zone_key] = bool(value)
+        elif key.startswith("floor_max_"):
+            zone_key = key[len("floor_max_"):]
+            try:
+                params.zone_floor_max[zone_key] = float(value)
+            except (ValueError, TypeError):
+                pass
 
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
@@ -1148,7 +1172,7 @@ def get_number_entities(
         ),
         OutdoorResetNumberEntity(
             coordinator, controller, "floor_temp_max",
-            "Max Floor Temp (Safety Cap)", DEFAULT_FLOOR_MAX, 75, 85, 1,
+            "Max Floor Temp (Wood Default)", DEFAULT_FLOOR_MAX, 75, 85, 1,
             "mdi:alert-octagon",
         ),
         OutdoorResetNumberEntity(
@@ -1194,10 +1218,19 @@ def get_number_entities(
                 f"Valve Count: {thm.name}", thm, entry_id,
             )
         )
+        zone_cap = default_zone_floor_max(zone_name, controller.params.floor_max)
+        cap_slider_max = 95 if zone_name in TILE_FLOOR_ZONES else 85
+        entities.append(
+            OutdoorResetZoneFloorMaxEntity(
+                coordinator, controller, zone_name,
+                f"Floor Max (Safety): {thm.name}", zone_cap, 70, cap_slider_max, 1,
+                thm, entry_id,
+            )
+        )
         entities.append(
             OutdoorResetFloorTargetEntity(
                 coordinator, controller, zone_name,
-                f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, 80, 0.5,
+                f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, zone_cap, 0.5,
                 thm, entry_id,
             )
         )
@@ -1429,6 +1462,86 @@ class OutdoorResetZoneOffsetEntity(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.zone_offsets[self._zone_key] = value
         self.async_write_ha_state()
+
+
+class OutdoorResetZoneFloorMaxEntity(RestoreNumber):
+    """Per-zone floor temperature safety cap (wood vs tile)."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:alert-octagon"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        name: str,
+        default: float,
+        min_val: float,
+        max_val: float,
+        step: float,
+        thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._thm_device = thm_device
+        self._entry_id = entry_id
+        self._default = default
+        self._attr_name = name
+        self._attr_native_min_value = min_val
+        self._attr_native_max_value = max_val
+        self._attr_native_step = step
+        self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_max_{zone_key}"
+        self._attr_native_value = default
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"floor_max_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    self._attr_native_value = float(saved)
+        if self._attr_native_value == self._default:
+            last = await self.async_get_last_number_data()
+            if last and last.native_value is not None:
+                self._attr_native_value = last.native_value
+        self._controller.params.zone_floor_max[self._zone_key] = self._attr_native_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.zone_floor_max[self._zone_key] = value
+        self.async_write_ha_state()
+        self._persist_to_options(value)
+
+    @callback
+    def _persist_to_options(self, value: float) -> None:
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"floor_max_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = value
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
 
 
 # ---------------------------------------------------------------------------

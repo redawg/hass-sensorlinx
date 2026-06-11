@@ -42,6 +42,14 @@ SUPPLY_ENTITIES = {
 ADJUST_STEP = 5.0
 IDEAL_DELTA_T = (10.0, 20.0)
 TANKLESS_MAX_TEMP = 140.0
+ZONE_FLOOR_TYPE = {
+    "laundry": "tile",
+    "living_room": "wood",
+    "main_area": "wood",
+    "main_office": "wood",
+}
+DEFAULT_WOOD_FLOOR_MAX = 80.0
+DEFAULT_TILE_FLOOR_MAX = 88.0
 DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 COST_ENTITY = "number.sensorlinx_outdoor_reset_electricity_cost_per_kwh"
 POWER_DRAW_ENTITY = "sensor.main_water_heater_power_draw"
@@ -139,6 +147,26 @@ def detect_short_cycling(cycles):
         return 0, 0
     short = [c for c in cycles if c["duration_min"] < 15]
     return len(short), len(cycles)
+
+
+def get_zone_floor_max(zone_key, states):
+    """Read per-zone floor safety cap from HA (wood 80F, tile laundry 88F)."""
+    entity = states.get(
+        f"number.sensorlinx_outdoor_reset_floor_max_{zone_key}", {}
+    )
+    state = entity.get("state")
+    try:
+        return float(state)
+    except (TypeError, ValueError):
+        pass
+    wood = states.get("number.sensorlinx_outdoor_reset_max_floor_temp_safety_cap", {})
+    try:
+        wood_max = float(wood.get("state", DEFAULT_WOOD_FLOOR_MAX))
+    except (TypeError, ValueError):
+        wood_max = DEFAULT_WOOD_FLOOR_MAX
+    if ZONE_FLOOR_TYPE.get(zone_key) == "tile":
+        return DEFAULT_TILE_FLOOR_MAX
+    return wood_max
 
 
 def _avg_field(samples, field):
@@ -696,12 +724,16 @@ def main(apply_supply=False):
     print("-" * 78)
     print()
 
-    floor_max_entity = states.get("number.sensorlinx_outdoor_reset_max_floor_temp_safety_cap", {})
-    floor_max = float(floor_max_entity.get("state", 80))
-    print(f"  Safety cap: {floor_max:.0f}F (wood floor maximum)")
+    wood_cap_entity = states.get("number.sensorlinx_outdoor_reset_max_floor_temp_safety_cap", {})
+    try:
+        wood_cap = float(wood_cap_entity.get("state", DEFAULT_WOOD_FLOOR_MAX))
+    except (TypeError, ValueError):
+        wood_cap = DEFAULT_WOOD_FLOOR_MAX
+    print(f"  Wood floor safety default: {wood_cap:.0f}F")
+    print(f"  Laundry (tile) may use a higher per-zone cap")
     print()
-    print(f"  {'Zone':<14} {'Floor Now':<11} {'Floor Max':<11} {'Margin':<9} {'Status'}")
-    print(f"  {'----':<14} {'---------':<11} {'---------':<11} {'------':<9} {'------'}")
+    print(f"  {'Zone':<14} {'Type':<6} {'Cap':<6} {'Floor Now':<11} {'Peak 24h':<11} {'Margin':<9} {'Status'}")
+    print(f"  {'----':<14} {'----':<6} {'---':<6} {'---------':<11} {'--------':<11} {'------':<9} {'------'}")
 
     for z in ZONES:
         data = zone_data[z]
@@ -709,16 +741,21 @@ def main(apply_supply=False):
             continue
         floors = [float(s["floor_temp"]) for s in data if s.get("floor_temp") is not None]
         if floors:
+            zone_cap = get_zone_floor_max(z, states)
+            floor_type = ZONE_FLOOR_TYPE.get(z, "wood")
             current = floors[-1]
             peak = max(floors)
-            margin = floor_max - peak
+            margin = zone_cap - peak
             if margin < 2:
                 status = "WARNING - close to limit"
             elif margin < 5:
                 status = "Monitor"
             else:
                 status = "Safe"
-            print(f"  {ZONE_LABELS[z]:<14} {current:.1f}F     {peak:.1f}F     {margin:.1f}F    {status}")
+            print(
+                f"  {ZONE_LABELS[z]:<14} {floor_type:<6} {zone_cap:.0f}F   "
+                f"{current:.1f}F     {peak:.1f}F     {margin:.1f}F    {status}"
+            )
 
     print()
 
@@ -894,10 +931,11 @@ def main(apply_supply=False):
             )
 
         # Floor near safety limit
-        if peak_floor > floor_max - 3:
+        zone_cap = get_zone_floor_max(z, states)
+        if peak_floor > zone_cap - 3:
             recommendations.append(
-                f"[{ZONE_LABELS[z]}] Floor peaked at {peak_floor:.1f}F, only {floor_max - peak_floor:.1f}F "
-                f"from safety cap. Consider reducing max output for this zone."
+                f"[{ZONE_LABELS[z]}] Floor peaked at {peak_floor:.1f}F, only {zone_cap - peak_floor:.1f}F "
+                f"from {zone_cap:.0f}F safety cap. Consider reducing max output for this zone."
             )
 
         # Cycles
@@ -969,7 +1007,14 @@ def main(apply_supply=False):
         current_out = outdoor_temps[-1]
         curve_out = float(curve_target.get("state", 70)) if curve_target else 70
         print(f"  Current operating point: {current_out:.0f}F outdoor -> {curve_out}F curve target")
-        print(f"  System capacity headroom: {floor_max - max(max(floors) for z in ZONES for floors in [[float(s['floor_temp']) for s in zone_data[z] if s.get('floor_temp')]] if floors):.0f}F to safety cap")
+        tightest = min(
+            get_zone_floor_max(z, states) - max(
+                [float(s["floor_temp"]) for s in zone_data[z] if s.get("floor_temp") is not None] or [0]
+            )
+            for z in ZONES
+            if zone_data[z]
+        )
+        print(f"  Tightest zone margin to safety cap: {tightest:.0f}F")
 
     # --- SECTIONS 9-10: Supply water agent ---
     hydronic_metrics = analyze_hydronic_performance(recent, zone_data, states)
