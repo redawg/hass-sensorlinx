@@ -41,6 +41,8 @@ _LOGGER = logging.getLogger(__name__)
 
 LOG_DIR = "/config/www/sensorlinx_thermal_log"
 SAMPLE_INTERVAL = timedelta(minutes=5)
+FAST_SAMPLE_INTERVAL = timedelta(seconds=15)
+TANKLESS_HEATING_ENTITY = "binary_sensor.main_water_heater_heating"
 
 # Ecobee / main HVAC entities
 ECOBEE_CLIMATE_ENTITY = "climate.main_floor"
@@ -76,7 +78,11 @@ TANKLESS_WATER_HEATER = "water_heater.main_water_heater"
 
 
 class ThermalDataLogger:
-    """Periodically logs thermal state for ML training."""
+    """Periodically logs thermal state for ML training.
+
+    Uses fast 15-second polling when the tankless is firing or any zone
+    is actively heating, otherwise normal 5-minute intervals.
+    """
 
     def __init__(
         self,
@@ -87,7 +93,10 @@ class ThermalDataLogger:
         self.hass = hass
         self.coordinator = coordinator
         self.controller = controller
-        self._unsub = None
+        self._unsub_normal = None
+        self._unsub_fast = None
+        self._fast_mode = False
+        self._unsub_state_listener = None
         self._ensure_log_dir()
 
     def _ensure_log_dir(self) -> None:
@@ -103,18 +112,86 @@ class ThermalDataLogger:
         now = datetime.now()
         return os.path.join(LOG_DIR, f"thermal_{now.strftime('%Y-%m')}.jsonl")
 
-    async def async_setup(self) -> None:
-        """Start periodic data collection."""
-        self._unsub = async_track_time_interval(
+    def _is_system_active(self) -> bool:
+        """Return True if tankless is heating OR any zone is actively heating."""
+        # Check tankless
+        wh_state = self.hass.states.get(TANKLESS_HEATING_ENTITY)
+        if wh_state and wh_state.state == "on":
+            return True
+        # Check zone demand
+        for thm in self.coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            entity_id = f"climate.{zone_name}_{zone_name}"
+            state = self.hass.states.get(entity_id)
+            if state and state.attributes.get("hvac_action") == "heating":
+                return True
+        return False
+
+    def _switch_to_fast(self) -> None:
+        """Activate fast 15-second polling."""
+        if self._fast_mode:
+            return
+        self._fast_mode = True
+        if self._unsub_normal:
+            self._unsub_normal()
+            self._unsub_normal = None
+        self._unsub_fast = async_track_time_interval(
+            self.hass, self._async_collect, FAST_SAMPLE_INTERVAL
+        )
+        _LOGGER.info("Thermal logger: fast mode ON (15s intervals)")
+
+    def _switch_to_normal(self) -> None:
+        """Revert to normal 5-minute polling."""
+        if not self._fast_mode:
+            return
+        self._fast_mode = False
+        if self._unsub_fast:
+            self._unsub_fast()
+            self._unsub_fast = None
+        self._unsub_normal = async_track_time_interval(
             self.hass, self._async_collect, SAMPLE_INTERVAL
         )
-        _LOGGER.info("Thermal data logger started (interval=%s)", SAMPLE_INTERVAL)
+        _LOGGER.info("Thermal logger: normal mode (5min intervals)")
+
+    @callback
+    def _handle_heating_state_change(self, event) -> None:
+        """React to tankless or zone heating state changes."""
+        if self._is_system_active():
+            self._switch_to_fast()
+        else:
+            self._switch_to_normal()
+
+    async def async_setup(self) -> None:
+        """Start periodic data collection with adaptive rate."""
+        self._unsub_normal = async_track_time_interval(
+            self.hass, self._async_collect, SAMPLE_INTERVAL
+        )
+        # Build list of entities to watch for heating activity
+        watch_entities = [TANKLESS_HEATING_ENTITY]
+        for thm in self.coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            watch_entities.append(f"climate.{zone_name}_{zone_name}")
+
+        self._unsub_state_listener = async_track_state_change_event(
+            self.hass,
+            watch_entities,
+            self._handle_heating_state_change,
+        )
+        # Check initial state
+        if self._is_system_active():
+            self._switch_to_fast()
+        _LOGGER.info("Thermal data logger started (normal=%s, fast=%s)",
+                     SAMPLE_INTERVAL, FAST_SAMPLE_INTERVAL)
 
     @callback
     def async_unload(self) -> None:
         """Stop collection."""
-        if self._unsub:
-            self._unsub()
+        if self._unsub_normal:
+            self._unsub_normal()
+        if self._unsub_fast:
+            self._unsub_fast()
+        if self._unsub_state_listener:
+            self._unsub_state_listener()
 
     async def _async_collect(self, _now=None) -> None:
         """Collect and write one sample for each zone."""
@@ -144,6 +221,7 @@ class ThermalDataLogger:
 
             sample = {
                 "ts": timestamp,
+                "sample_mode": "fast" if self._fast_mode else "normal",
                 "outdoor_temp": outdoor_temp,
                 "zone": zone_name,
                 "room_temp": room_temp,
