@@ -754,6 +754,15 @@ async def async_setup_outdoor_reset(
     if flow_rate_sensor:
         params.flow_rate_sensor = flow_rate_sensor
 
+    # Restore per-zone valve counts from options
+    for key, value in entry.options.items():
+        if key.startswith("zone_valves_"):
+            zone_key = key[len("zone_valves_"):]
+            try:
+                params.zone_valve_counts[zone_key] = int(value)
+            except (ValueError, TypeError):
+                pass
+
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
 

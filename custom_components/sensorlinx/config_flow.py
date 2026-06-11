@@ -60,6 +60,14 @@ class SensorlinxConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 1
 
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        """Return the options flow handler."""
+        return SensorlinxOptionsFlowHandler(config_entry)
+
     def __init__(self) -> None:
         """Initialize."""
         self._username: str | None = None
@@ -162,14 +170,16 @@ class NoBuildings(HomeAssistantError):
     """Error to indicate the account has no buildings."""
 
 
+CONF_SUPPLY_ENTITY = "supply_entity_id"
+CONF_SUPPLY_TEMP_SENSOR = "supply_temp_sensor"
+CONF_RETURN_TEMP_SENSOR = "return_temp_sensor"
+CONF_FLOW_RATE_SENSOR = "flow_rate_sensor"
+CONF_FORECAST_ENTITY = "forecast_entity_id"
+CONF_ZONE_VALVE_PREFIX = "zone_valves_"
+
+
 def _external_switch_schema(defaults: dict[str, Any]) -> vol.Schema:
     """Schema for linking physical HA switches to SensorLinx."""
-    switch_selector = selector.EntitySelector(
-        selector.EntitySelectorConfig(domain=["switch"])
-    )
-    floor_selector = selector.EntitySelector(
-        selector.EntitySelectorConfig(domain=["switch", "light"])
-    )
     return vol.Schema(
         {
             vol.Optional(
@@ -181,43 +191,158 @@ def _external_switch_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_RADIANT_FLOOR_SWITCH,
                 default=defaults.get(CONF_RADIANT_FLOOR_SWITCH, ""),
-            ): switch_selector,
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch"])
+            ),
             vol.Optional(
                 CONF_HEATED_FLOOR_CONTROLLER,
                 default=defaults.get(CONF_HEATED_FLOOR_CONTROLLER, ""),
-            ): floor_selector,
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["switch", "light"])
+            ),
         }
     )
 
 
-@callback
-def async_get_options_flow(
-    config_entry: config_entries.ConfigEntry,
-) -> config_entries.OptionsFlow:
-    """Return the options flow handler."""
-    return SensorlinxOptionsFlowHandler(config_entry)
+def _hydronic_schema(defaults: dict[str, Any]) -> vol.Schema:
+    """Schema for hydronic loop and supply water configuration."""
+    return vol.Schema(
+        {
+            vol.Optional(
+                CONF_SUPPLY_ENTITY,
+                default=defaults.get(CONF_SUPPLY_ENTITY, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["water_heater", "climate", "number"])
+            ),
+            vol.Optional(
+                CONF_SUPPLY_TEMP_SENSOR,
+                default=defaults.get(CONF_SUPPLY_TEMP_SENSOR, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
+            ),
+            vol.Optional(
+                CONF_RETURN_TEMP_SENSOR,
+                default=defaults.get(CONF_RETURN_TEMP_SENSOR, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
+            ),
+            vol.Optional(
+                CONF_FLOW_RATE_SENSOR,
+                default=defaults.get(CONF_FLOW_RATE_SENSOR, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["sensor"])
+            ),
+            vol.Optional(
+                CONF_FORECAST_ENTITY,
+                default=defaults.get(CONF_FORECAST_ENTITY, ""),
+            ): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain=["weather"])
+            ),
+        }
+    )
+
+
+def _zone_valves_schema(zone_names: list[tuple[str, str]], defaults: dict[str, Any]) -> vol.Schema:
+    """Schema for per-zone valve count configuration."""
+    schema_dict: dict[Any, Any] = {}
+    for zone_key, zone_label in zone_names:
+        key = f"{CONF_ZONE_VALVE_PREFIX}{zone_key}"
+        schema_dict[vol.Optional(key, default=defaults.get(key, 1))] = selector.NumberSelector(
+            selector.NumberSelectorConfig(min=1, max=6, step=1, mode="slider")
+        )
+    return vol.Schema(schema_dict)
 
 
 class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow for linking external HA switches."""
+    """Options flow for external switches, hydronic sensors, and zone valve counts."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize."""
         self._config_entry = config_entry
+        self._options: dict[str, Any] = {}
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Manage external switch links."""
+        """Step 1: External switch links."""
         if user_input is not None:
-            cleaned = {
-                key: value.strip()
-                for key, value in user_input.items()
-                if isinstance(value, str) and value.strip()
-            }
-            return self.async_create_entry(title="", data=cleaned)
+            self._options.update(
+                {k: v.strip() for k, v in user_input.items() if isinstance(v, str) and v.strip()}
+            )
+            return await self.async_step_hydronic()
 
         return self.async_show_form(
             step_id="init",
             data_schema=_external_switch_schema(dict(self._config_entry.options)),
+            description_placeholders={"step_title": "External Switches"},
         )
+
+    async def async_step_hydronic(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Step 2: Hydronic sensors and supply water entity."""
+        if user_input is not None:
+            self._options.update(
+                {k: v.strip() for k, v in user_input.items() if isinstance(v, str) and v.strip()}
+            )
+            return await self.async_step_zone_valves()
+
+        return self.async_show_form(
+            step_id="hydronic",
+            data_schema=_hydronic_schema(dict(self._config_entry.options)),
+        )
+
+    async def async_step_zone_valves(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Step 3: Per-zone valve counts."""
+        if user_input is not None:
+            self._options.update(user_input)
+            return await self._save_all_options()
+
+        zone_names = self._get_zone_names()
+        if not zone_names:
+            return await self._save_all_options()
+
+        return self.async_show_form(
+            step_id="zone_valves",
+            data_schema=_zone_valves_schema(zone_names, dict(self._config_entry.options)),
+        )
+
+    def _get_zone_names(self) -> list[tuple[str, str]]:
+        """Get zone key/label pairs from the coordinator."""
+        domain_data = self.hass.data.get(DOMAIN, {})
+        coordinator = domain_data.get(self._config_entry.entry_id)
+        if coordinator is None:
+            return []
+        zones: list[tuple[str, str]] = []
+        for thm in coordinator.get_thm_devices():
+            zone_key = thm.name.lower().replace(" ", "_")
+            zones.append((zone_key, thm.name))
+        return zones
+
+    async def _save_all_options(self) -> config_entries.ConfigFlowResult:
+        """Persist all options and propagate to the outdoor reset controller."""
+        new_options = dict(self._config_entry.options)
+        new_options.update(self._options)
+
+        # Propagate to the outdoor reset controller if loaded
+        domain_data = self.hass.data.get(DOMAIN, {})
+        controller = domain_data.get(f"{self._config_entry.entry_id}_outdoor_reset")
+        if controller is not None:
+            if new_options.get(CONF_SUPPLY_ENTITY):
+                controller.params.supply_entity_id = new_options[CONF_SUPPLY_ENTITY]
+            if new_options.get(CONF_SUPPLY_TEMP_SENSOR):
+                controller.params.supply_temp_sensor = new_options[CONF_SUPPLY_TEMP_SENSOR]
+            if new_options.get(CONF_RETURN_TEMP_SENSOR):
+                controller.params.return_temp_sensor = new_options[CONF_RETURN_TEMP_SENSOR]
+            if new_options.get(CONF_FLOW_RATE_SENSOR):
+                controller.params.flow_rate_sensor = new_options[CONF_FLOW_RATE_SENSOR]
+            if new_options.get(CONF_FORECAST_ENTITY):
+                controller.params.forecast_entity_id = new_options[CONF_FORECAST_ENTITY]
+            for key, value in new_options.items():
+                if key.startswith(CONF_ZONE_VALVE_PREFIX):
+                    zone_key = key[len(CONF_ZONE_VALVE_PREFIX):]
+                    controller.params.zone_valve_counts[zone_key] = int(value)
+
+        return self.async_create_entry(title="", data=new_options)

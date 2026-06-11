@@ -31,12 +31,27 @@
     "step": {
       "init": {
         "title": "External switches",
-        "description": "Link physical Home Assistant switches that power your hot-water heater and radiant-floor controller. When a linked switch turns off, SensorLinx thermostats and hot-water demand are suppressed in the cloud; turning the switch back on restores the previous settings.",
+        "description": "Link physical Home Assistant switches that power your hot-water heater and radiant-floor controller.",
         "data": {
           "hot_water_switch_entity_id": "Hot water heater switch",
           "radiant_floor_switch_entity_id": "Radiant floor controller switch",
           "heated_floor_controller_entity_id": "Heated floor controller (switch or light)"
         }
+      },
+      "hydronic": {
+        "title": "Hydronic loop & supply water",
+        "description": "Configure the water heater control entity and temperature sensors for the hydronic floor loop.",
+        "data": {
+          "supply_entity_id": "Supply water heater (controls target temp)",
+          "supply_temp_sensor": "Supply water temperature sensor (outlet)",
+          "return_temp_sensor": "Return water temperature sensor (inlet)",
+          "flow_rate_sensor": "Flow rate sensor (GPM)",
+          "forecast_entity_id": "Weather forecast entity (for preheat)"
+        }
+      },
+      "zone_valves": {
+        "title": "Zone valve counts",
+        "description": "Set how many valves are connected to each thermostat zone. This is used to estimate water flow rate and BTU heat output per zone."
       }
     }
   }
