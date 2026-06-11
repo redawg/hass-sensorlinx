@@ -17,7 +17,12 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import math
 
-BASE = "http://172.16.255.250:8123"
+import os
+from pathlib import Path as _Path
+BASE = os.environ.get(
+    "HA_HOST",
+    "http://127.0.0.1:8123" if _Path("/config").exists() else "http://172.16.255.250:8123",
+)
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ.Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
 headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
