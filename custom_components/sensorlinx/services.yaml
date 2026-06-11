@@ -9,3 +9,16 @@ set_supply_entity:
       example: "climate.tankless_water_heater"
       selector:
         entity:
+
+set_forecast_entity:
+  name: Set Weather Forecast Entity
+  description: Configure which weather entity provides hourly forecast data for predictive preheat.
+  fields:
+    entity_id:
+      name: Entity ID
+      description: A weather entity that provides hourly forecast (e.g., weather.home, weather.openweathermap)
+      required: true
+      example: "weather.home"
+      selector:
+        entity:
+          domain: weather

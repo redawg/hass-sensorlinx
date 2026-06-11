@@ -11,6 +11,8 @@ Formula:
 from __future__ import annotations
 
 import logging
+from collections import deque
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.number import NumberEntity, NumberMode, RestoreNumber
@@ -22,8 +24,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-
-from datetime import timedelta
 
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
@@ -46,6 +46,11 @@ FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is bel
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
 SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
+
+# Preheat defaults
+DEFAULT_THERMAL_LAG = 20.0  # minutes per degree F of floor temp rise
+PREHEAT_CHECK_INTERVAL = timedelta(minutes=15)
+TREND_WINDOW_MINUTES = 120  # use last 2 hours of outdoor temp for trend prediction
 
 
 def compute_target(outdoor: float, base: float, overshoot: float,
@@ -75,6 +80,9 @@ class OutdoorResetController:
         self.params = params
         self._unsub_interval = None
         self._unsub_state = None
+        # Preheat: track outdoor temp history for trend prediction
+        self._temp_history: deque[tuple[datetime, float]] = deque(maxlen=24)
+        self._preheat_active: bool = False
 
     @property
     def enabled(self) -> bool:
@@ -142,19 +150,30 @@ class OutdoorResetController:
         # Adjust supply water temperature alongside zone setpoints
         await self._apply_supply_water_temp(outdoor)
 
+        # Check preheat before shutdown logic
+        await self._check_preheat(outdoor)
+
         target = self.calculated_target
 
         if outdoor >= self.params.shutdown:
-            _LOGGER.info("Outdoor %.1f°F >= shutdown %.1f°F, turning off zones",
-                         outdoor, self.params.shutdown)
-            for thm in self.coordinator.get_thm_devices():
-                entity_id = f"climate.{thm.name.lower().replace(' ', '_')}_{thm.name.lower().replace(' ', '_')}"
-                await self.hass.services.async_call(
-                    "climate", "turn_off",
-                    {"entity_id": entity_id},
-                    blocking=True,
+            if self._preheat_active:
+                # Preheat override: keep heating even though outdoor is above shutdown
+                _LOGGER.info(
+                    "Preheat active: outdoor %.1f°F >= shutdown %.1f°F but pre-warming floors",
+                    outdoor, self.params.shutdown,
                 )
-            return
+                # Fall through to normal heating logic below
+            else:
+                _LOGGER.info("Outdoor %.1f\u00b0F >= shutdown %.1f\u00b0F, turning off zones",
+                             outdoor, self.params.shutdown)
+                for thm in self.coordinator.get_thm_devices():
+                    entity_id = f"climate.{thm.name.lower().replace(' ', '_')}_{thm.name.lower().replace(' ', '_')}"
+                    await self.hass.services.async_call(
+                        "climate", "turn_off",
+                        {"entity_id": entity_id},
+                        blocking=True,
+                    )
+                return
 
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
@@ -344,6 +363,173 @@ class OutdoorResetController:
         else:
             _LOGGER.warning("Unsupported entity type for supply control: %s", entity_id)
 
+    # ------------------------------------------------------------------
+    # Preheat: start heating before outdoor drops below shutdown
+    # ------------------------------------------------------------------
+
+    def _record_outdoor_temp(self, outdoor: float) -> None:
+        """Record outdoor temp reading for trend analysis."""
+        self._temp_history.append((datetime.now(), outdoor))
+
+    def _estimate_minutes_to_shutdown(self, outdoor: float) -> float | None:
+        """Estimate minutes until outdoor temp crosses shutdown threshold.
+
+        Uses linear regression on recent history, or forecast if available.
+        Returns None if temp is not dropping toward shutdown.
+        """
+        shutdown = self.params.shutdown
+
+        # Already below shutdown — no preheat needed (normal heating active)
+        if outdoor < shutdown:
+            return 0.0
+
+        # Try forecast first
+        minutes_from_forecast = self._check_forecast_for_shutdown()
+        if minutes_from_forecast is not None:
+            return minutes_from_forecast
+
+        # Fallback: trend-based using temp history
+        if len(self._temp_history) < 4:
+            return None
+
+        # Get readings from last TREND_WINDOW_MINUTES
+        now = datetime.now()
+        cutoff = now - timedelta(minutes=TREND_WINDOW_MINUTES)
+        recent = [(t, temp) for t, temp in self._temp_history if t >= cutoff]
+
+        if len(recent) < 3:
+            return None
+
+        # Calculate rate of change (degrees per minute)
+        first_time, first_temp = recent[0]
+        last_time, last_temp = recent[-1]
+        elapsed_min = (last_time - first_time).total_seconds() / 60.0
+
+        if elapsed_min < 15:
+            return None
+
+        rate = (last_temp - first_temp) / elapsed_min  # deg/min (negative = cooling)
+
+        if rate >= 0:
+            # Temp is rising or stable — no preheat needed
+            return None
+
+        # How many minutes until we hit shutdown?
+        degrees_to_go = outdoor - shutdown
+        minutes_to_shutdown = degrees_to_go / abs(rate)
+
+        _LOGGER.debug(
+            "Preheat trend: rate=%.3f deg/min, degrees_to_go=%.1f, ETA=%.0f min",
+            rate, degrees_to_go, minutes_to_shutdown,
+        )
+        return minutes_to_shutdown
+
+    def _check_forecast_for_shutdown(self) -> float | None:
+        """Check weather forecast entity for when temp will cross shutdown."""
+        forecast_entity = self.params.forecast_entity_id
+        if not forecast_entity:
+            return None
+
+        state = self.hass.states.get(forecast_entity)
+        if state is None:
+            return None
+
+        # Try to get forecast from attributes (older HA format)
+        forecast = state.attributes.get("forecast", [])
+        if not forecast:
+            return None
+
+        shutdown = self.params.shutdown
+        now = datetime.now()
+
+        for entry in forecast:
+            fc_time_str = entry.get("datetime")
+            fc_temp = entry.get("temperature")
+            if fc_time_str is None or fc_temp is None:
+                continue
+
+            try:
+                fc_time = datetime.fromisoformat(fc_time_str.replace("Z", "+00:00"))
+                fc_time_local = fc_time.replace(tzinfo=None)
+            except (ValueError, TypeError):
+                continue
+
+            if fc_temp < shutdown:
+                minutes_away = (fc_time_local - now).total_seconds() / 60.0
+                if minutes_away > 0:
+                    _LOGGER.debug(
+                        "Preheat forecast: temp %.1f < shutdown %.1f at %s (%.0f min away)",
+                        fc_temp, shutdown, fc_time_str, minutes_away,
+                    )
+                    return minutes_away
+
+        return None
+
+    def _compute_preheat_lead_time(self) -> float:
+        """Compute how many minutes before shutdown the system needs to start.
+
+        Based on thermal lag and how far below target the floors currently are.
+        """
+        max_deficit = 0.0
+        for thm in self.coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            floor_entity_id = f"sensor.{zone_name}_floor_temperature"
+            floor_state = self.hass.states.get(floor_entity_id)
+            if floor_state and floor_state.state not in ("unavailable", "unknown"):
+                try:
+                    floor_temp = float(floor_state.state)
+                    floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                    deficit = max(0, floor_target - floor_temp)
+                    max_deficit = max(max_deficit, deficit)
+                except (ValueError, TypeError):
+                    pass
+
+        # If floors are already at target, still need some lead time for thermal mass
+        lead_minutes = self.params.thermal_lag * max(max_deficit, 2.0)
+        return lead_minutes
+
+    async def _check_preheat(self, outdoor: float) -> None:
+        """Check if preheat should be activated based on forecast/trend."""
+        if not self.params.preheat_enabled:
+            self._preheat_active = False
+            return
+
+        # Only relevant when outdoor is ABOVE shutdown (system would normally be off)
+        if outdoor < self.params.shutdown:
+            self._preheat_active = False
+            return
+
+        self._record_outdoor_temp(outdoor)
+
+        minutes_to_shutdown = self._estimate_minutes_to_shutdown(outdoor)
+        if minutes_to_shutdown is None:
+            # Can't estimate — not cooling, no preheat needed
+            if self._preheat_active:
+                _LOGGER.info("Preheat: trend reversed, deactivating")
+                self._preheat_active = False
+            return
+
+        lead_time = self._compute_preheat_lead_time()
+
+        if minutes_to_shutdown <= lead_time:
+            if not self._preheat_active:
+                _LOGGER.info(
+                    "PREHEAT ACTIVATED: outdoor=%.1f, ETA to shutdown=%.0f min, "
+                    "lead_time=%.0f min — starting floor heating now",
+                    outdoor, minutes_to_shutdown, lead_time,
+                )
+                self._preheat_active = True
+        else:
+            if self._preheat_active:
+                _LOGGER.info("Preheat: no longer needed (ETA=%.0f > lead=%.0f), deactivating",
+                             minutes_to_shutdown, lead_time)
+            self._preheat_active = False
+
+    @property
+    def preheat_active(self) -> bool:
+        """Whether preheat mode is currently active."""
+        return self._preheat_active
+
 
 class OutdoorResetParams:
     """Stores mutable outdoor reset parameters, updated by number entities."""
@@ -364,6 +550,10 @@ class OutdoorResetParams:
         self.supply_temp_max: float = DEFAULT_SUPPLY_TEMP_MAX
         self.supply_entity_id: str | None = None  # set via text entity or config
         self.supply_control_enabled: bool = False
+        # Preheat
+        self.preheat_enabled: bool = True
+        self.thermal_lag: float = DEFAULT_THERMAL_LAG  # min per degree F
+        self.forecast_entity_id: str | None = None  # weather.X entity for hourly forecast
 
 
 # ---------------------------------------------------------------------------
@@ -378,26 +568,39 @@ async def async_setup_outdoor_reset(
     """Create the outdoor reset controller and register it."""
     params = OutdoorResetParams()
 
-    # Restore supply entity from config entry options if previously set
+    # Restore persisted options
     supply_entity = entry.options.get("supply_entity_id")
     if supply_entity:
         params.supply_entity_id = supply_entity
+    forecast_entity = entry.options.get("forecast_entity_id")
+    if forecast_entity:
+        params.forecast_entity_id = forecast_entity
 
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
 
-    # Register a service to configure the supply water heater entity
+    # Register services for configuring external entity links
     async def handle_set_supply_entity(call):
         entity_id = call.data.get("entity_id")
         controller.params.supply_entity_id = entity_id
-        # Persist to config entry options
         new_options = dict(entry.options)
         new_options["supply_entity_id"] = entity_id
         hass.config_entries.async_update_entry(entry, options=new_options)
         _LOGGER.info("Supply water entity set to: %s", entity_id)
 
+    async def handle_set_forecast_entity(call):
+        entity_id = call.data.get("entity_id")
+        controller.params.forecast_entity_id = entity_id
+        new_options = dict(entry.options)
+        new_options["forecast_entity_id"] = entity_id
+        hass.config_entries.async_update_entry(entry, options=new_options)
+        _LOGGER.info("Forecast entity set to: %s", entity_id)
+
     hass.services.async_register(
         DOMAIN, "set_supply_entity", handle_set_supply_entity,
+    )
+    hass.services.async_register(
+        DOMAIN, "set_forecast_entity", handle_set_forecast_entity,
     )
 
     return controller
@@ -449,6 +652,11 @@ def get_number_entities(
             "Supply Water: Max Temp (Cold)", DEFAULT_SUPPLY_TEMP_MAX, 110, 180, 5,
             "mdi:water-thermometer",
         ),
+        OutdoorResetNumberEntity(
+            coordinator, controller, "thermal_lag",
+            "Preheat: Thermal Lag (min/°F)", DEFAULT_THERMAL_LAG, 5, 60, 5,
+            "mdi:clock-fast",
+        ),
     ]
 
     for thm in coordinator.get_thm_devices():
@@ -477,6 +685,7 @@ def get_sensor_entities(
     entities: list[SensorEntity] = [
         OutdoorResetTargetSensor(coordinator, controller, "target_setpoint", "Heating Curve Target"),
         SupplyWaterTargetSensor(coordinator, controller),
+        PreheatStatusSensor(coordinator, controller),
     ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -496,6 +705,7 @@ def get_switch_entities(
     entities: list[SwitchEntity] = [
         OutdoorResetEnableSwitch(coordinator, controller),
         SupplyWaterControlSwitch(coordinator, controller),
+        PreheatEnableSwitch(coordinator, controller),
     ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -582,6 +792,8 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.supply_temp_min = self._attr_native_value
         elif self._key == "supply_temp_max":
             params.supply_temp_max = self._attr_native_value
+        elif self._key == "thermal_lag":
+            params.thermal_lag = self._attr_native_value
 
 
 class OutdoorResetZoneOffsetEntity(RestoreNumber):
@@ -948,3 +1160,99 @@ class SupplyWaterTargetSensor(SensorEntity):
             "supply_entity_id": self._controller.params.supply_entity_id or "not configured",
             "supply_control_enabled": self._controller.params.supply_control_enabled,
         }
+
+
+# ---------------------------------------------------------------------------
+# Preheat entities
+# ---------------------------------------------------------------------------
+
+class PreheatEnableSwitch(SwitchEntity):
+    """Enable/disable predictive preheat."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Preheat Enabled"
+    _attr_icon = "mdi:clock-start"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_preheat_enabled"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.preheat_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.preheat_enabled = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.preheat_enabled = False
+        self.async_write_ha_state()
+
+
+class PreheatStatusSensor(SensorEntity):
+    """Shows preheat status and estimated time to shutdown."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Preheat Status"
+    _attr_icon = "mdi:clock-fast"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_preheat_status"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def native_value(self) -> str:
+        if not self._controller.params.preheat_enabled:
+            return "disabled"
+        if self._controller.preheat_active:
+            return "active"
+        outdoor = self._controller.outdoor_temp
+        if outdoor is None:
+            return "unknown"
+        if outdoor < self._controller.params.shutdown:
+            return "heating"
+        return "standby"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        outdoor = self._controller.outdoor_temp
+        attrs: dict[str, Any] = {
+            "preheat_active": self._controller.preheat_active,
+            "thermal_lag_min_per_deg": self._controller.params.thermal_lag,
+            "temp_history_points": len(self._controller._temp_history),
+        }
+        if outdoor is not None and outdoor >= self._controller.params.shutdown:
+            eta = self._controller._estimate_minutes_to_shutdown(outdoor)
+            lead = self._controller._compute_preheat_lead_time()
+            attrs["eta_to_shutdown_min"] = round(eta, 0) if eta is not None else None
+            attrs["preheat_lead_time_min"] = round(lead, 0)
+        return attrs
