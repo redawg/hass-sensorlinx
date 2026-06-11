@@ -22,6 +22,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -57,6 +58,8 @@ TREND_WINDOW_MINUTES = 120  # use last 2 hours of outdoor temp for trend predict
 DEFAULT_VALVE_COUNT = 1  # valves per zone (for flow estimation)
 DEFAULT_FLOW_RATE_PER_VALVE = 0.5  # GPM per valve (typical 1/2" zone valve)
 WATER_BTU_FACTOR = 500  # BTU/hr per GPM per degree F delta-T
+
+SIGNAL_FLOOR_MODE_CHANGED = f"{DOMAIN}_floor_mode_changed"
 
 
 def compute_target(outdoor: float, base: float, overshoot: float,
@@ -1229,10 +1232,12 @@ class OutdoorResetFloorModeSwitch(SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._controller.params.floor_control_enabled[self._zone_key] = True
         self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.floor_control_enabled[self._zone_key] = False
         self.async_write_ha_state()
+        async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
 
 
 class OutdoorResetFloorTargetEntity(RestoreNumber):
@@ -1283,12 +1288,23 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         """Only available when floor control mode is enabled for this zone."""
         return self._controller.params.floor_control_enabled.get(self._zone_key, False)
 
+    @callback
+    def _handle_floor_mode_changed(self, zone_key: str) -> None:
+        """Refresh state when floor mode toggles for this zone."""
+        if zone_key == self._zone_key:
+            self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_number_data()
         if last and last.native_value is not None:
             self._attr_native_value = last.native_value
         self._controller.params.floor_targets[self._zone_key] = self._attr_native_value
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._handle_floor_mode_changed
+            )
+        )
 
     async def async_set_native_value(self, value: float) -> None:
         self._attr_native_value = value
@@ -1531,12 +1547,23 @@ class ZoneValveCountEntity(RestoreNumber):
         """Only available when floor control mode is enabled for this zone."""
         return self._controller.params.floor_control_enabled.get(self._zone_key, False)
 
+    @callback
+    def _handle_floor_mode_changed(self, zone_key: str) -> None:
+        """Refresh state when floor mode toggles for this zone."""
+        if zone_key == self._zone_key:
+            self.async_write_ha_state()
+
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
         last = await self.async_get_last_number_data()
         if last and last.native_value is not None:
             self._attr_native_value = last.native_value
         self._controller.params.zone_valve_counts[self._zone_key] = int(self._attr_native_value)
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._handle_floor_mode_changed
+            )
+        )
 
     async def async_set_native_value(self, value: float) -> None:
         self._attr_native_value = value
