@@ -193,6 +193,15 @@ class OutdoorResetController(NightSetbackMixin):
     def _is_floor_mode_zone(self, zone_name: str) -> bool:
         return bool(self.params.floor_control_enabled.get(zone_name, False))
 
+    async def _ensure_zone_ready_for_heat(self, zone_name: str) -> None:
+        """Clear THM away mode so commanded setpoints can call for heat."""
+        away_entity = f"switch.{zone_name}_away_mode"
+        state = self.hass.states.get(away_entity)
+        if state is not None and state.state == "on":
+            await self.hass.services.async_call(
+                "switch", "turn_off", {"entity_id": away_entity}, blocking=True
+            )
+
     def _climate_needs_setpoint_update(
         self, climate_state, zone_target: float
     ) -> bool:
@@ -366,6 +375,7 @@ class OutdoorResetController(NightSetbackMixin):
                 "Setting %s to %.1f°F (mode=%s, outdoor=%.1f)",
                 zone_name, zone_target, "floor" if floor_mode else "room", outdoor,
             )
+            await self._ensure_zone_ready_for_heat(zone_name)
             await self.hass.services.async_call(
                 "climate", "set_temperature",
                 {"entity_id": entity_id, "temperature": zone_target, "hvac_mode": "heat"},
