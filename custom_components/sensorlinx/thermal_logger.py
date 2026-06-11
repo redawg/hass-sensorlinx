@@ -374,15 +374,17 @@ class ThermalDataLogger:
     def _extract_floor_temp(self, raw: dict, zone_name: str) -> float | None:
         """Extract floor temp — try raw data first, then HA entity."""
         flr = raw.get("flr")
-        if flr is not None:
-            return float(flr)
-        state = self.hass.states.get(f"sensor.{zone_name}_floor_temperature")
-        if state and state.state not in ("unavailable", "unknown"):
-            try:
-                return float(state.state)
-            except (ValueError, TypeError):
-                pass
-        return None
+        raw_floor = float(flr) if flr is not None else None
+        if raw_floor is None:
+            state = self.hass.states.get(f"sensor.{zone_name}_floor_temperature")
+            if state and state.state not in ("unavailable", "unknown"):
+                try:
+                    raw_floor = float(state.state)
+                except (ValueError, TypeError):
+                    pass
+        if raw_floor is None:
+            return None
+        return self.controller.effective_floor_temp(zone_name, raw_floor)
 
     def _extract_hvac_mode(self, raw: dict) -> str:
         """Extract current HVAC mode."""

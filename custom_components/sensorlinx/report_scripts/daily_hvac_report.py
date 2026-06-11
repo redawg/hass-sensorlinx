@@ -17,12 +17,7 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import math
 
-import os
-from pathlib import Path as _Path
-BASE = os.environ.get(
-    "HA_HOST",
-    "http://127.0.0.1:8123" if _Path("/config").exists() else "http://172.16.255.250:8123",
-)
+BASE = "http://172.16.255.250:8123"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ.Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
 headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
@@ -50,6 +45,7 @@ ZONE_FLOOR_TYPE = {
 }
 DEFAULT_WOOD_FLOOR_MAX = 80.0
 DEFAULT_TILE_FLOOR_MAX = 88.0
+DEFAULT_ZONE_FLOOR_SENSOR_BIAS = {"living_room": -5.0}
 DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 COST_ENTITY = "number.sensorlinx_outdoor_reset_electricity_cost_per_kwh"
 POWER_DRAW_ENTITY = "sensor.main_water_heater_power_draw"
@@ -147,6 +143,26 @@ def detect_short_cycling(cycles):
         return 0, 0
     short = [c for c in cycles if c["duration_min"] < 15]
     return len(short), len(cycles)
+
+
+def get_zone_floor_sensor_bias(zone_key, states):
+    """Per-zone floor probe correction (negative if sensor runs hot)."""
+    entity = states.get(f"number.{zone_key}_floor_sensor_bias_{zone_key}", {})
+    if not entity:
+        entity = states.get(
+            f"number.sensorlinx_outdoor_reset_floor_bias_{zone_key}", {}
+        )
+    state = entity.get("state")
+    try:
+        return float(state)
+    except (TypeError, ValueError):
+        return DEFAULT_ZONE_FLOOR_SENSOR_BIAS.get(zone_key, 0.0)
+
+
+def correct_floor_temp(zone_key, raw_floor, states):
+    if raw_floor is None:
+        return None
+    return round(float(raw_floor) + get_zone_floor_sensor_bias(zone_key, states), 1)
 
 
 def get_zone_floor_max(zone_key, states):
@@ -734,19 +750,23 @@ def main(apply_supply=False):
     print(f"  Wood floor safety default: {wood_cap:.0f}F")
     print(f"  Laundry (tile) may use a higher per-zone cap")
     print()
-    print(f"  {'Zone':<14} {'Type':<6} {'Cap':<6} {'Floor Now':<11} {'Peak 24h':<11} {'Margin':<9} {'Status'}")
-    print(f"  {'----':<14} {'----':<6} {'---':<6} {'---------':<11} {'--------':<11} {'------':<9} {'------'}")
+    print(f"  {'Zone':<14} {'Type':<6} {'Cap':<6} {'Floor':<11} {'Peak 24h':<11} {'Margin':<9} {'Status'}")
+    print(f"  {'----':<14} {'----':<6} {'---':<6} {'-----':<11} {'--------':<11} {'------':<9} {'------'}")
+    print("  (Floor = bias-corrected where configured; raw sensor in parentheses)")
 
     for z in ZONES:
         data = zone_data[z]
         if not data:
             continue
-        floors = [float(s["floor_temp"]) for s in data if s.get("floor_temp") is not None]
-        if floors:
+        raw_floors = [float(s["floor_temp"]) for s in data if s.get("floor_temp") is not None]
+        if raw_floors:
             zone_cap = get_zone_floor_max(z, states)
             floor_type = ZONE_FLOOR_TYPE.get(z, "wood")
-            current = floors[-1]
-            peak = max(floors)
+            bias = get_zone_floor_sensor_bias(z, states)
+            current_raw = raw_floors[-1]
+            peak_raw = max(raw_floors)
+            current = correct_floor_temp(z, current_raw, states)
+            peak = correct_floor_temp(z, peak_raw, states)
             margin = zone_cap - peak
             if margin < 2:
                 status = "WARNING - close to limit"
@@ -754,9 +774,12 @@ def main(apply_supply=False):
                 status = "Monitor"
             else:
                 status = "Safe"
+            floor_label = f"{current:.1f}F"
+            if bias:
+                floor_label = f"{current:.1f}F ({current_raw:.0f}raw)"
             print(
                 f"  {ZONE_LABELS[z]:<14} {floor_type:<6} {zone_cap:.0f}F   "
-                f"{current:.1f}F     {peak:.1f}F     {margin:.1f}F    {status}"
+                f"{floor_label:<11} {peak:.1f}F     {margin:.1f}F    {status}"
             )
 
     print()
@@ -897,7 +920,10 @@ def main(apply_supply=False):
             continue
 
         rooms = [float(s["room_temp"]) for s in data if s.get("room_temp") is not None]
-        floors = [float(s["floor_temp"]) for s in data if s.get("floor_temp") is not None]
+        raw_floors = [float(s["floor_temp"]) for s in data if s.get("floor_temp") is not None]
+        floors = [
+            correct_floor_temp(z, f, states) for f in raw_floors
+        ] if raw_floors else []
         targets = [float(s["commanded_setpoint"]) for s in data if s.get("commanded_setpoint") is not None]
 
         if not rooms or not targets:
@@ -1011,7 +1037,11 @@ def main(apply_supply=False):
         print(f"  Current operating point: {current_out:.0f}F outdoor -> {curve_out}F curve target")
         tightest = min(
             get_zone_floor_max(z, states) - max(
-                [float(s["floor_temp"]) for s in zone_data[z] if s.get("floor_temp") is not None] or [0]
+                [
+                    correct_floor_temp(z, float(s["floor_temp"]), states)
+                    for s in zone_data[z]
+                    if s.get("floor_temp") is not None
+                ] or [0]
             )
             for z in ZONES
             if zone_data[z]

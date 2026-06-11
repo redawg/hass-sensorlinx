@@ -57,6 +57,13 @@ def default_zone_floor_max(zone_key: str, wood_default: float = DEFAULT_FLOOR_MA
     if zone_key in TILE_FLOOR_ZONES:
         return DEFAULT_TILE_FLOOR_MAX
     return wood_default
+
+
+# Negative bias = sensor reads hot (e.g. probe at loop supply/manifold).
+DEFAULT_ZONE_FLOOR_SENSOR_BIAS: dict[str, float] = {
+    "living_room": -5.0,
+}
+
 DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 
@@ -170,6 +177,28 @@ class OutdoorResetController(NightSetbackMixin):
             return self.params.zone_floor_max[zone_name]
         return default_zone_floor_max(zone_name, self.params.floor_max)
 
+    def floor_sensor_bias(self, zone_name: str) -> float:
+        """Per-zone correction added to raw floor sensor (negative if probe runs hot)."""
+        if zone_name in self.params.zone_floor_sensor_bias:
+            return self.params.zone_floor_sensor_bias[zone_name]
+        return DEFAULT_ZONE_FLOOR_SENSOR_BIAS.get(zone_name, 0.0)
+
+    def effective_floor_temp(self, zone_name: str, raw_floor_temp: float | None) -> float | None:
+        """Estimate true slab temp from a misplaced or biased floor probe."""
+        if raw_floor_temp is None:
+            return None
+        return round(raw_floor_temp + self.floor_sensor_bias(zone_name), 1)
+
+    def _read_zone_floor_temp(self, zone_name: str) -> float | None:
+        """Read raw floor sensor from HA."""
+        floor_state = self.hass.states.get(f"sensor.{zone_name}_floor_temperature")
+        if floor_state and floor_state.state not in ("unavailable", "unknown"):
+            try:
+                return float(floor_state.state)
+            except (ValueError, TypeError):
+                pass
+        return None
+
     async def async_setup(self) -> None:
         """Start periodic updates."""
         self._unsub_interval = async_track_time_interval(
@@ -255,23 +284,24 @@ class OutdoorResetController(NightSetbackMixin):
             zone_name = thm.name.lower().replace(" ", "_")
             entity_id = f"climate.{zone_name}_{zone_name}"
 
-            # Read current floor temp
-            floor_entity_id = f"sensor.{zone_name}_floor_temperature"
-            floor_state = self.hass.states.get(floor_entity_id)
-            floor_temp = None
-            if floor_state and floor_state.state not in ("unavailable", "unknown"):
-                try:
-                    floor_temp = float(floor_state.state)
-                except (ValueError, TypeError):
-                    pass
+            raw_floor_temp = self._read_zone_floor_temp(zone_name)
+            floor_temp = self.effective_floor_temp(zone_name, raw_floor_temp)
 
-            # Safety cap: turn off if floor exceeds zone max
+            # Safety cap: turn off if corrected floor exceeds zone max
             zone_cap = self.zone_floor_max(zone_name)
             if floor_temp is not None and floor_temp >= zone_cap:
-                _LOGGER.warning(
-                    "Floor temp %.1f°F >= max %.1f°F for %s, turning off",
-                    floor_temp, zone_cap, zone_name,
-                )
+                bias = self.floor_sensor_bias(zone_name)
+                if bias and raw_floor_temp is not None:
+                    _LOGGER.warning(
+                        "Floor temp %.1f°F (sensor %.1f°F, bias %+.1f°F) >= max %.1f°F "
+                        "for %s, turning off",
+                        floor_temp, raw_floor_temp, bias, zone_cap, zone_name,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "Floor temp %.1f°F >= max %.1f°F for %s, turning off",
+                        floor_temp, zone_cap, zone_name,
+                    )
                 await self.hass.services.async_call(
                     "climate", "turn_off",
                     {"entity_id": entity_id},
@@ -823,16 +853,12 @@ class OutdoorResetController(NightSetbackMixin):
         max_deficit = 0.0
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
-            floor_entity_id = f"sensor.{zone_name}_floor_temperature"
-            floor_state = self.hass.states.get(floor_entity_id)
-            if floor_state and floor_state.state not in ("unavailable", "unknown"):
-                try:
-                    floor_temp = float(floor_state.state)
-                    floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
-                    deficit = max(0, floor_target - floor_temp)
-                    max_deficit = max(max_deficit, deficit)
-                except (ValueError, TypeError):
-                    pass
+            raw_floor = self._read_zone_floor_temp(zone_name)
+            floor_temp = self.effective_floor_temp(zone_name, raw_floor)
+            if floor_temp is not None:
+                floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                deficit = max(0, floor_target - floor_temp)
+                max_deficit = max(max_deficit, deficit)
 
         # If floors are already at target, still need some lead time for thermal mass
         lead_minutes = self.params.thermal_lag * max(max_deficit, 2.0)
@@ -989,6 +1015,7 @@ class OutdoorResetParams:
         self.design_outdoor: float = DEFAULT_DESIGN_OUTDOOR
         self.floor_max: float = DEFAULT_FLOOR_MAX
         self.zone_floor_max: dict[str, float] = {}
+        self.zone_floor_sensor_bias: dict[str, float] = {}
         self.zone_offsets: dict[str, float] = {}
         self.floor_control_enabled: dict[str, bool] = {}
         self.floor_targets: dict[str, float] = {}
@@ -1063,6 +1090,12 @@ async def async_setup_outdoor_reset(
             zone_key = key[len("floor_max_"):]
             try:
                 params.zone_floor_max[zone_key] = float(value)
+            except (ValueError, TypeError):
+                pass
+        elif key.startswith("floor_bias_"):
+            zone_key = key[len("floor_bias_"):]
+            try:
+                params.zone_floor_sensor_bias[zone_key] = float(value)
             except (ValueError, TypeError):
                 pass
 
@@ -1224,6 +1257,14 @@ def get_number_entities(
             OutdoorResetZoneFloorMaxEntity(
                 coordinator, controller, zone_name,
                 f"Floor Max (Safety): {thm.name}", zone_cap, 70, cap_slider_max, 1,
+                thm, entry_id,
+            )
+        )
+        bias_default = DEFAULT_ZONE_FLOOR_SENSOR_BIAS.get(zone_name, 0.0)
+        entities.append(
+            OutdoorResetZoneFloorBiasEntity(
+                coordinator, controller, zone_name,
+                f"Floor Sensor Bias: {thm.name}", bias_default, -15, 5, 0.5,
                 thm, entry_id,
             )
         )
@@ -1538,6 +1579,88 @@ class OutdoorResetZoneFloorMaxEntity(RestoreNumber):
         if entry is None:
             return
         key = f"floor_max_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = value
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
+
+
+class OutdoorResetZoneFloorBiasEntity(RestoreNumber):
+    """Per-zone floor sensor correction (negative if probe is near loop supply)."""
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:thermometer-minus"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        name: str,
+        default: float,
+        min_val: float,
+        max_val: float,
+        step: float,
+        thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._thm_device = thm_device
+        self._entry_id = entry_id
+        self._default = default
+        self._attr_name = name
+        self._attr_native_min_value = min_val
+        self._attr_native_max_value = max_val
+        self._attr_native_step = step
+        self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_bias_{zone_key}"
+        self._attr_native_value = default
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"floor_bias_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    self._attr_native_value = float(saved)
+        if self._attr_native_value == self._default:
+            last = await self.async_get_last_number_data()
+            if last and last.native_value is not None:
+                self._attr_native_value = last.native_value
+        self._controller.params.zone_floor_sensor_bias[self._zone_key] = (
+            self._attr_native_value
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.zone_floor_sensor_bias[self._zone_key] = value
+        self.async_write_ha_state()
+        self._persist_to_options(value)
+
+    @callback
+    def _persist_to_options(self, value: float) -> None:
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"floor_bias_{self._zone_key}"
         new_options = dict(entry.options)
         new_options[key] = value
         self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
