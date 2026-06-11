@@ -6,7 +6,7 @@ import aiohttp
 
 BASE = "ws://172.16.255.250:8123/api/websocket"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ.Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
-REPO = "redawg/hbx-sensorlinx-ha"
+REPO = "redawg/hass-sensorlinx"
 
 
 async def main():
