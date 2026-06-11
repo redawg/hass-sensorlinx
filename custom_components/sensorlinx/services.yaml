@@ -22,3 +22,26 @@ set_forecast_entity:
       selector:
         entity:
           domain: weather
+
+set_hydronic_sensors:
+  name: Set Hydronic Loop Sensors
+  description: Configure the supply (input) and return (output) water temperature sensors for the hydronic loop.
+  fields:
+    supply_temp_sensor:
+      name: Supply Temperature Sensor
+      description: Sensor entity measuring the water temperature going INTO the floor loops
+      required: false
+      example: "sensor.supply_water_temperature"
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+    return_temp_sensor:
+      name: Return Temperature Sensor
+      description: Sensor entity measuring the water temperature coming OUT of the floor loops
+      required: false
+      example: "sensor.return_water_temperature"
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature

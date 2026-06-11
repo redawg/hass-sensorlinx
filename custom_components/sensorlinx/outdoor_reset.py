@@ -52,6 +52,11 @@ DEFAULT_THERMAL_LAG = 20.0  # minutes per degree F of floor temp rise
 PREHEAT_CHECK_INTERVAL = timedelta(minutes=15)
 TREND_WINDOW_MINUTES = 120  # use last 2 hours of outdoor temp for trend prediction
 
+# Hydronic loop monitoring
+DEFAULT_VALVE_COUNT = 1  # valves per zone (for flow estimation)
+DEFAULT_FLOW_RATE_PER_VALVE = 0.5  # GPM per valve (typical 1/2" zone valve)
+WATER_BTU_FACTOR = 500  # BTU/hr per GPM per degree F delta-T
+
 
 def compute_target(outdoor: float, base: float, overshoot: float,
                    shutdown: float, design_outdoor: float) -> float:
@@ -587,6 +592,80 @@ class OutdoorResetController:
         """Whether preheat mode is currently active."""
         return self._preheat_active
 
+    # ------------------------------------------------------------------
+    # Hydronic loop monitoring: supply/return temps, delta-T, BTU output
+    # ------------------------------------------------------------------
+
+    @property
+    def supply_water_actual(self) -> float | None:
+        """Read actual supply (input) water temperature from sensor."""
+        entity_id = self.params.supply_temp_sensor
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def return_water_actual(self) -> float | None:
+        """Read actual return (output) water temperature from sensor."""
+        entity_id = self.params.return_temp_sensor
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            return float(state.state)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def delta_t(self) -> float | None:
+        """Temperature drop across the floor loop (supply - return)."""
+        supply = self.supply_water_actual
+        ret = self.return_water_actual
+        if supply is None or ret is None:
+            return None
+        return round(supply - ret, 1)
+
+    def zone_flow_rate(self, zone_name: str) -> float:
+        """Estimated flow rate for a zone based on valve count (GPM)."""
+        valves = self.params.zone_valve_counts.get(zone_name, DEFAULT_VALVE_COUNT)
+        return valves * self.params.flow_rate_per_valve
+
+    def zone_btu_output(self, zone_name: str) -> float | None:
+        """Estimated BTU/hr heat delivery for a zone.
+
+        Formula: BTU/hr = 500 * GPM * delta-T
+        (500 factor = 60 min/hr * 8.33 lb/gal * 1 BTU/lb/°F)
+        """
+        dt = self.delta_t
+        if dt is None or dt <= 0:
+            return None
+        flow = self.zone_flow_rate(zone_name)
+        return round(WATER_BTU_FACTOR * flow * dt, 0)
+
+    def total_system_btu(self) -> float | None:
+        """Total BTU/hr across all zones currently heating."""
+        dt = self.delta_t
+        if dt is None or dt <= 0:
+            return None
+        total_flow = 0.0
+        for thm in self.coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            entity_id = f"climate.{zone_name}_{zone_name}"
+            state = self.hass.states.get(entity_id)
+            if state and state.state == "heat":
+                total_flow += self.zone_flow_rate(zone_name)
+        if total_flow == 0:
+            return None
+        return round(WATER_BTU_FACTOR * total_flow * dt, 0)
+
 
 class OutdoorResetParams:
     """Stores mutable outdoor reset parameters, updated by number entities."""
@@ -611,6 +690,11 @@ class OutdoorResetParams:
         self.preheat_enabled: bool = True
         self.thermal_lag: float = DEFAULT_THERMAL_LAG  # min per degree F
         self.forecast_entity_id: str | None = None  # weather.X entity for hourly forecast
+        # Hydronic loop monitoring
+        self.supply_temp_sensor: str | None = None  # sensor for water input temp
+        self.return_temp_sensor: str | None = None  # sensor for water output temp
+        self.zone_valve_counts: dict[str, int] = {}  # zone_name -> number of valves
+        self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +716,12 @@ async def async_setup_outdoor_reset(
     forecast_entity = entry.options.get("forecast_entity_id")
     if forecast_entity:
         params.forecast_entity_id = forecast_entity
+    supply_temp_sensor = entry.options.get("supply_temp_sensor")
+    if supply_temp_sensor:
+        params.supply_temp_sensor = supply_temp_sensor
+    return_temp_sensor = entry.options.get("return_temp_sensor")
+    if return_temp_sensor:
+        params.return_temp_sensor = return_temp_sensor
 
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
@@ -653,11 +743,27 @@ async def async_setup_outdoor_reset(
         hass.config_entries.async_update_entry(entry, options=new_options)
         _LOGGER.info("Forecast entity set to: %s", entity_id)
 
+    async def handle_set_hydronic_sensors(call):
+        supply_sensor = call.data.get("supply_temp_sensor")
+        return_sensor = call.data.get("return_temp_sensor")
+        new_options = dict(entry.options)
+        if supply_sensor:
+            controller.params.supply_temp_sensor = supply_sensor
+            new_options["supply_temp_sensor"] = supply_sensor
+        if return_sensor:
+            controller.params.return_temp_sensor = return_sensor
+            new_options["return_temp_sensor"] = return_sensor
+        hass.config_entries.async_update_entry(entry, options=new_options)
+        _LOGGER.info("Hydronic sensors: supply=%s, return=%s", supply_sensor, return_sensor)
+
     hass.services.async_register(
         DOMAIN, "set_supply_entity", handle_set_supply_entity,
     )
     hass.services.async_register(
         DOMAIN, "set_forecast_entity", handle_set_forecast_entity,
+    )
+    hass.services.async_register(
+        DOMAIN, "set_hydronic_sensors", handle_set_hydronic_sensors,
     )
 
     return controller
@@ -714,6 +820,11 @@ def get_number_entities(
             "Preheat: Thermal Lag (min/°F)", DEFAULT_THERMAL_LAG, 5, 60, 5,
             "mdi:clock-fast",
         ),
+        OutdoorResetNumberEntity(
+            coordinator, controller, "flow_rate_per_valve",
+            "Hydronic: Flow Rate per Valve (GPM)", DEFAULT_FLOW_RATE_PER_VALVE, 0.25, 2.0, 0.25,
+            "mdi:pipe-valve",
+        ),
     ]
 
     for thm in coordinator.get_thm_devices():
@@ -722,6 +833,12 @@ def get_number_entities(
             OutdoorResetZoneOffsetEntity(
                 coordinator, controller, zone_name,
                 f"Zone Offset: {thm.name}", 0, -5, 5, 0.5,
+            )
+        )
+        entities.append(
+            ZoneValveCountEntity(
+                coordinator, controller, zone_name,
+                f"Valve Count: {thm.name}",
             )
         )
         entities.append(
@@ -743,6 +860,8 @@ def get_sensor_entities(
         OutdoorResetTargetSensor(coordinator, controller, "target_setpoint", "Heating Curve Target"),
         SupplyWaterTargetSensor(coordinator, controller),
         PreheatStatusSensor(coordinator, controller),
+        HydronicDeltaTSensor(coordinator, controller),
+        HydronicBtuSensor(coordinator, controller),
     ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -851,6 +970,8 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.supply_temp_max = self._attr_native_value
         elif self._key == "thermal_lag":
             params.thermal_lag = self._attr_native_value
+        elif self._key == "flow_rate_per_valve":
+            params.flow_rate_per_valve = self._attr_native_value
 
 
 class OutdoorResetZoneOffsetEntity(RestoreNumber):
@@ -1312,4 +1433,144 @@ class PreheatStatusSensor(SensorEntity):
             lead = self._controller._compute_preheat_lead_time()
             attrs["eta_to_shutdown_min"] = round(eta, 0) if eta is not None else None
             attrs["preheat_lead_time_min"] = round(lead, 0)
+        return attrs
+
+
+# ---------------------------------------------------------------------------
+# Hydronic loop monitoring entities
+# ---------------------------------------------------------------------------
+
+class ZoneValveCountEntity(RestoreNumber):
+    """Per-zone valve count for flow rate estimation."""
+
+    _attr_has_entity_name = True
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:pipe-valve"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        name: str,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._attr_name = name
+        self._attr_native_min_value = 1
+        self._attr_native_max_value = 6
+        self._attr_native_step = 1
+        self._attr_unique_id = f"sensorlinx_zone_valve_count_{zone_key}"
+        self._attr_native_value = DEFAULT_VALVE_COUNT
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last and last.native_value is not None:
+            self._attr_native_value = last.native_value
+        self._controller.params.zone_valve_counts[self._zone_key] = int(self._attr_native_value)
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.zone_valve_counts[self._zone_key] = int(value)
+        self.async_write_ha_state()
+
+
+class HydronicDeltaTSensor(SensorEntity):
+    """Shows the supply-return temperature differential (delta-T)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Hydronic Delta-T"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_state_class = "measurement"
+    _attr_icon = "mdi:thermometer-water"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_hydronic_delta_t"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def native_value(self) -> float | None:
+        return self._controller.delta_t
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "supply_temp": self._controller.supply_water_actual,
+            "return_temp": self._controller.return_water_actual,
+            "supply_sensor": self._controller.params.supply_temp_sensor or "not configured",
+            "return_sensor": self._controller.params.return_temp_sensor or "not configured",
+        }
+
+
+class HydronicBtuSensor(SensorEntity):
+    """Shows estimated total BTU/hr heat delivery across active zones."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Hydronic Heat Output"
+    _attr_native_unit_of_measurement = "BTU/hr"
+    _attr_state_class = "measurement"
+    _attr_icon = "mdi:fire"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_hydronic_btu_output"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def native_value(self) -> float | None:
+        return self._controller.total_system_btu()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs: dict[str, Any] = {
+            "delta_t": self._controller.delta_t,
+            "flow_rate_per_valve_gpm": self._controller.params.flow_rate_per_valve,
+        }
+        for thm in self._coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            valves = self._controller.params.zone_valve_counts.get(zone_name, DEFAULT_VALVE_COUNT)
+            flow = self._controller.zone_flow_rate(zone_name)
+            btu = self._controller.zone_btu_output(zone_name)
+            attrs[f"{zone_name}_valves"] = valves
+            attrs[f"{zone_name}_flow_gpm"] = flow
+            attrs[f"{zone_name}_btu_hr"] = btu
         return attrs
