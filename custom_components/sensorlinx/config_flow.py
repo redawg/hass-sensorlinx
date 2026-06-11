@@ -183,28 +183,26 @@ OPTIMALTANKLESS_DOMAIN = "optimaltankless"
 
 def _external_switch_schema(defaults: dict[str, Any]) -> vol.Schema:
     """Schema for linking physical HA switches to SensorLinx."""
-    return vol.Schema(
-        {
-            vol.Optional(
-                CONF_HOT_WATER_SWITCH,
-                default=defaults.get(CONF_HOT_WATER_SWITCH, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch"])
-            ),
-            vol.Optional(
-                CONF_RADIANT_FLOOR_SWITCH,
-                default=defaults.get(CONF_RADIANT_FLOOR_SWITCH, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch"])
-            ),
-            vol.Optional(
-                CONF_HEATED_FLOOR_CONTROLLER,
-                default=defaults.get(CONF_HEATED_FLOOR_CONTROLLER, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["switch", "light"])
-            ),
-        }
-    )
+    schema_dict: dict[Any, Any] = {}
+    hot_water = defaults.get(CONF_HOT_WATER_SWITCH)
+    if hot_water:
+        schema_dict[vol.Optional(CONF_HOT_WATER_SWITCH, default=hot_water)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["switch"]))
+        )
+    else:
+        schema_dict[vol.Optional(CONF_HOT_WATER_SWITCH)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["switch"]))
+        )
+    radiant = defaults.get(CONF_RADIANT_FLOOR_SWITCH)
+    if radiant:
+        schema_dict[vol.Optional(CONF_RADIANT_FLOOR_SWITCH, default=radiant)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["switch"]))
+        )
+    else:
+        schema_dict[vol.Optional(CONF_RADIANT_FLOOR_SWITCH)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["switch"]))
+        )
+    return vol.Schema(schema_dict)
 
 
 def _heating_source_schema(
@@ -213,24 +211,36 @@ def _heating_source_schema(
     """Schema for selecting floor heating source from available water heaters."""
     schema_dict: dict[Any, Any] = {}
     if water_heaters:
-        schema_dict[vol.Optional(
-            CONF_HEATING_SOURCE,
-            default=defaults.get(CONF_HEATING_SOURCE, ""),
-        )] = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(value=eid, label=label)
-                    for eid, label in water_heaters.items()
-                ],
-                mode="dropdown",
+        heating_default = defaults.get(CONF_HEATING_SOURCE)
+        if heating_default:
+            schema_dict[vol.Optional(CONF_HEATING_SOURCE, default=heating_default)] = (
+                selector.SelectSelector(selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(value=eid, label=label)
+                        for eid, label in water_heaters.items()
+                    ],
+                    mode="dropdown",
+                ))
             )
+        else:
+            schema_dict[vol.Optional(CONF_HEATING_SOURCE)] = (
+                selector.SelectSelector(selector.SelectSelectorConfig(
+                    options=[
+                        selector.SelectOptionDict(value=eid, label=label)
+                        for eid, label in water_heaters.items()
+                    ],
+                    mode="dropdown",
+                ))
+            )
+    forecast = defaults.get(CONF_FORECAST_ENTITY)
+    if forecast:
+        schema_dict[vol.Optional(CONF_FORECAST_ENTITY, default=forecast)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["weather"]))
         )
-    schema_dict[vol.Optional(
-        CONF_FORECAST_ENTITY,
-        default=defaults.get(CONF_FORECAST_ENTITY, ""),
-    )] = selector.EntitySelector(
-        selector.EntitySelectorConfig(domain=["weather"])
-    )
+    else:
+        schema_dict[vol.Optional(CONF_FORECAST_ENTITY)] = (
+            selector.EntitySelector(selector.EntitySelectorConfig(domain=["weather"]))
+        )
     return vol.Schema(schema_dict)
 
 

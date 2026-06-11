@@ -34,8 +34,7 @@
         "description": "Link physical Home Assistant switches that power your hot-water heater and radiant-floor controller.",
         "data": {
           "hot_water_switch_entity_id": "Hot water heater switch",
-          "radiant_floor_switch_entity_id": "Radiant floor controller switch",
-          "heated_floor_controller_entity_id": "Heated floor controller (switch or light)"
+          "radiant_floor_switch_entity_id": "Radiant floor controller switch"
         }
       },
       "heating_source": {
