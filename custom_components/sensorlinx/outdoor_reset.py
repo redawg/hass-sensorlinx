@@ -42,6 +42,11 @@ DEFAULT_FLOOR_TARGET = 70.0
 DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 
+# Supply water temperature reset defaults
+DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
+DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
+SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
+
 
 def compute_target(outdoor: float, base: float, overshoot: float,
                    shutdown: float, design_outdoor: float) -> float:
@@ -133,6 +138,9 @@ class OutdoorResetController:
         if outdoor is None:
             _LOGGER.debug("Outdoor temp unavailable, skipping reset update")
             return
+
+        # Adjust supply water temperature alongside zone setpoints
+        await self._apply_supply_water_temp(outdoor)
 
         target = self.calculated_target
 
@@ -256,6 +264,86 @@ class OutdoorResetController:
         # Clamp to reasonable range
         return round(max(65.0, min(setpoint, self.params.floor_max - 2)), 1)
 
+    def _compute_supply_water_temp(self, outdoor: float) -> float:
+        """Compute target supply water temperature based on outdoor temp.
+
+        Linear interpolation:
+        - At shutdown (65F outdoor): supply = supply_temp_min (100F)
+        - At design outdoor (25F): supply = supply_temp_max (140F)
+        """
+        temp_range = self.params.shutdown - self.params.design_outdoor
+        if temp_range <= 0:
+            return self.params.supply_temp_min
+        if outdoor >= self.params.shutdown:
+            return self.params.supply_temp_min
+        if outdoor <= self.params.design_outdoor:
+            return self.params.supply_temp_max
+        ratio = (self.params.shutdown - outdoor) / temp_range
+        return round(
+            self.params.supply_temp_min
+            + (self.params.supply_temp_max - self.params.supply_temp_min) * ratio,
+            1,
+        )
+
+    async def _apply_supply_water_temp(self, outdoor: float) -> None:
+        """Adjust the water heater setpoint based on outdoor temperature."""
+        if not self.params.supply_control_enabled:
+            return
+        entity_id = self.params.supply_entity_id
+        if not entity_id:
+            return
+
+        target_supply = self._compute_supply_water_temp(outdoor)
+
+        # Determine entity type and read current value
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            _LOGGER.debug("Supply entity %s unavailable", entity_id)
+            return
+
+        # Deadband check
+        try:
+            if entity_id.startswith("climate."):
+                current = float(state.attributes.get("temperature", 0))
+            else:
+                current = float(state.state)
+        except (ValueError, TypeError):
+            current = 0.0
+
+        if abs(current - target_supply) < SUPPLY_DEADBAND:
+            _LOGGER.debug(
+                "Supply water: skipping %s (current=%.1f, target=%.1f)",
+                entity_id, current, target_supply,
+            )
+            return
+
+        _LOGGER.info(
+            "Supply water reset: outdoor=%.1f, setting %s to %.1fF",
+            outdoor, entity_id, target_supply,
+        )
+
+        # Call appropriate service based on entity domain
+        if entity_id.startswith("climate."):
+            await self.hass.services.async_call(
+                "climate", "set_temperature",
+                {"entity_id": entity_id, "temperature": target_supply},
+                blocking=True,
+            )
+        elif entity_id.startswith("number."):
+            await self.hass.services.async_call(
+                "number", "set_value",
+                {"entity_id": entity_id, "value": target_supply},
+                blocking=True,
+            )
+        elif entity_id.startswith("water_heater."):
+            await self.hass.services.async_call(
+                "water_heater", "set_temperature",
+                {"entity_id": entity_id, "temperature": target_supply},
+                blocking=True,
+            )
+        else:
+            _LOGGER.warning("Unsupported entity type for supply control: %s", entity_id)
+
 
 class OutdoorResetParams:
     """Stores mutable outdoor reset parameters, updated by number entities."""
@@ -271,6 +359,11 @@ class OutdoorResetParams:
         self.floor_control_enabled: dict[str, bool] = {}
         self.floor_targets: dict[str, float] = {}
         self.floor_boost: float = DEFAULT_FLOOR_BOOST
+        # Supply water temperature reset
+        self.supply_temp_min: float = DEFAULT_SUPPLY_TEMP_MIN
+        self.supply_temp_max: float = DEFAULT_SUPPLY_TEMP_MAX
+        self.supply_entity_id: str | None = None  # set via text entity or config
+        self.supply_control_enabled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +377,29 @@ async def async_setup_outdoor_reset(
 ) -> OutdoorResetController:
     """Create the outdoor reset controller and register it."""
     params = OutdoorResetParams()
+
+    # Restore supply entity from config entry options if previously set
+    supply_entity = entry.options.get("supply_entity_id")
+    if supply_entity:
+        params.supply_entity_id = supply_entity
+
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
+
+    # Register a service to configure the supply water heater entity
+    async def handle_set_supply_entity(call):
+        entity_id = call.data.get("entity_id")
+        controller.params.supply_entity_id = entity_id
+        # Persist to config entry options
+        new_options = dict(entry.options)
+        new_options["supply_entity_id"] = entity_id
+        hass.config_entries.async_update_entry(entry, options=new_options)
+        _LOGGER.info("Supply water entity set to: %s", entity_id)
+
+    hass.services.async_register(
+        DOMAIN, "set_supply_entity", handle_set_supply_entity,
+    )
+
     return controller
 
 
@@ -325,6 +439,16 @@ def get_number_entities(
             "Floor Boost (Cold Weather)", DEFAULT_FLOOR_BOOST, 0, 5, 0.5,
             "mdi:thermometer-chevron-up",
         ),
+        OutdoorResetNumberEntity(
+            coordinator, controller, "supply_temp_min",
+            "Supply Water: Min Temp (Mild)", DEFAULT_SUPPLY_TEMP_MIN, 80, 130, 5,
+            "mdi:water-thermometer-outline",
+        ),
+        OutdoorResetNumberEntity(
+            coordinator, controller, "supply_temp_max",
+            "Supply Water: Max Temp (Cold)", DEFAULT_SUPPLY_TEMP_MAX, 110, 180, 5,
+            "mdi:water-thermometer",
+        ),
     ]
 
     for thm in coordinator.get_thm_devices():
@@ -352,6 +476,7 @@ def get_sensor_entities(
     """Return sensor entities that report the calculated targets."""
     entities: list[SensorEntity] = [
         OutdoorResetTargetSensor(coordinator, controller, "target_setpoint", "Heating Curve Target"),
+        SupplyWaterTargetSensor(coordinator, controller),
     ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -368,7 +493,10 @@ def get_switch_entities(
     controller: OutdoorResetController,
 ) -> list[SwitchEntity]:
     """Return the enable/disable switch and per-zone floor mode switches."""
-    entities: list[SwitchEntity] = [OutdoorResetEnableSwitch(coordinator, controller)]
+    entities: list[SwitchEntity] = [
+        OutdoorResetEnableSwitch(coordinator, controller),
+        SupplyWaterControlSwitch(coordinator, controller),
+    ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
@@ -450,6 +578,10 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.floor_max = self._attr_native_value
         elif self._key == "floor_boost":
             params.floor_boost = self._attr_native_value
+        elif self._key == "supply_temp_min":
+            params.supply_temp_min = self._attr_native_value
+        elif self._key == "supply_temp_max":
+            params.supply_temp_max = self._attr_native_value
 
 
 class OutdoorResetZoneOffsetEntity(RestoreNumber):
@@ -723,3 +855,96 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.floor_targets[self._zone_key] = value
         self.async_write_ha_state()
+
+
+# ---------------------------------------------------------------------------
+# Supply water temperature reset entities
+# ---------------------------------------------------------------------------
+
+class SupplyWaterControlSwitch(SwitchEntity):
+    """Enable/disable automatic supply water temperature adjustment."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Supply Water Reset Enabled"
+    _attr_icon = "mdi:water-boiler"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_supply_water_control_enabled"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.supply_control_enabled
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "supply_entity_id": self._controller.params.supply_entity_id or "not configured",
+        }
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.supply_control_enabled = True
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.supply_control_enabled = False
+        self.async_write_ha_state()
+
+
+class SupplyWaterTargetSensor(SensorEntity):
+    """Displays the calculated supply water temperature target."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Supply Water Target"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_state_class = "measurement"
+    _attr_icon = "mdi:water-thermometer"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_supply_water_target"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def native_value(self) -> float | None:
+        outdoor = self._controller.outdoor_temp
+        if outdoor is None:
+            return None
+        return self._controller._compute_supply_water_temp(outdoor)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "supply_min": self._controller.params.supply_temp_min,
+            "supply_max": self._controller.params.supply_temp_max,
+            "supply_entity_id": self._controller.params.supply_entity_id or "not configured",
+            "supply_control_enabled": self._controller.params.supply_control_enabled,
+        }

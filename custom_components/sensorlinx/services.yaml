@@ -1,0 +1,11 @@
+set_supply_entity:
+  name: Set Supply Water Heater Entity
+  description: Configure which HA entity controls the supply water temperature for outdoor reset.
+  fields:
+    entity_id:
+      name: Entity ID
+      description: The entity that controls the water heater temperature (e.g., climate.tankless_water_heater, number.water_heater_setpoint, or water_heater.my_heater)
+      required: true
+      example: "climate.tankless_water_heater"
+      selector:
+        entity:
