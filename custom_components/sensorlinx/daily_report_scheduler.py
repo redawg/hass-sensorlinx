@@ -16,8 +16,20 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 REPORT_SCRIPT = Path(__file__).parent / "report_scripts" / "ha_daily_report_slack.py"
+SLACK_CHANNEL_FILE = Path("/config/sensorlinx/slack_channel.txt")
+DEFAULT_SLACK_CHANNEL = "#aatom"
 SCHEDULE_HOUR = 7
 SCHEDULE_MINUTE = 0
+
+
+def _slack_channel() -> str:
+    if SLACK_CHANNEL_FILE.exists():
+        ch = SLACK_CHANNEL_FILE.read_text(encoding="utf-8").strip()
+    else:
+        ch = DEFAULT_SLACK_CHANNEL
+    if ch and not ch.startswith("#"):
+        ch = f"#{ch}"
+    return ch
 
 
 def _run_report_script() -> tuple[int, str]:
@@ -45,7 +57,10 @@ async def async_run_daily_report(hass: HomeAssistant) -> None:
         await hass.services.async_call(
             "notify",
             "schoenfeld",
-            {"message": "SensorLinx daily report FAILED: timed out after 5 minutes"},
+            {
+                "message": "SensorLinx daily report FAILED: timed out after 5 minutes",
+                "target": _slack_channel(),
+            },
         )
         return
 
@@ -59,6 +74,7 @@ async def async_run_daily_report(hass: HomeAssistant) -> None:
                     f"SensorLinx daily report FAILED (exit {returncode}):\n"
                     f"```{output[-1500:]}```"
                 ),
+                "target": _slack_channel(),
             },
         )
         return
