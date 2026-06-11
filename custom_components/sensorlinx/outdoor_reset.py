@@ -32,7 +32,7 @@ from .helpers import thm_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
-OUTDOOR_TEMP_ENTITY = "sensor.home_weather_station_temperature"
+OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
 UPDATE_INTERVAL = timedelta(minutes=15)
 
 DEFAULT_BASE = 70.0
