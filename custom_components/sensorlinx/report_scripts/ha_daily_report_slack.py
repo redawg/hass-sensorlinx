@@ -27,6 +27,8 @@ if Path("/config").exists():
 else:
     _DEFAULT_HA = "http://172.16.255.250:8123"
 HA_HOST = os.environ.get("HA_HOST", _DEFAULT_HA)
+SLACK_CHANNEL_FILE = Path("/config/sensorlinx/slack_channel.txt")
+DEFAULT_SLACK_CHANNEL = "#aatom"
 TOKEN_FILE = Path("/config/sensorlinx/.ha_token")
 DEFAULT_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
@@ -40,6 +42,18 @@ def load_token():
     if TOKEN_FILE.exists():
         return TOKEN_FILE.read_text(encoding="utf-8").strip()
     return os.environ.get("HA_TOKEN", DEFAULT_TOKEN)
+
+
+def load_slack_channel():
+    if os.environ.get("SLACK_CHANNEL"):
+        ch = os.environ["SLACK_CHANNEL"].strip()
+    elif SLACK_CHANNEL_FILE.exists():
+        ch = SLACK_CHANNEL_FILE.read_text(encoding="utf-8").strip()
+    else:
+        ch = DEFAULT_SLACK_CHANNEL
+    if ch and not ch.startswith("#"):
+        ch = f"#{ch}"
+    return ch
 
 
 def ha_post(path, payload, token):
@@ -96,12 +110,14 @@ def build_slack_summary(report_text, result):
     return header + "```\n" + body + "\n```"
 
 
-def send_slack(message, token):
+def send_slack(message, token, channel=None):
+    channel = channel or load_slack_channel()
     status, body = ha_post(
         "/api/services/notify/schoenfeld",
         {
             "message": message,
             "title": "SensorLinx Daily Report",
+            "target": channel,
         },
         token,
     )
