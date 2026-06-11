@@ -213,7 +213,7 @@ def _heating_source_schema(
     """Schema for selecting floor heating source from available water heaters."""
     schema_dict: dict[Any, Any] = {}
     if water_heaters:
-        schema_dict[vol.Required(
+        schema_dict[vol.Optional(
             CONF_HEATING_SOURCE,
             default=defaults.get(CONF_HEATING_SOURCE, ""),
         )] = selector.SelectSelector(
