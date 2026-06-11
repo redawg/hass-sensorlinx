@@ -61,7 +61,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when options change so external switch links are reapplied."""
+    """Reload when external switch config changes via options flow.
+
+    Entity-level option saves (valve counts, floor mode, floor targets,
+    hydronic sensors) set a skip flag to prevent unnecessary reloads.
+    """
+    domain_data = hass.data.get(DOMAIN, {})
+    if domain_data.pop(f"{entry.entry_id}_skip_reload", False):
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 

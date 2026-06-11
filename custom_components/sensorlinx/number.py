@@ -32,7 +32,7 @@ async def async_setup_entry(
 
     controller = hass.data[DOMAIN].get(f"{entry.entry_id}_outdoor_reset")
     if controller:
-        entities.extend(get_number_entities(coordinator, controller))
+        entities.extend(get_number_entities(coordinator, controller, entry.entry_id))
 
     async_add_entities(entities)
 

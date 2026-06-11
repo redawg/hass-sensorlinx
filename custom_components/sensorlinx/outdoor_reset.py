@@ -18,6 +18,7 @@ from typing import Any
 from homeassistant.components.number import NumberEntity, NumberMode, RestoreNumber
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.components.switch import SwitchEntity
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
@@ -754,7 +755,7 @@ async def async_setup_outdoor_reset(
     if flow_rate_sensor:
         params.flow_rate_sensor = flow_rate_sensor
 
-    # Restore per-zone valve counts from options
+    # Restore per-zone valve counts and floor mode from options
     for key, value in entry.options.items():
         if key.startswith("zone_valves_"):
             zone_key = key[len("zone_valves_"):]
@@ -762,6 +763,9 @@ async def async_setup_outdoor_reset(
                 params.zone_valve_counts[zone_key] = int(value)
             except (ValueError, TypeError):
                 pass
+        elif key.startswith("floor_mode_"):
+            zone_key = key[len("floor_mode_"):]
+            params.floor_control_enabled[zone_key] = bool(value)
 
     controller = OutdoorResetController(hass, coordinator, params)
     await controller.async_setup()
@@ -776,6 +780,7 @@ async def async_setup_outdoor_reset(
             return
         new_options = dict(live_entry.options)
         new_options["supply_entity_id"] = entity_id
+        hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
         hass.config_entries.async_update_entry(live_entry, options=new_options)
         _LOGGER.info("Supply water entity set to: %s", entity_id)
 
@@ -788,6 +793,7 @@ async def async_setup_outdoor_reset(
             return
         new_options = dict(live_entry.options)
         new_options["forecast_entity_id"] = entity_id
+        hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
         hass.config_entries.async_update_entry(live_entry, options=new_options)
         _LOGGER.info("Forecast entity set to: %s", entity_id)
 
@@ -809,10 +815,7 @@ async def async_setup_outdoor_reset(
         if flow_sensor:
             controller.params.flow_rate_sensor = flow_sensor
             new_options["flow_rate_sensor"] = flow_sensor
-        _LOGGER.info(
-            "Updating config entry options: %s (entry_id=%s)",
-            new_options, live_entry.entry_id,
-        )
+        hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
         hass.config_entries.async_update_entry(live_entry, options=new_options)
         _LOGGER.info(
             "Hydronic sensors set: supply=%s, return=%s, flow=%s",
@@ -835,6 +838,7 @@ async def async_setup_outdoor_reset(
 def get_number_entities(
     coordinator: SensorlinxCoordinator,
     controller: OutdoorResetController,
+    entry_id: str | None = None,
 ) -> list[NumberEntity]:
     """Return number entities for outdoor reset parameters."""
     entities: list[NumberEntity] = [
@@ -901,14 +905,14 @@ def get_number_entities(
         entities.append(
             ZoneValveCountEntity(
                 coordinator, controller, zone_name,
-                f"Valve Count: {thm.name}", thm,
+                f"Valve Count: {thm.name}", thm, entry_id,
             )
         )
         entities.append(
             OutdoorResetFloorTargetEntity(
                 coordinator, controller, zone_name,
                 f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, 80, 0.5,
-                thm,
+                thm, entry_id,
             )
         )
 
@@ -940,6 +944,7 @@ def get_sensor_entities(
 def get_switch_entities(
     coordinator: SensorlinxCoordinator,
     controller: OutdoorResetController,
+    entry_id: str | None = None,
 ) -> list[SwitchEntity]:
     """Return the enable/disable switch and per-zone floor mode switches."""
     entities: list[SwitchEntity] = [
@@ -950,7 +955,9 @@ def get_switch_entities(
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
-            OutdoorResetFloorModeSwitch(coordinator, controller, zone_name, thm.name, thm)
+            OutdoorResetFloorModeSwitch(
+                coordinator, controller, zone_name, thm.name, thm, entry_id,
+            )
         )
     return entities
 
@@ -1218,7 +1225,7 @@ class OutdoorResetEnableSwitch(SwitchEntity):
         self.async_write_ha_state()
 
 
-class OutdoorResetFloorModeSwitch(SwitchEntity):
+class OutdoorResetFloorModeSwitch(SwitchEntity, RestoreEntity):
     """Per-zone switch: when ON, targets floor temperature instead of room temperature."""
 
     _attr_has_entity_name = True
@@ -1231,11 +1238,13 @@ class OutdoorResetFloorModeSwitch(SwitchEntity):
         zone_key: str,
         zone_name: str,
         thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
         self._thm_device = thm_device
+        self._entry_id = entry_id
         self._attr_name = f"Floor Control Mode: {zone_name}"
         self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_mode_{zone_key}"
 
@@ -1254,15 +1263,42 @@ class OutdoorResetFloorModeSwitch(SwitchEntity):
     def is_on(self) -> bool:
         return self._controller.params.floor_control_enabled.get(self._zone_key, False)
 
+    async def async_added_to_hass(self) -> None:
+        """Restore floor mode state from config entry options."""
+        await super().async_added_to_hass()
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"floor_mode_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    self._controller.params.floor_control_enabled[self._zone_key] = bool(saved)
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._controller.params.floor_control_enabled[self._zone_key] = True
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
+        self._persist_to_options(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.floor_control_enabled[self._zone_key] = False
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
+        self._persist_to_options(False)
+
+    @callback
+    def _persist_to_options(self, enabled: bool) -> None:
+        """Save floor mode state to config entry options."""
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"floor_mode_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = enabled
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
 
 
 class OutdoorResetFloorTargetEntity(RestoreNumber):
@@ -1284,11 +1320,13 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         max_val: float,
         step: float,
         thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
         self._thm_device = thm_device
+        self._entry_id = entry_id
         self._default = default
         self._attr_name = name
         self._attr_native_min_value = min_val
@@ -1321,9 +1359,18 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        last = await self.async_get_last_number_data()
-        if last and last.native_value is not None:
-            self._attr_native_value = last.native_value
+        # Prioritize config entry options (survives unavailable state)
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"floor_target_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    self._attr_native_value = float(saved)
+        if self._attr_native_value == self._default:
+            last = await self.async_get_last_number_data()
+            if last and last.native_value is not None:
+                self._attr_native_value = last.native_value
         self._controller.params.floor_targets[self._zone_key] = self._attr_native_value
         self.async_on_remove(
             async_dispatcher_connect(
@@ -1335,6 +1382,21 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.floor_targets[self._zone_key] = value
         self.async_write_ha_state()
+        self._persist_to_options(value)
+
+    @callback
+    def _persist_to_options(self, value: float) -> None:
+        """Save floor target to config entry options."""
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"floor_target_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = value
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,11 +1606,13 @@ class ZoneValveCountEntity(RestoreNumber):
         zone_key: str,
         name: str,
         thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
         self._thm_device = thm_device
+        self._entry_id = entry_id
         self._attr_name = name
         self._attr_native_min_value = 1
         self._attr_native_max_value = 6
@@ -1580,9 +1644,14 @@ class ZoneValveCountEntity(RestoreNumber):
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
-        last = await self.async_get_last_number_data()
-        if last and last.native_value is not None:
-            self._attr_native_value = last.native_value
+        # Prioritize config entry options (survives unavailable state)
+        options_value = self._controller.params.zone_valve_counts.get(self._zone_key)
+        if options_value is not None and options_value != DEFAULT_VALVE_COUNT:
+            self._attr_native_value = float(options_value)
+        else:
+            last = await self.async_get_last_number_data()
+            if last and last.native_value is not None:
+                self._attr_native_value = last.native_value
         self._controller.params.zone_valve_counts[self._zone_key] = int(self._attr_native_value)
         self.async_on_remove(
             async_dispatcher_connect(
@@ -1594,6 +1663,21 @@ class ZoneValveCountEntity(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.zone_valve_counts[self._zone_key] = int(value)
         self.async_write_ha_state()
+        self._persist_to_options(int(value))
+
+    @callback
+    def _persist_to_options(self, value: int) -> None:
+        """Save valve count to config entry options for reliable persistence."""
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"zone_valves_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = value
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
 
 
 class HydronicDeltaTSensor(SensorEntity):
