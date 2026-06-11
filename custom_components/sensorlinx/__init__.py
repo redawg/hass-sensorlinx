@@ -14,6 +14,7 @@ from .const import CONF_BUILDING_ID, DOMAIN
 from .coordinator import SensorlinxCoordinator
 from .external_control import SensorlinxExternalControl
 from .outdoor_reset import async_setup_outdoor_reset
+from .daily_report_scheduler import async_setup_daily_report
 from .thermal_logger import async_setup_thermal_logger
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     outdoor_reset = await async_setup_outdoor_reset(hass, entry, coordinator)
     thermal_logger = await async_setup_thermal_logger(hass, coordinator, outdoor_reset)
+    await async_setup_daily_report(hass)
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = coordinator
