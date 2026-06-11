@@ -361,9 +361,9 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             orig_name = (ent.original_name or "").lower()
 
             if ent.domain == "sensor":
-                if "outlet" in orig_name or "output" in orig_name:
+                if "outlet" in orig_name and "temperature" in orig_name:
                     self._options[CONF_SUPPLY_TEMP_SENSOR] = eid
-                elif "inlet" in orig_name or "input" in orig_name:
+                elif "inlet" in orig_name and "temperature" in orig_name:
                     self._options[CONF_RETURN_TEMP_SENSOR] = eid
                 elif "flow_rate" in eid and "available" not in eid:
                     self._options[CONF_FLOW_RATE_SENSOR] = eid
