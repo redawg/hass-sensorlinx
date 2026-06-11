@@ -151,9 +151,11 @@ def detect_short_cycling(cycles):
 
 def get_zone_floor_max(zone_key, states):
     """Read per-zone floor safety cap from HA (wood 80F, tile laundry 88F)."""
-    entity = states.get(
-        f"number.sensorlinx_outdoor_reset_floor_max_{zone_key}", {}
-    )
+    entity = states.get(f"number.{zone_key}_floor_max_safety_{zone_key}", {})
+    if not entity:
+        entity = states.get(
+            f"number.sensorlinx_outdoor_reset_floor_max_{zone_key}", {}
+        )
     state = entity.get("state")
     try:
         return float(state)
