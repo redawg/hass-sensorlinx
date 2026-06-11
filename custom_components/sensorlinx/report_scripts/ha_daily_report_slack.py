@@ -37,8 +37,10 @@ AGENT_LOG_PATH = (
     if Path("/config").exists()
     else SCRIPT_DIR / "agent_adjustments.jsonl"
 )
-DEFAULT_SLACK_CHANNEL = "#aatom"
-DEFAULT_SLACK_MENTION = "@andrew"
+DEFAULT_SLACK_CHANNEL = "@aschoenfeld"
+DEFAULT_SLACK_MENTION = "@aschoenfeld"
+DEFAULT_NOTIFY_SERVICE = "schoenfeld"
+NOTIFY_SERVICE_FILE = Path("/config/sensorlinx/slack_notify_service.txt")
 
 ENTITY_LABELS = {
     "switch.sensorlinx_outdoor_reset_supply_water_reset_enabled": "Supply water reset",
@@ -73,6 +75,14 @@ def load_slack_mention():
     return DEFAULT_SLACK_MENTION
 
 
+def load_notify_service():
+    if os.environ.get("SLACK_NOTIFY_SERVICE"):
+        return os.environ["SLACK_NOTIFY_SERVICE"].strip()
+    if NOTIFY_SERVICE_FILE.exists():
+        return NOTIFY_SERVICE_FILE.read_text(encoding="utf-8").strip()
+    return DEFAULT_NOTIFY_SERVICE
+
+
 def load_slack_channel():
     if os.environ.get("SLACK_CHANNEL"):
         ch = os.environ["SLACK_CHANNEL"].strip()
@@ -80,7 +90,7 @@ def load_slack_channel():
         ch = SLACK_CHANNEL_FILE.read_text(encoding="utf-8").strip()
     else:
         ch = DEFAULT_SLACK_CHANNEL
-    if ch and not ch.startswith("#"):
+    if ch and not ch.startswith(("#", "@")):
         ch = f"#{ch}"
     return ch
 
@@ -307,8 +317,9 @@ def build_slack_messages(report_text, result):
 
 def send_slack(message, token, channel=None, title="SensorLinx Daily Report"):
     channel = channel or load_slack_channel()
+    notify_service = load_notify_service()
     status, body = ha_post(
-        "/api/services/notify/schoenfeld",
+        f"/api/services/notify/{notify_service}",
         {
             "message": message,
             "title": title,

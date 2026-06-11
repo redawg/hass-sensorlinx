@@ -17,7 +17,8 @@ _LOGGER = logging.getLogger(__name__)
 
 REPORT_SCRIPT = Path(__file__).parent / "report_scripts" / "ha_daily_report_slack.py"
 SLACK_CHANNEL_FILE = Path("/config/sensorlinx/slack_channel.txt")
-DEFAULT_SLACK_CHANNEL = "#aatom"
+DEFAULT_SLACK_CHANNEL = "@aschoenfeld"
+DEFAULT_NOTIFY_SERVICE = "schoenfeld"
 SCHEDULE_HOUR = 7
 SCHEDULE_MINUTE = 0
 
@@ -27,9 +28,13 @@ def _slack_channel() -> str:
         ch = SLACK_CHANNEL_FILE.read_text(encoding="utf-8").strip()
     else:
         ch = DEFAULT_SLACK_CHANNEL
-    if ch and not ch.startswith("#"):
+    if ch and not ch.startswith(("#", "@")):
         ch = f"#{ch}"
     return ch
+
+
+def _notify_service() -> str:
+    return DEFAULT_NOTIFY_SERVICE
 
 
 def _run_report_script() -> tuple[int, str]:
@@ -56,7 +61,7 @@ async def async_run_daily_report(hass: HomeAssistant) -> None:
         _LOGGER.error("Daily report timed out after 300s")
         await hass.services.async_call(
             "notify",
-            "schoenfeld",
+            _notify_service(),
             {
                 "message": "SensorLinx daily report FAILED: timed out after 5 minutes",
                 "target": _slack_channel(),
@@ -68,7 +73,7 @@ async def async_run_daily_report(hass: HomeAssistant) -> None:
         _LOGGER.error("Daily report failed (rc=%s): %s", returncode, output[-500:])
         await hass.services.async_call(
             "notify",
-            "schoenfeld",
+            _notify_service(),
             {
                 "message": (
                     f"SensorLinx daily report FAILED (exit {returncode}):\n"
