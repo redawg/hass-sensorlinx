@@ -27,6 +27,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
+from .helpers import thm_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -872,13 +873,14 @@ def get_number_entities(
         entities.append(
             ZoneValveCountEntity(
                 coordinator, controller, zone_name,
-                f"Valve Count: {thm.name}",
+                f"Valve Count: {thm.name}", thm,
             )
         )
         entities.append(
             OutdoorResetFloorTargetEntity(
                 coordinator, controller, zone_name,
                 f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, 80, 0.5,
+                thm,
             )
         )
 
@@ -920,7 +922,7 @@ def get_switch_entities(
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
-            OutdoorResetFloorModeSwitch(coordinator, controller, zone_name, thm.name)
+            OutdoorResetFloorModeSwitch(coordinator, controller, zone_name, thm.name, thm)
         )
     return entities
 
@@ -1200,15 +1202,19 @@ class OutdoorResetFloorModeSwitch(SwitchEntity):
         controller: OutdoorResetController,
         zone_key: str,
         zone_name: str,
+        thm_device: SensorlinxDeviceData | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
+        self._thm_device = thm_device
         self._attr_name = f"Floor Control Mode: {zone_name}"
         self._attr_unique_id = f"sensorlinx_outdoor_reset_floor_mode_{zone_key}"
 
     @property
     def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
         return {
             "identifiers": {(DOMAIN, "outdoor_reset")},
             "name": "SensorLinx Outdoor Reset",
@@ -1247,10 +1253,12 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         min_val: float,
         max_val: float,
         step: float,
+        thm_device: SensorlinxDeviceData | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
+        self._thm_device = thm_device
         self._default = default
         self._attr_name = name
         self._attr_native_min_value = min_val
@@ -1261,12 +1269,19 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
 
     @property
     def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
         return {
             "identifiers": {(DOMAIN, "outdoor_reset")},
             "name": "SensorLinx Outdoor Reset",
             "manufacturer": "HBX Controls",
             "model": "Heating Curve Controller",
         }
+
+    @property
+    def available(self) -> bool:
+        """Only available when floor control mode is enabled for this zone."""
+        return self._controller.params.floor_control_enabled.get(self._zone_key, False)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
@@ -1475,7 +1490,7 @@ class PreheatStatusSensor(SensorEntity):
 # ---------------------------------------------------------------------------
 
 class ZoneValveCountEntity(RestoreNumber):
-    """Per-zone valve count for flow rate estimation."""
+    """Per-zone valve count for flow rate estimation (visible when floor mode is ON)."""
 
     _attr_has_entity_name = True
     _attr_mode = NumberMode.SLIDER
@@ -1487,10 +1502,12 @@ class ZoneValveCountEntity(RestoreNumber):
         controller: OutdoorResetController,
         zone_key: str,
         name: str,
+        thm_device: SensorlinxDeviceData | None = None,
     ) -> None:
         self._coordinator = coordinator
         self._controller = controller
         self._zone_key = zone_key
+        self._thm_device = thm_device
         self._attr_name = name
         self._attr_native_min_value = 1
         self._attr_native_max_value = 6
@@ -1500,12 +1517,19 @@ class ZoneValveCountEntity(RestoreNumber):
 
     @property
     def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
         return {
             "identifiers": {(DOMAIN, "outdoor_reset")},
             "name": "SensorLinx Outdoor Reset",
             "manufacturer": "HBX Controls",
             "model": "Heating Curve Controller",
         }
+
+    @property
+    def available(self) -> bool:
+        """Only available when floor control mode is enabled for this zone."""
+        return self._controller.params.floor_control_enabled.get(self._zone_key, False)
 
     async def async_added_to_hass(self) -> None:
         await super().async_added_to_hass()
