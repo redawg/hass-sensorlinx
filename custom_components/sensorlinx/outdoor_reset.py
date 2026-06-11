@@ -49,7 +49,14 @@ FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is bel
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
 SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
-BOOST_INLET_TOLERANCE = 2.0  # inlet within this of optimal ends boost
+# Supply boost: fast heat-up without holding max temp longer than needed
+BOOST_TARGET_DELTA_T = 10.0  # ideal loop extraction (F) — step down when sustained
+BOOST_EFFICIENT_DELTA_T = 8.0  # minimum meaningful extraction during warm-up
+BOOST_HIGH_DELTA_T = 18.0  # step down early if over-extracting (saves power)
+BOOST_STABLE_CHECKS = 2  # consecutive monitor ticks at target delta-T
+BOOST_HEADROOM_F = 15.0  # boost setpoint = optimal + headroom (not always max)
+BOOST_MAX_DURATION = timedelta(minutes=25)
+BOOST_COOLDOWN = timedelta(minutes=20)
 TANKLESS_FAST_SCAN_INTERVAL = 15  # seconds during supply boost
 TANKLESS_NORMAL_SCAN_INTERVAL = 60  # seconds during normal operation
 BOOST_MONITOR_INTERVAL = timedelta(seconds=15)
@@ -103,6 +110,11 @@ class OutdoorResetController:
         # Supply water fast heat-up boost
         self._supply_boost_active: bool = False
         self._supply_boost_optimal: float | None = None
+        self._supply_boost_target: float | None = None
+        self._boost_start_inlet: float | None = None
+        self._boost_start_time: datetime | None = None
+        self._boost_stable_count: int = 0
+        self._boost_last_end: datetime | None = None
         self._tankless_scan_interval: int | None = None
 
     @property
@@ -376,11 +388,23 @@ class OutdoorResetController:
             self._unsub_boost_monitor()
             self._unsub_boost_monitor = None
 
+    def _compute_boost_target(self, optimal: float) -> float:
+        """Boost only as hot as needed — optimal + headroom, capped at max."""
+        return round(min(self.params.supply_temp_max, optimal + BOOST_HEADROOM_F), 1)
+
+    def _boost_cooldown_active(self) -> bool:
+        if self._boost_last_end is None:
+            return False
+        return datetime.now() - self._boost_last_end < BOOST_COOLDOWN
+
     async def _async_start_supply_boost(self) -> None:
-        """Crank tankless to max temp when a zone first calls for heat."""
+        """Raise supply temp briefly when a zone calls for heat and loop dT is low."""
         if not self.params.supply_control_enabled or not self.params.supply_boost_enabled:
             return
         if self._supply_boost_active or not self.params.supply_entity_id:
+            return
+        if self._boost_cooldown_active():
+            _LOGGER.debug("Supply boost skipped: cooldown active")
             return
 
         outdoor = self.outdoor_temp
@@ -388,47 +412,72 @@ class OutdoorResetController:
             return
 
         optimal = self._compute_supply_water_temp(outdoor)
-        max_temp = self.params.supply_temp_max
-        if max_temp <= optimal + SUPPLY_DEADBAND:
+        boost_target = self._compute_boost_target(optimal)
+        if boost_target <= optimal + SUPPLY_DEADBAND:
+            return
+
+        dt = self.delta_t
+        if dt is not None and dt >= BOOST_TARGET_DELTA_T:
+            _LOGGER.debug(
+                "Supply boost skipped: delta-T %.1fF already at target", dt,
+            )
             return
 
         inlet = self.return_water_actual
-        if inlet is not None and inlet >= optimal - BOOST_INLET_TOLERANCE:
-            _LOGGER.debug(
-                "Supply boost skipped: inlet %.1fF already near optimal %.1fF",
-                inlet, optimal,
-            )
+        if (
+            dt is not None
+            and dt >= BOOST_EFFICIENT_DELTA_T
+            and inlet is not None
+            and self.supply_water_actual is not None
+            and abs(self.supply_water_actual - optimal) < SUPPLY_DEADBAND * 3
+        ):
+            _LOGGER.debug("Supply boost skipped: loop already efficient")
             return
 
         self._supply_boost_active = True
         self._supply_boost_optimal = optimal
+        self._supply_boost_target = boost_target
+        self._boost_start_inlet = inlet
+        self._boost_start_time = datetime.now()
+        self._boost_stable_count = 0
         _LOGGER.info(
-            "Supply boost START: zone heat demand, inlet=%s, optimal=%.1fF, max=%.1fF",
+            "Supply boost START: inlet=%s, dT=%s, boost=%.1fF, optimal=%.1fF",
             f"{inlet:.1f}F" if inlet is not None else "unknown",
+            f"{dt:.1f}F" if dt is not None else "unknown",
+            boost_target,
             optimal,
-            max_temp,
         )
-        await self._async_set_supply_temperature(max_temp, force=True)
+        await self._async_set_supply_temperature(boost_target, force=True)
         await self._async_set_tankless_scan_interval(TANKLESS_FAST_SCAN_INTERVAL)
         self._start_boost_monitor()
 
-    async def _async_end_supply_boost(self, *, cancelled: bool = False) -> None:
+    async def _async_end_supply_boost(
+        self, *, cancelled: bool = False, reason: str = "complete",
+    ) -> None:
         """Restore optimal supply temp and normal tankless polling."""
         if not self._supply_boost_active:
             return
 
         optimal = self._supply_boost_optimal
         inlet = self.return_water_actual
+        dt = self.delta_t
         self._supply_boost_active = False
         self._supply_boost_optimal = None
+        self._supply_boost_target = None
+        self._boost_start_inlet = None
+        self._boost_start_time = None
+        self._boost_stable_count = 0
+        self._boost_last_end = datetime.now()
         self._stop_boost_monitor()
 
         if cancelled:
-            _LOGGER.info("Supply boost CANCELLED: no zones heating")
+            _LOGGER.info("Supply boost CANCELLED (%s)", reason)
         else:
             _LOGGER.info(
-                "Supply boost COMPLETE: inlet=%s, restoring optimal %.1fF",
+                "Supply boost DONE (%s): inlet=%s, dT=%s, restoring optimal %.1fF",
+                reason,
                 f"{inlet:.1f}F" if inlet is not None else "unknown",
+                f"{dt:.1f}F" if dt is not None else "unknown",
                 optimal or 0,
             )
 
@@ -437,20 +486,34 @@ class OutdoorResetController:
         await self._async_set_tankless_scan_interval(TANKLESS_NORMAL_SCAN_INTERVAL)
 
     async def _async_check_boost_progress(self, _now=None) -> None:
-        """End boost once inlet water reaches the optimal supply target."""
+        """End boost when delta-T shows efficient heat transfer (power-optimal)."""
         if not self._supply_boost_active:
             return
         if not self._any_zone_heating():
-            await self._async_end_supply_boost(cancelled=True)
+            await self._async_end_supply_boost(cancelled=True, reason="no_zone_demand")
             return
 
-        inlet = self.return_water_actual
-        optimal = self._supply_boost_optimal
-        if inlet is None or optimal is None:
+        if (
+            self._boost_start_time is not None
+            and datetime.now() - self._boost_start_time >= BOOST_MAX_DURATION
+        ):
+            await self._async_end_supply_boost(reason="max_duration")
             return
 
-        if inlet >= optimal - BOOST_INLET_TOLERANCE:
-            await self._async_end_supply_boost()
+        dt = self.delta_t
+        if dt is None:
+            return
+
+        if dt >= BOOST_HIGH_DELTA_T:
+            await self._async_end_supply_boost(reason="high_delta_t")
+            return
+
+        if dt >= BOOST_TARGET_DELTA_T:
+            self._boost_stable_count += 1
+            if self._boost_stable_count >= BOOST_STABLE_CHECKS:
+                await self._async_end_supply_boost(reason="delta_t_stable")
+        else:
+            self._boost_stable_count = 0
 
     async def _async_set_tankless_scan_interval(self, seconds: int) -> None:
         """Change Optimal Tankless cloud polling interval."""
@@ -1656,9 +1719,13 @@ class SupplyWaterBoostSwitch(SwitchEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
+        ctrl = self._controller
         return {
-            "boost_active": self._controller.supply_boost_active,
-            "boost_optimal_target": self._controller._supply_boost_optimal,
+            "boost_active": ctrl.supply_boost_active,
+            "boost_optimal_target": ctrl._supply_boost_optimal,
+            "boost_setpoint": ctrl._supply_boost_target,
+            "delta_t": ctrl.delta_t,
+            "target_delta_t": BOOST_TARGET_DELTA_T,
             "fast_scan_seconds": TANKLESS_FAST_SCAN_INTERVAL,
             "normal_scan_seconds": TANKLESS_NORMAL_SCAN_INTERVAL,
         }
@@ -1719,7 +1786,10 @@ class SupplyWaterTargetSensor(SensorEntity):
             "supply_boost_enabled": self._controller.params.supply_boost_enabled,
             "supply_boost_active": self._controller.supply_boost_active,
             "boost_optimal_target": self._controller._supply_boost_optimal,
+            "boost_setpoint": self._controller._supply_boost_target,
             "inlet_temp": self._controller.return_water_actual,
+            "delta_t": self._controller.delta_t,
+            "target_delta_t": BOOST_TARGET_DELTA_T,
         }
 
 
