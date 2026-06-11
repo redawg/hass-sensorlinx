@@ -1,0 +1,11 @@
+# Night setback is built into SensorLinx v0.1.8+ (no package required).
+#
+# After midnight, if no first-floor / basement motion for 45 minutes, zones
+# move to efficient night targets. Restores at 6 AM or on motion.
+#
+# Tune targets under SensorLinx Outdoor Reset:
+#   Night Target: Main Area / Living Room / Main Office
+#   Night Floor Target: Laundry
+#   Night Setback: Motion Idle (min)
+#
+# Services: sensorlinx.apply_night_setback, sensorlinx.restore_day_setback

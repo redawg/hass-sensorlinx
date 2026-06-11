@@ -30,6 +30,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .helpers import thm_device_info
+from .night_setback import (
+    NightSetbackMixin,
+    NightSetbackParams,
+    get_night_setback_number_entities,
+    get_night_setback_switch_entities,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -89,7 +95,7 @@ def compute_target(outdoor: float, base: float, overshoot: float,
     return round(base + overshoot * ((shutdown - outdoor) / temp_range), 1)
 
 
-class OutdoorResetController:
+class OutdoorResetController(NightSetbackMixin):
     """Manages the outdoor reset logic and periodically updates zone setpoints."""
 
     def __init__(
@@ -118,6 +124,9 @@ class OutdoorResetController:
         self._boost_stable_count: int = 0
         self._boost_last_end: datetime | None = None
         self._tankless_scan_interval: int | None = None
+        self._unsub_night_schedule = None
+        self._unsub_night_motion = None
+        self._unsub_day_restore = None
 
     @property
     def enabled(self) -> bool:
@@ -164,10 +173,12 @@ class OutdoorResetController:
             self._unsub_inlet_boost = async_track_state_change_event(
                 self.hass, [inlet_entity], self._async_on_inlet_temp_change
             )
+        await self._setup_night_setback()
 
     @callback
     def async_unload(self) -> None:
         """Remove listeners."""
+        self._unload_night_setback()
         if self._unsub_interval:
             self._unsub_interval()
         if self._unsub_state:
@@ -255,7 +266,11 @@ class OutdoorResetController:
             # Determine setpoint based on control mode
             floor_mode = self.params.floor_control_enabled.get(zone_name, False)
 
-            if floor_mode:
+            if self.params.night_setback.active:
+                zone_target = self._zone_night_target(
+                    zone_name, floor_mode, floor_temp, outdoor
+                )
+            elif floor_mode:
                 # Floor control mode: dynamic floor target based on outdoor temp
                 base_floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
                 floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
@@ -977,6 +992,7 @@ class OutdoorResetParams:
         self.zone_valve_counts: dict[str, int] = {}  # zone_name -> number of valves
         self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
         self.electricity_cost_per_kwh: float = DEFAULT_ELECTRICITY_COST
+        self.night_setback: NightSetbackParams = NightSetbackParams()
 
 
 # ---------------------------------------------------------------------------
@@ -1091,6 +1107,15 @@ async def async_setup_outdoor_reset(
         DOMAIN, "set_hydronic_sensors", handle_set_hydronic_sensors,
     )
 
+    async def handle_apply_night_setback(_call):
+        await controller._async_apply_night_setback("service call")
+
+    async def handle_restore_day_setback(_call):
+        await controller._async_restore_day_setback("service call")
+
+    hass.services.async_register(DOMAIN, "apply_night_setback", handle_apply_night_setback)
+    hass.services.async_register(DOMAIN, "restore_day_setback", handle_restore_day_setback)
+
     return controller
 
 
@@ -1153,6 +1178,7 @@ def get_number_entities(
         ),
         ElectricityCostNumberEntity(coordinator, controller),
     ]
+    entities.extend(get_night_setback_number_entities(coordinator, controller))
 
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -1213,6 +1239,7 @@ def get_switch_entities(
         SupplyWaterBoostSwitch(coordinator, controller),
         PreheatEnableSwitch(coordinator, controller),
     ]
+    entities.extend(get_night_setback_switch_entities(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
