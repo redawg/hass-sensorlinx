@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 
 from .coordinator import SensorlinxCoordinator
 from .outdoor_reset import OutdoorResetController, OUTDOOR_TEMP_ENTITY
