@@ -176,7 +176,9 @@ CONF_RETURN_TEMP_SENSOR = "return_temp_sensor"
 CONF_FLOW_RATE_SENSOR = "flow_rate_sensor"
 CONF_FORECAST_ENTITY = "forecast_entity_id"
 CONF_HEATING_SOURCE = "heating_source_device"
+CONF_ELECTRICITY_COST = "electricity_cost_per_kwh"
 CONF_ZONE_VALVE_PREFIX = "zone_valves_"
+DEFAULT_ELECTRICITY_COST = 0.105
 
 OPTIMALTANKLESS_DOMAIN = "optimaltankless"
 
@@ -241,6 +243,14 @@ def _heating_source_schema(
         schema_dict[vol.Optional(CONF_FORECAST_ENTITY)] = (
             selector.EntitySelector(selector.EntitySelectorConfig(domain=["weather"]))
         )
+    cost_default = defaults.get(CONF_ELECTRICITY_COST, DEFAULT_ELECTRICITY_COST)
+    schema_dict[vol.Optional(CONF_ELECTRICITY_COST, default=cost_default)] = (
+        selector.NumberSelector(
+            selector.NumberSelectorConfig(
+                min=0.01, max=2.0, step=0.001, mode="box", unit_of_measurement="$ / kWh"
+            )
+        )
+    )
     return vol.Schema(schema_dict)
 
 
@@ -290,6 +300,9 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             forecast = user_input.get(CONF_FORECAST_ENTITY, "")
             if forecast:
                 self._options[CONF_FORECAST_ENTITY] = forecast
+            cost = user_input.get(CONF_ELECTRICITY_COST)
+            if cost is not None:
+                self._options[CONF_ELECTRICITY_COST] = float(cost)
             return await self.async_step_zone_valves()
 
         water_heaters = self._discover_water_heaters()
@@ -413,6 +426,10 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
                 controller.params.flow_rate_sensor = new_options[CONF_FLOW_RATE_SENSOR]
             if new_options.get(CONF_FORECAST_ENTITY):
                 controller.params.forecast_entity_id = new_options[CONF_FORECAST_ENTITY]
+            if new_options.get(CONF_ELECTRICITY_COST) is not None:
+                controller.params.electricity_cost_per_kwh = float(
+                    new_options[CONF_ELECTRICITY_COST]
+                )
             for key, value in new_options.items():
                 if key.startswith(CONF_ZONE_VALVE_PREFIX):
                     zone_key = key[len(CONF_ZONE_VALVE_PREFIX):]

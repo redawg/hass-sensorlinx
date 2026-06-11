@@ -42,6 +42,10 @@ SUPPLY_ENTITIES = {
 ADJUST_STEP = 5.0
 IDEAL_DELTA_T = (10.0, 20.0)
 TANKLESS_MAX_TEMP = 140.0
+DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
+COST_ENTITY = "number.sensorlinx_outdoor_reset_electricity_cost_per_kwh"
+POWER_DRAW_ENTITY = "sensor.main_water_heater_power_draw"
+MAX_POWER_GAP_MINUTES = 15
 
 
 def fetch_data():
@@ -142,6 +146,61 @@ def _avg_field(samples, field):
     return sum(vals) / len(vals) if vals else None
 
 
+def get_electricity_cost_per_kwh(states):
+    """Read configured electricity rate from SensorLinx setup."""
+    entity = states.get(COST_ENTITY, {})
+    state = entity.get("state")
+    try:
+        return float(state)
+    except (TypeError, ValueError):
+        return DEFAULT_ELECTRICITY_COST
+
+
+def compute_tankless_energy(recent, max_gap_minutes=MAX_POWER_GAP_MINUTES):
+    """Integrate tankless power draw from thermal log samples (dedupe by timestamp)."""
+    by_ts = {}
+    for s in recent:
+        ts = s.get("ts")
+        pw = s.get("wh_power_kw")
+        if not ts or pw is None:
+            continue
+        pw = float(pw)
+        if pw < 0.01:
+            continue
+        by_ts[ts] = max(by_ts.get(ts, 0.0), pw)
+
+    powers = list(by_ts.values())
+    if len(by_ts) < 2:
+        return {
+            "energy_kwh": 0.0,
+            "avg_power_kw": sum(powers) / len(powers) if powers else None,
+            "peak_power_kw": max(powers) if powers else None,
+            "active_hours": 0.0,
+            "sample_points": len(by_ts),
+        }
+
+    points = sorted(by_ts.items())
+    total_kwh = 0.0
+    active_seconds = 0.0
+    for i in range(len(points) - 1):
+        t0 = datetime.fromisoformat(points[i][0])
+        t1 = datetime.fromisoformat(points[i + 1][0])
+        gap_sec = (t1 - t0).total_seconds()
+        if gap_sec / 60 > max_gap_minutes:
+            continue
+        hours = gap_sec / 3600
+        total_kwh += points[i][1] * hours
+        active_seconds += gap_sec
+
+    return {
+        "energy_kwh": total_kwh,
+        "avg_power_kw": sum(powers) / len(powers) if powers else None,
+        "peak_power_kw": max(powers) if powers else None,
+        "active_hours": active_seconds / 3600,
+        "sample_points": len(points),
+    }
+
+
 def analyze_hydronic_performance(recent, zone_data, states):
     """Evaluate supply water and hydronic loop efficiency from thermal log data."""
     heating_samples = [
@@ -196,6 +255,23 @@ def analyze_hydronic_performance(recent, zone_data, states):
     wh_target = wh.get("attributes", {}).get("temperature")
     wh_actual = wh.get("attributes", {}).get("current_temperature")
 
+    cost_per_kwh = get_electricity_cost_per_kwh(states)
+    energy = compute_tankless_energy(recent)
+    daily_cost = energy["energy_kwh"] * cost_per_kwh
+    cost_per_1000_btu = None
+    if avg_btu and energy["energy_kwh"] > 0.01:
+        total_btu = avg_btu * energy["active_hours"]
+        if total_btu > 0:
+            cost_per_1000_btu = daily_cost / (total_btu / 1000)
+
+    live_power = None
+    power_state = states.get(POWER_DRAW_ENTITY, {})
+    if power_state.get("state") not in (None, "unavailable", "unknown"):
+        try:
+            live_power = float(power_state["state"])
+        except (TypeError, ValueError):
+            pass
+
     return {
         "heating_sample_count": len(heating_samples),
         "outdoor_now": outdoor_now,
@@ -216,6 +292,13 @@ def analyze_hydronic_performance(recent, zone_data, states):
         "reset_enabled": reset_enabled,
         "wh_target": wh_target,
         "wh_actual": wh_actual,
+        "cost_per_kwh": cost_per_kwh,
+        "energy_kwh": energy["energy_kwh"],
+        "daily_cost": daily_cost,
+        "peak_power_kw": energy["peak_power_kw"],
+        "tankless_active_hours": energy["active_hours"],
+        "live_power_kw": live_power,
+        "cost_per_1000_btu": cost_per_1000_btu,
     }
 
 
@@ -254,6 +337,10 @@ def compute_hydronic_efficiency_score(metrics):
     if metrics.get("btu_per_kw") and metrics["btu_per_kw"] < 0.5:
         score -= 10
         reasons.append("low heat delivery per kW")
+
+    if metrics.get("cost_per_1000_btu") and metrics["cost_per_1000_btu"] > 0.08:
+        score -= 10
+        reasons.append(f"high energy cost (${metrics['cost_per_1000_btu']:.3f}/1000 BTU)")
 
     assessment = ", ".join(reasons) if reasons else "optimal hydronic delivery"
     return max(0, min(100, round(score))), assessment
@@ -422,6 +509,18 @@ def print_hydronic_sections(metrics, adjustments, applied=None):
             print(f"  Avg flow rate: {metrics['avg_flow']:.2f} GPM")
         if metrics["avg_power"] is not None:
             print(f"  Avg power draw: {metrics['avg_power']:.2f} kW")
+        if metrics.get("peak_power_kw") is not None:
+            print(f"  Peak power draw (24h): {metrics['peak_power_kw']:.2f} kW")
+        if metrics.get("live_power_kw") is not None:
+            print(f"  Current power draw: {metrics['live_power_kw']:.2f} kW")
+        if metrics.get("energy_kwh", 0) > 0:
+            print(f"  Tankless energy (24h): {metrics['energy_kwh']:.2f} kWh")
+            print(f"  Electricity rate: ${metrics['cost_per_kwh']:.3f}/kWh")
+            print(f"  Estimated daily cost: ${metrics['daily_cost']:.2f}")
+            if metrics.get("tankless_active_hours", 0) > 0:
+                print(f"  Tankless runtime (integrated): {metrics['tankless_active_hours']:.1f} hr")
+            if metrics.get("cost_per_1000_btu") is not None:
+                print(f"  Cost per 1000 BTU delivered: ${metrics['cost_per_1000_btu']:.3f}")
         if metrics["avg_btu"] is not None:
             print(f"  Avg heat output: {metrics['avg_btu']:.0f} BTU/hr")
         if metrics["btu_per_kw"] is not None:
@@ -714,6 +813,32 @@ def main(apply_supply=False):
                 print(f"  Rating: GOOD - minor zone imbalance")
             else:
                 print(f"  Rating: FAIR - significant variation between zones")
+
+        cost_per_kwh = get_electricity_cost_per_kwh(states)
+        energy = compute_tankless_energy(recent)
+        daily_cost = energy["energy_kwh"] * cost_per_kwh
+        print()
+        print(f"  Tankless water heater (24h):")
+        if energy["energy_kwh"] > 0:
+            print(f"    Energy consumed: {energy['energy_kwh']:.2f} kWh")
+            print(f"    Electricity rate: ${cost_per_kwh:.3f}/kWh")
+            print(f"    Estimated cost: ${daily_cost:.2f}")
+            if energy["avg_power_kw"] is not None:
+                print(f"    Avg power while firing: {energy['avg_power_kw']:.2f} kW")
+            if energy["peak_power_kw"] is not None:
+                print(f"    Peak power draw: {energy['peak_power_kw']:.2f} kW")
+            if energy["active_hours"] > 0:
+                print(f"    Integrated firing time: {energy['active_hours']:.1f} hr")
+                print(f"    Avg cost while firing: ${daily_cost / energy['active_hours']:.2f}/hr")
+        else:
+            print("    No significant tankless power draw logged in last 24h")
+        power_state = states.get(POWER_DRAW_ENTITY, {})
+        if power_state.get("state") not in (None, "unavailable", "unknown"):
+            try:
+                live_kw = float(power_state["state"])
+                print(f"    Current draw: {live_kw:.2f} kW (${live_kw * cost_per_kwh:.3f}/hr at current rate)")
+            except (TypeError, ValueError):
+                pass
 
     print()
 

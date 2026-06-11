@@ -70,6 +70,7 @@ TREND_WINDOW_MINUTES = 120  # use last 2 hours of outdoor temp for trend predict
 # Hydronic loop monitoring
 DEFAULT_VALVE_COUNT = 1  # valves per zone (for flow estimation)
 DEFAULT_FLOW_RATE_PER_VALVE = 0.5  # GPM per valve (typical 1/2" zone valve)
+DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 WATER_BTU_FACTOR = 500  # BTU/hr per GPM per degree F delta-T
 
 SIGNAL_FLOOR_MODE_CHANGED = f"{DOMAIN}_floor_mode_changed"
@@ -975,6 +976,7 @@ class OutdoorResetParams:
         self.flow_rate_sensor: str | None = None  # actual GPM sensor (e.g. from tankless)
         self.zone_valve_counts: dict[str, int] = {}  # zone_name -> number of valves
         self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
+        self.electricity_cost_per_kwh: float = DEFAULT_ELECTRICITY_COST
 
 
 # ---------------------------------------------------------------------------
@@ -1005,6 +1007,12 @@ async def async_setup_outdoor_reset(
     flow_rate_sensor = entry.options.get("flow_rate_sensor")
     if flow_rate_sensor:
         params.flow_rate_sensor = flow_rate_sensor
+    electricity_cost = entry.options.get("electricity_cost_per_kwh")
+    if electricity_cost is not None:
+        try:
+            params.electricity_cost_per_kwh = float(electricity_cost)
+        except (ValueError, TypeError):
+            pass
 
     # Restore per-zone valve counts and floor mode from options
     for key, value in entry.options.items():
@@ -1143,6 +1151,7 @@ def get_number_entities(
             "Hydronic: Flow Rate per Valve (GPM)", DEFAULT_FLOW_RATE_PER_VALVE, 0.25, 2.0, 0.25,
             "mdi:pipe-valve",
         ),
+        ElectricityCostNumberEntity(coordinator, controller),
     ]
 
     for thm in coordinator.get_thm_devices():
@@ -1295,6 +1304,52 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.thermal_lag = self._attr_native_value
         elif self._key == "flow_rate_per_valve":
             params.flow_rate_per_valve = self._attr_native_value
+
+
+class ElectricityCostNumberEntity(RestoreNumber):
+    """Configurable electricity rate for tankless energy cost reporting."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Electricity Cost per kWh"
+    _attr_native_unit_of_measurement = "$/kWh"
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:currency-usd"
+    _attr_native_min_value = 0.01
+    _attr_native_max_value = 2.0
+    _attr_native_step = 0.001
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_outdoor_reset_electricity_cost_per_kwh"
+        self._attr_native_value = controller.params.electricity_cost_per_kwh
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Restore last known value."""
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last and last.native_value is not None:
+            self._attr_native_value = last.native_value
+        self._controller.params.electricity_cost_per_kwh = self._attr_native_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Update the electricity rate."""
+        self._attr_native_value = value
+        self._controller.params.electricity_cost_per_kwh = value
+        self.async_write_ha_state()
 
 
 class OutdoorResetZoneOffsetEntity(RestoreNumber):
