@@ -48,6 +48,7 @@ FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is bel
 # Supply water temperature reset defaults
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
+TANKLESS_MAX_TEMP = 140.0  # physical maximum the Optimal Tankless can produce
 SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
 # Supply boost: fast heat-up without holding max temp longer than needed
 BOOST_TARGET_DELTA_T = 10.0  # ideal loop extraction (F) — step down when sustained
@@ -388,9 +389,17 @@ class OutdoorResetController:
             self._unsub_boost_monitor()
             self._unsub_boost_monitor = None
 
+    def _effective_supply_max(self) -> float:
+        """Configured max capped at tankless hardware limit."""
+        return min(self.params.supply_temp_max, TANKLESS_MAX_TEMP)
+
+    def _clamp_supply_temp(self, temp: float) -> float:
+        """Never command above tankless physical max or configured ceiling."""
+        return round(min(temp, self._effective_supply_max(), TANKLESS_MAX_TEMP), 1)
+
     def _compute_boost_target(self, optimal: float) -> float:
-        """Boost only as hot as needed — optimal + headroom, capped at max."""
-        return round(min(self.params.supply_temp_max, optimal + BOOST_HEADROOM_F), 1)
+        """Boost only as hot as needed — optimal + headroom, capped at tankless max."""
+        return self._clamp_supply_temp(optimal + BOOST_HEADROOM_F)
 
     def _boost_cooldown_active(self) -> bool:
         if self._boost_last_end is None:
@@ -550,10 +559,12 @@ class OutdoorResetController:
         except (ValueError, TypeError):
             current = 0.0
 
+        target = self._clamp_supply_temp(target)
         if not force and abs(current - target) < SUPPLY_DEADBAND:
             return False
 
         set_value = round(target) if entity_id.startswith("water_heater.") else target
+        set_value = min(set_value, TANKLESS_MAX_TEMP) if entity_id.startswith("water_heater.") else set_value
         _LOGGER.info("Setting supply %s to %sF (was %.1fF)", entity_id, set_value, current)
 
         if entity_id.startswith("climate."):
@@ -591,13 +602,13 @@ class OutdoorResetController:
             return self.params.supply_temp_min
         if outdoor >= self.params.shutdown:
             return self.params.supply_temp_min
+        supply_max = self._effective_supply_max()
         if outdoor <= self.params.design_outdoor:
-            return self.params.supply_temp_max
+            return supply_max
         ratio = (self.params.shutdown - outdoor) / temp_range
-        return round(
+        return self._clamp_supply_temp(
             self.params.supply_temp_min
-            + (self.params.supply_temp_max - self.params.supply_temp_min) * ratio,
-            1,
+            + (supply_max - self.params.supply_temp_min) * ratio
         )
 
     async def _apply_supply_water_temp(self, outdoor: float) -> None:
@@ -1119,7 +1130,7 @@ def get_number_entities(
         ),
         OutdoorResetNumberEntity(
             coordinator, controller, "supply_temp_max",
-            "Supply Water: Max Temp (Cold)", DEFAULT_SUPPLY_TEMP_MAX, 110, 180, 5,
+            "Supply Water: Max Temp (Cold)", DEFAULT_SUPPLY_TEMP_MAX, 110, 140, 5,
             "mdi:water-thermometer",
         ),
         OutdoorResetNumberEntity(
@@ -1780,7 +1791,8 @@ class SupplyWaterTargetSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "supply_min": self._controller.params.supply_temp_min,
-            "supply_max": self._controller.params.supply_temp_max,
+            "supply_max": self._controller._effective_supply_max(),
+            "tankless_max": TANKLESS_MAX_TEMP,
             "supply_entity_id": self._controller.params.supply_entity_id or "not configured",
             "supply_control_enabled": self._controller.params.supply_control_enabled,
             "supply_boost_enabled": self._controller.params.supply_boost_enabled,

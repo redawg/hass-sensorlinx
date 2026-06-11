@@ -41,6 +41,7 @@ SUPPLY_ENTITIES = {
 
 ADJUST_STEP = 5.0
 IDEAL_DELTA_T = (10.0, 20.0)
+TANKLESS_MAX_TEMP = 140.0
 
 
 def fetch_data():
@@ -295,7 +296,7 @@ def compute_supply_adjustments(metrics):
         })
 
     if metrics["underheating_zones"] and metrics.get("avg_delta_t", 99) < 8:
-        new_max = min(180, supply_max + ADJUST_STEP)
+        new_max = min(TANKLESS_MAX_TEMP, supply_max + ADJUST_STEP)
         if new_max > supply_max:
             adjustments.append({
                 "entity": SUPPLY_ENTITIES["max_temp"],
