@@ -66,6 +66,7 @@ DEFAULT_ZONE_FLOOR_SENSOR_BIAS: dict[str, float] = {
 
 DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
+MIN_VALID_HEAT_SETPOINT = 60.0  # THM may report ~41F after turn_off; always re-command
 
 # Supply water temperature reset defaults
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
@@ -189,6 +190,28 @@ class OutdoorResetController(NightSetbackMixin):
             return None
         return round(raw_floor_temp + self.floor_sensor_bias(zone_name), 1)
 
+    def _is_floor_mode_zone(self, zone_name: str) -> bool:
+        return bool(self.params.floor_control_enabled.get(zone_name, False))
+
+    def _climate_needs_setpoint_update(
+        self, climate_state, zone_target: float
+    ) -> bool:
+        """Return True when the THM climate entity should be re-commanded."""
+        if climate_state is None:
+            return True
+        if climate_state.state not in ("heat",):
+            return True
+        current_setpoint = climate_state.attributes.get("temperature")
+        if current_setpoint is None:
+            return True
+        try:
+            current = float(current_setpoint)
+        except (TypeError, ValueError):
+            return True
+        if current < MIN_VALID_HEAT_SETPOINT:
+            return True
+        return abs(current - zone_target) >= 0.5
+
     def _read_zone_floor_temp(self, zone_name: str) -> float | None:
         """Read raw floor sensor from HA."""
         floor_state = self.hass.states.get(f"sensor.{zone_name}_floor_temperature")
@@ -260,29 +283,35 @@ class OutdoorResetController(NightSetbackMixin):
 
         target = self.calculated_target
 
-        if outdoor >= self.params.shutdown:
-            if self._preheat_active:
-                # Preheat override: keep heating even though outdoor is above shutdown
-                _LOGGER.info(
-                    "Preheat active: outdoor %.1f°F >= shutdown %.1f°F but pre-warming floors",
-                    outdoor, self.params.shutdown,
+        outdoor_shutdown = outdoor >= self.params.shutdown and not self._preheat_active
+        if outdoor >= self.params.shutdown and self._preheat_active:
+            _LOGGER.info(
+                "Preheat active: outdoor %.1f°F >= shutdown %.1f°F but pre-warming floors",
+                outdoor, self.params.shutdown,
+            )
+
+        if outdoor_shutdown:
+            _LOGGER.info(
+                "Outdoor %.1f\u00b0F >= shutdown %.1f\u00b0F, turning off room-mode zones",
+                outdoor, self.params.shutdown,
+            )
+            for thm in self.coordinator.get_thm_devices():
+                zone_name = thm.name.lower().replace(" ", "_")
+                if self._is_floor_mode_zone(zone_name):
+                    continue
+                entity_id = f"climate.{zone_name}_{zone_name}"
+                await self.hass.services.async_call(
+                    "climate", "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=True,
                 )
-                # Fall through to normal heating logic below
-            else:
-                _LOGGER.info("Outdoor %.1f\u00b0F >= shutdown %.1f\u00b0F, turning off zones",
-                             outdoor, self.params.shutdown)
-                for thm in self.coordinator.get_thm_devices():
-                    entity_id = f"climate.{thm.name.lower().replace(' ', '_')}_{thm.name.lower().replace(' ', '_')}"
-                    await self.hass.services.async_call(
-                        "climate", "turn_off",
-                        {"entity_id": entity_id},
-                        blocking=True,
-                    )
-                return
 
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
             entity_id = f"climate.{zone_name}_{zone_name}"
+
+            if outdoor_shutdown and not self._is_floor_mode_zone(zone_name):
+                continue
 
             raw_floor_temp = self._read_zone_floor_temp(zone_name)
             floor_temp = self.effective_floor_temp(zone_name, raw_floor_temp)
@@ -328,16 +357,10 @@ class OutdoorResetController(NightSetbackMixin):
                 offset = self.params.zone_offsets.get(zone_name, 0.0)
                 zone_target = self.zone_target(offset)
 
-            # Deadband: skip if climate entity already at this setpoint (avoids churn)
             climate_state = self.hass.states.get(entity_id)
-            if climate_state:
-                current_setpoint = climate_state.attributes.get("temperature")
-                current_mode = climate_state.state
-                if (current_mode == "heat"
-                        and current_setpoint is not None
-                        and abs(float(current_setpoint) - zone_target) < 0.5):
-                    _LOGGER.debug("Skipping %s - already at %.1f°F", zone_name, zone_target)
-                    continue
+            if not self._climate_needs_setpoint_update(climate_state, zone_target):
+                _LOGGER.debug("Skipping %s - already at %.1f°F", zone_name, zone_target)
+                continue
 
             _LOGGER.debug(
                 "Setting %s to %.1f°F (mode=%s, outdoor=%.1f)",
