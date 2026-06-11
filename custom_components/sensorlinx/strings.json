@@ -38,14 +38,11 @@
           "heated_floor_controller_entity_id": "Heated floor controller (switch or light)"
         }
       },
-      "hydronic": {
-        "title": "Hydronic loop & supply water",
-        "description": "Configure the water heater control entity and temperature sensors for the hydronic floor loop.",
+      "heating_source": {
+        "title": "Floor heating source",
+        "description": "Select the water heater that supplies your radiant floor loops. If the Optimal Tankless integration is installed, it will appear here and all sensors (inlet, outlet, flow rate) will be auto-configured.",
         "data": {
-          "supply_entity_id": "Supply water heater (controls target temp)",
-          "supply_temp_sensor": "Supply water temperature sensor (outlet)",
-          "return_temp_sensor": "Return water temperature sensor (inlet)",
-          "flow_rate_sensor": "Flow rate sensor (GPM)",
+          "heating_source_device": "Floor heating water source",
           "forecast_entity_id": "Weather forecast entity (for preheat)"
         }
       },

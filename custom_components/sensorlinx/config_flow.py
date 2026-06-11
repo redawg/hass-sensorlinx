@@ -10,7 +10,7 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import selector
+from homeassistant.helpers import entity_registry as er, device_registry as dr, selector
 from pysensorlinx import InvalidCredentialsError, LoginError, Sensorlinx
 
 from .const import (
@@ -175,7 +175,10 @@ CONF_SUPPLY_TEMP_SENSOR = "supply_temp_sensor"
 CONF_RETURN_TEMP_SENSOR = "return_temp_sensor"
 CONF_FLOW_RATE_SENSOR = "flow_rate_sensor"
 CONF_FORECAST_ENTITY = "forecast_entity_id"
+CONF_HEATING_SOURCE = "heating_source_device"
 CONF_ZONE_VALVE_PREFIX = "zone_valves_"
+
+OPTIMALTANKLESS_DOMAIN = "optimaltankless"
 
 
 def _external_switch_schema(defaults: dict[str, Any]) -> vol.Schema:
@@ -204,42 +207,31 @@ def _external_switch_schema(defaults: dict[str, Any]) -> vol.Schema:
     )
 
 
-def _hydronic_schema(defaults: dict[str, Any]) -> vol.Schema:
-    """Schema for hydronic loop and supply water configuration."""
-    return vol.Schema(
-        {
-            vol.Optional(
-                CONF_SUPPLY_ENTITY,
-                default=defaults.get(CONF_SUPPLY_ENTITY, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["water_heater", "climate", "number"])
-            ),
-            vol.Optional(
-                CONF_SUPPLY_TEMP_SENSOR,
-                default=defaults.get(CONF_SUPPLY_TEMP_SENSOR, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Optional(
-                CONF_RETURN_TEMP_SENSOR,
-                default=defaults.get(CONF_RETURN_TEMP_SENSOR, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"], device_class="temperature")
-            ),
-            vol.Optional(
-                CONF_FLOW_RATE_SENSOR,
-                default=defaults.get(CONF_FLOW_RATE_SENSOR, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["sensor"])
-            ),
-            vol.Optional(
-                CONF_FORECAST_ENTITY,
-                default=defaults.get(CONF_FORECAST_ENTITY, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain=["weather"])
-            ),
-        }
+def _heating_source_schema(
+    water_heaters: dict[str, str], defaults: dict[str, Any]
+) -> vol.Schema:
+    """Schema for selecting floor heating source from available water heaters."""
+    schema_dict: dict[Any, Any] = {}
+    if water_heaters:
+        schema_dict[vol.Required(
+            CONF_HEATING_SOURCE,
+            default=defaults.get(CONF_HEATING_SOURCE, ""),
+        )] = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=[
+                    selector.SelectOptionDict(value=eid, label=label)
+                    for eid, label in water_heaters.items()
+                ],
+                mode="dropdown",
+            )
+        )
+    schema_dict[vol.Optional(
+        CONF_FORECAST_ENTITY,
+        default=defaults.get(CONF_FORECAST_ENTITY, ""),
+    )] = selector.EntitySelector(
+        selector.EntitySelectorConfig(domain=["weather"])
     )
+    return vol.Schema(schema_dict)
 
 
 def _zone_valves_schema(zone_names: list[tuple[str, str]], defaults: dict[str, Any]) -> vol.Schema:
@@ -254,7 +246,7 @@ def _zone_valves_schema(zone_names: list[tuple[str, str]], defaults: dict[str, A
 
 
 class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow for external switches, hydronic sensors, and zone valve counts."""
+    """Options flow for external switches, heating source, and zone valve counts."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize."""
@@ -267,29 +259,36 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
         """Step 1: External switch links."""
         if user_input is not None:
             self._options.update(
-                {k: v.strip() for k, v in user_input.items() if isinstance(v, str) and v.strip()}
+                {k: v for k, v in user_input.items()
+                 if isinstance(v, str) and v.strip()}
             )
-            return await self.async_step_hydronic()
+            return await self.async_step_heating_source()
 
         return self.async_show_form(
             step_id="init",
             data_schema=_external_switch_schema(dict(self._config_entry.options)),
-            description_placeholders={"step_title": "External Switches"},
         )
 
-    async def async_step_hydronic(
+    async def async_step_heating_source(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Step 2: Hydronic sensors and supply water entity."""
+        """Step 2: Floor heating source (Optimal Tankless auto-discovery)."""
         if user_input is not None:
-            self._options.update(
-                {k: v.strip() for k, v in user_input.items() if isinstance(v, str) and v.strip()}
-            )
+            selected = user_input.get(CONF_HEATING_SOURCE, "")
+            if selected:
+                self._options[CONF_HEATING_SOURCE] = selected
+                self._auto_wire_heating_source(selected)
+            forecast = user_input.get(CONF_FORECAST_ENTITY, "")
+            if forecast:
+                self._options[CONF_FORECAST_ENTITY] = forecast
             return await self.async_step_zone_valves()
 
+        water_heaters = self._discover_water_heaters()
         return self.async_show_form(
-            step_id="hydronic",
-            data_schema=_hydronic_schema(dict(self._config_entry.options)),
+            step_id="heating_source",
+            data_schema=_heating_source_schema(
+                water_heaters, dict(self._config_entry.options)
+            ),
         )
 
     async def async_step_zone_valves(
@@ -307,6 +306,66 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
         return self.async_show_form(
             step_id="zone_valves",
             data_schema=_zone_valves_schema(zone_names, dict(self._config_entry.options)),
+        )
+
+    def _discover_water_heaters(self) -> dict[str, str]:
+        """Find water heater entities, preferring Optimal Tankless integration."""
+        ent_reg = er.async_get(self.hass)
+        water_heaters: dict[str, str] = {}
+
+        # Look for Optimal Tankless entities first
+        for entry in ent_reg.entities.values():
+            if entry.domain == "water_heater" and not entry.disabled:
+                state = self.hass.states.get(entry.entity_id)
+                name = entry.original_name or entry.entity_id
+                if state:
+                    name = state.attributes.get("friendly_name", name)
+                # Mark Optimal Tankless entries prominently
+                if entry.platform == OPTIMALTANKLESS_DOMAIN:
+                    name = f"⚡ {name} (Optimal Tankless)"
+                water_heaters[entry.entity_id] = name
+
+        return water_heaters
+
+    def _auto_wire_heating_source(self, water_heater_entity_id: str) -> None:
+        """Auto-discover related sensors from the same device as the water heater."""
+        ent_reg = er.async_get(self.hass)
+        dev_reg = dr.async_get(self.hass)
+
+        # Find the device that owns the selected water heater
+        wh_entry = ent_reg.async_get(water_heater_entity_id)
+        if wh_entry is None or wh_entry.device_id is None:
+            self._options[CONF_SUPPLY_ENTITY] = water_heater_entity_id
+            return
+
+        device_id = wh_entry.device_id
+        self._options[CONF_SUPPLY_ENTITY] = water_heater_entity_id
+
+        # Find all sensor entities on the same device
+        device_entities = er.async_entries_for_device(ent_reg, device_id)
+
+        for ent in device_entities:
+            if ent.disabled:
+                continue
+            eid = ent.entity_id
+            orig_name = (ent.original_name or "").lower()
+
+            if ent.domain == "sensor":
+                if "outlet" in orig_name or "output" in orig_name:
+                    self._options[CONF_SUPPLY_TEMP_SENSOR] = eid
+                elif "inlet" in orig_name or "input" in orig_name:
+                    self._options[CONF_RETURN_TEMP_SENSOR] = eid
+                elif "flow_rate" in eid and "available" not in eid:
+                    self._options[CONF_FLOW_RATE_SENSOR] = eid
+
+        _LOGGER.info(
+            "Auto-wired heating source from device %s: supply=%s, "
+            "supply_temp=%s, return_temp=%s, flow=%s",
+            device_id,
+            self._options.get(CONF_SUPPLY_ENTITY),
+            self._options.get(CONF_SUPPLY_TEMP_SENSOR),
+            self._options.get(CONF_RETURN_TEMP_SENSOR),
+            self._options.get(CONF_FLOW_RATE_SENSOR),
         )
 
     def _get_zone_names(self) -> list[tuple[str, str]]:
