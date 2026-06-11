@@ -1,30 +1,23 @@
 """Thermal data logger for AI-driven heating curve optimization.
 
-Collects periodic snapshots of outdoor temp, room temp, floor temp,
-setpoints, and HVAC state per zone. Stores as JSONL files for feeding
-into ML models that learn each room's thermal dynamics.
+Collects periodic snapshots of all thermal system data. Stores as JSONL
+files for feeding into ML models that learn each room's thermal dynamics.
 
 Data captured per sample:
   - timestamp (ISO 8601)
   - outdoor_temp (°F)
-  - zone_name
-  - room_temp (°F)
-  - floor_temp (°F)
-  - target_setpoint (°F from heating curve)
-  - commanded_setpoint (°F actually sent to device)
-  - hvac_mode (heat/cool/off)
-  - hvac_action (heating/idle/off)
+  - zone_name, room_temp, floor_temp
+  - target_setpoint, commanded_setpoint
+  - hvac_mode, hvac_action
   - heating_curve_params (base, overshoot, shutdown, design_outdoor)
-  - zone_offset (°F)
-  - outdoor_reset_enabled (bool)
-  - ecobee_mode (main HVAC mode: heat/cool/off/heat_cool)
-  - ecobee_action (main HVAC action: heating/cooling/idle)
-  - ecobee_temp (ecobee current temperature reading)
-  - ecobee_setpoint (ecobee target temperature)
-  - ecobee_humidity (current humidity %)
-  - ecobee_fan (fan mode: auto/on)
-  - ecobee_sensors (dict of remote sensor temps)
-  - occupancy (dict of occupancy states per area)
+  - zone_offset, outdoor_reset_enabled
+  - ecobee_mode, ecobee_action, ecobee_temp, ecobee_setpoint
+  - ecobee_humidity, ecobee_fan, ecobee_sensors, occupancy
+  - wh_supply_temp, wh_return_temp, wh_delta_t (Optimal Tankless)
+  - wh_flow_rate_gpm, wh_power_kw, wh_btu_hr (computed)
+  - wh_heating, wh_state, wh_target_temp, wh_current_temp
+  - wh_available_flow_gpm, wh_heater_capacity, wh_input_voltage
+  - wh_error_code, wh_online
 
 Stored at: /config/www/sensorlinx_thermal_log/thermal_YYYY-MM.jsonl
 One file per month, one JSON line per sample interval.
@@ -63,6 +56,23 @@ OCCUPANCY_SENSORS = {
     "upstairs": "binary_sensor.upstairs_occupancy",
     "family_room": "binary_sensor.family_room_occupancy",
 }
+
+# Optimal Tankless water heater sensors
+TANKLESS_SENSORS = {
+    "supply_temp": "sensor.main_water_heater_outlet_temperature",
+    "return_temp": "sensor.main_water_heater_inlet_temperature",
+    "flow_rate_gpm": "sensor.main_water_heater_flow_rate",
+    "power_kw": "sensor.main_water_heater_power_draw",
+    "available_flow_gpm": "sensor.main_water_heater_available_flow_rate",
+    "heater_capacity": "sensor.main_water_heater_heater_capacity",
+    "input_voltage": "sensor.main_water_heater_input_voltage",
+    "error_code": "sensor.main_water_heater_error_code",
+}
+TANKLESS_BINARY = {
+    "heating": "binary_sensor.main_water_heater_heating",
+    "online": "binary_sensor.main_water_heater_online",
+}
+TANKLESS_WATER_HEATER = "water_heater.main_water_heater"
 
 
 class ThermalDataLogger:
@@ -112,8 +122,9 @@ class ThermalDataLogger:
         timestamp = datetime.now().isoformat()
         params = self.controller.params
 
-        # Collect ecobee / main HVAC state (shared across all zone samples)
+        # Collect shared state (same for all zone samples in this interval)
         ecobee_data = self._get_ecobee_state()
+        tankless_data = self._get_tankless_state()
 
         samples = []
         for thm in self.coordinator.get_thm_devices():
@@ -149,6 +160,7 @@ class ThermalDataLogger:
                 "zone_offset": offset,
                 "enabled": params.enabled,
                 **ecobee_data,
+                **tankless_data,
             }
             samples.append(sample)
 
@@ -208,6 +220,58 @@ class ThermalDataLogger:
             else:
                 occupancy[name] = None
         result["occupancy"] = occupancy
+
+        return result
+
+    def _get_tankless_state(self) -> dict[str, Any]:
+        """Collect Optimal Tankless water heater state for thermal analysis."""
+        result: dict[str, Any] = {}
+
+        # Numeric sensors
+        for key, entity_id in TANKLESS_SENSORS.items():
+            state = self.hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                try:
+                    result[f"wh_{key}"] = float(state.state)
+                except (ValueError, TypeError):
+                    result[f"wh_{key}"] = None
+            else:
+                result[f"wh_{key}"] = None
+
+        # Binary sensors
+        for key, entity_id in TANKLESS_BINARY.items():
+            state = self.hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                result[f"wh_{key}"] = state.state == "on"
+            else:
+                result[f"wh_{key}"] = None
+
+        # Water heater control entity (target temp + state)
+        wh = self.hass.states.get(TANKLESS_WATER_HEATER)
+        if wh and wh.state not in ("unavailable", "unknown"):
+            result["wh_state"] = wh.state
+            result["wh_target_temp"] = wh.attributes.get("temperature")
+            result["wh_current_temp"] = wh.attributes.get("current_temperature")
+        else:
+            result["wh_state"] = None
+            result["wh_target_temp"] = None
+            result["wh_current_temp"] = None
+
+        # Computed delta-T
+        supply = result.get("wh_supply_temp")
+        ret = result.get("wh_return_temp")
+        if supply is not None and ret is not None:
+            result["wh_delta_t"] = round(supply - ret, 1)
+        else:
+            result["wh_delta_t"] = None
+
+        # Computed BTU/hr (500 * GPM * delta-T)
+        flow = result.get("wh_flow_rate_gpm")
+        dt = result.get("wh_delta_t")
+        if flow and dt and flow > 0 and dt > 0:
+            result["wh_btu_hr"] = round(500 * flow * dt, 0)
+        else:
+            result["wh_btu_hr"] = None
 
         return result
 
