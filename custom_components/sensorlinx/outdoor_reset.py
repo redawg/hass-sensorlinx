@@ -29,7 +29,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
-from .helpers import thm_device_info
+from .helpers import thm_device_info, zon_device_info
 from .night_setback import (
     NightSetbackMixin,
     NightSetbackParams,
@@ -96,6 +96,10 @@ DEFAULT_FLOW_RATE_PER_VALVE = 0.5  # GPM per valve (typical 1/2" zone valve)
 DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 WATER_BTU_FACTOR = 500  # BTU/hr per GPM per degree F delta-T
 
+# WWSD shutdown deadband: once shut off at threshold, don't restart until
+# outdoor drops this many degrees below the shutdown temp (prevents cycling)
+SHUTDOWN_DEADBAND = 2.0  # degrees F hysteresis
+
 SIGNAL_FLOOR_MODE_CHANGED = f"{DOMAIN}_floor_mode_changed"
 
 
@@ -144,6 +148,8 @@ class OutdoorResetController(NightSetbackMixin):
         self._unsub_night_schedule = None
         self._unsub_night_motion = None
         self._unsub_day_restore = None
+        # Per-zone WWSD state: tracks whether each zone is currently in shutdown
+        self._zone_in_shutdown: dict[str, bool] = {}
 
     @property
     def enabled(self) -> bool:
@@ -171,6 +177,33 @@ class OutdoorResetController(NightSetbackMixin):
 
     def zone_target(self, zone_offset: float) -> float:
         return round(self.calculated_target + zone_offset, 1)
+
+    def zone_shutdown_temp(self, zone_name: str) -> float:
+        """Effective WWSD shutdown temp for a zone (per-zone override or system-wide)."""
+        return self.params.zone_shutdown_temps.get(zone_name, self.params.shutdown)
+
+    def is_zone_shutdown(self, zone_name: str, outdoor: float) -> bool:
+        """Determine if zone should be in shutdown with deadband hysteresis.
+
+        Once a zone shuts down (outdoor >= threshold), it stays off until
+        outdoor drops SHUTDOWN_DEADBAND degrees below threshold. This prevents
+        rapid cycling when outdoor temp oscillates near the boundary.
+        """
+        threshold = self.zone_shutdown_temp(zone_name)
+        was_shutdown = self._zone_in_shutdown.get(zone_name, False)
+
+        if was_shutdown:
+            # Already in shutdown: require outdoor to drop below threshold - deadband
+            if outdoor < (threshold - SHUTDOWN_DEADBAND):
+                self._zone_in_shutdown[zone_name] = False
+                return False
+            return True
+        else:
+            # Not in shutdown: trigger when outdoor reaches threshold
+            if outdoor >= threshold:
+                self._zone_in_shutdown[zone_name] = True
+                return True
+            return False
 
     def zone_floor_max(self, zone_name: str) -> float:
         """Per-zone floor safety cap (wood default 80F, tile zones higher)."""
@@ -292,34 +325,32 @@ class OutdoorResetController(NightSetbackMixin):
 
         target = self.calculated_target
 
-        outdoor_shutdown = outdoor >= self.params.shutdown and not self._preheat_active
+        # Preheat override: skip shutdown logic while pre-warming
         if outdoor >= self.params.shutdown and self._preheat_active:
             _LOGGER.info(
                 "Preheat active: outdoor %.1f°F >= shutdown %.1f°F but pre-warming floors",
                 outdoor, self.params.shutdown,
             )
 
-        if outdoor_shutdown:
-            _LOGGER.info(
-                "Outdoor %.1f\u00b0F >= shutdown %.1f\u00b0F, turning off room-mode zones",
-                outdoor, self.params.shutdown,
-            )
-            for thm in self.coordinator.get_thm_devices():
-                zone_name = thm.name.lower().replace(" ", "_")
-                if self._is_floor_mode_zone(zone_name):
-                    continue
-                entity_id = f"climate.{zone_name}_{zone_name}"
+        for thm in self.coordinator.get_thm_devices():
+            zone_name = thm.name.lower().replace(" ", "_")
+            entity_id = f"climate.{zone_name}_{zone_name}"
+
+            # Per-zone shutdown with deadband hysteresis to prevent cycling
+            zone_shutdown = self.is_zone_shutdown(zone_name, outdoor) and not self._preheat_active
+
+            if zone_shutdown and not self._is_floor_mode_zone(zone_name):
+                zone_sd = self.zone_shutdown_temp(zone_name)
+                _LOGGER.info(
+                    "WWSD: outdoor %.1f°F, zone %s shutdown at %.1f°F "
+                    "(restart below %.1f°F)",
+                    outdoor, zone_name, zone_sd, zone_sd - SHUTDOWN_DEADBAND,
+                )
                 await self.hass.services.async_call(
                     "climate", "turn_off",
                     {"entity_id": entity_id},
                     blocking=True,
                 )
-
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            entity_id = f"climate.{zone_name}_{zone_name}"
-
-            if outdoor_shutdown and not self._is_floor_mode_zone(zone_name):
                 continue
 
             raw_floor_temp = self._read_zone_floor_temp(zone_name)
@@ -1070,6 +1101,7 @@ class OutdoorResetParams:
         self.zone_valve_counts: dict[str, int] = {}  # zone_name -> number of valves
         self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
         self.electricity_cost_per_kwh: float = DEFAULT_ELECTRICITY_COST
+        self.zone_shutdown_temps: dict[str, float] = {}  # per-zone override (None = use system)
         self.night_setback: NightSetbackParams = NightSetbackParams()
 
 
@@ -1129,6 +1161,12 @@ async def async_setup_outdoor_reset(
             zone_key = key[len("floor_bias_"):]
             try:
                 params.zone_floor_sensor_bias[zone_key] = float(value)
+            except (ValueError, TypeError):
+                pass
+        elif key.startswith("zone_shutdown_"):
+            zone_key = key[len("zone_shutdown_"):]
+            try:
+                params.zone_shutdown_temps[zone_key] = float(value)
             except (ValueError, TypeError):
                 pass
 
@@ -1308,6 +1346,12 @@ def get_number_entities(
                 thm, entry_id,
             )
         )
+        entities.append(
+            ZoneShutdownTempEntity(
+                coordinator, controller, zone_name,
+                f"WWSD Shutdown: {thm.name}", thm, entry_id,
+            )
+        )
 
     return entities
 
@@ -1331,6 +1375,11 @@ def get_sensor_entities(
                 coordinator, controller, zone_name, f"Target: {thm.name}",
             )
         )
+    # WWSD sensor reads raw device data from ZON and THM devices
+    for zon in coordinator.get_zon_devices():
+        entities.append(WwsdDeviceSensor(coordinator, controller, zon))
+    for thm in coordinator.get_thm_devices():
+        entities.append(WwsdDeviceSensor(coordinator, controller, thm))
     return entities
 
 
@@ -2438,3 +2487,150 @@ class HydronicBtuSensor(SensorEntity):
             attrs[f"{zone_name}_flow_gpm"] = flow
             attrs[f"{zone_name}_btu_hr"] = btu
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# WWSD (Warm Weather Shutdown) entities
+# ---------------------------------------------------------------------------
+
+class WwsdDeviceSensor(CoordinatorEntity[SensorlinxCoordinator], SensorEntity):
+    """Reads the raw 'wwsd' field from a ZON or THM device's API response."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_state_class = "measurement"
+    _attr_icon = "mdi:weather-sunny-alert"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        device_data: SensorlinxDeviceData,
+    ) -> None:
+        super().__init__(coordinator)
+        self._device_data = device_data
+        self._controller = controller
+        dtype = device_data.device_type
+        self._attr_name = f"WWSD Setting ({device_data.name})"
+        self._attr_unique_id = f"sensorlinx_wwsd_{device_data.device_id}"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        if self._device_data.device_type == "ZON":
+            return zon_device_info(self._device_data)
+        return thm_device_info(self.coordinator, self._device_data)
+
+    @property
+    def native_value(self) -> float | None:
+        raw = self.coordinator.data.get(self._device_data.device_id)
+        if raw is None:
+            return None
+        wwsd = raw.raw.get("wwsd")
+        if wwsd is None:
+            return None
+        if wwsd == 32:
+            return None  # 32 = disabled
+        try:
+            return float(wwsd)
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        raw = self.coordinator.data.get(self._device_data.device_id)
+        if raw is None:
+            return {}
+        wwsd = raw.raw.get("wwsd")
+        cwsd = raw.raw.get("cwsd")
+        ws_lag = raw.raw.get("wsLag")
+        return {
+            "wwsd_raw": wwsd,
+            "cwsd_raw": cwsd,
+            "shutdown_lag_hours": ws_lag,
+            "wwsd_disabled": wwsd == 32 if wwsd is not None else None,
+            "device_type": self._device_data.device_type,
+        }
+
+
+class ZoneShutdownTempEntity(RestoreNumber):
+    """Per-zone WWSD shutdown temperature override.
+
+    Defaults to the system-wide shutdown temp. Setting a different value
+    allows individual zones to shut down at different outdoor temperatures.
+    """
+
+    _attr_has_entity_name = True
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:weather-sunny-alert"
+    _attr_native_min_value = 50.0
+    _attr_native_max_value = 80.0
+    _attr_native_step = 1.0
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        name: str,
+        thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._thm_device = thm_device
+        self._entry_id = entry_id
+        self._attr_name = name
+        self._attr_unique_id = f"sensorlinx_zone_shutdown_{zone_key}"
+        self._attr_native_value = controller.params.shutdown
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"zone_shutdown_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    try:
+                        self._attr_native_value = float(saved)
+                    except (ValueError, TypeError):
+                        pass
+        if self._attr_native_value == self._controller.params.shutdown:
+            last = await self.async_get_last_number_data()
+            if last and last.native_value is not None:
+                self._attr_native_value = last.native_value
+        self._controller.params.zone_shutdown_temps[self._zone_key] = self._attr_native_value
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.zone_shutdown_temps[self._zone_key] = value
+        self.async_write_ha_state()
+        self._persist_to_options(value)
+
+    @callback
+    def _persist_to_options(self, value: float) -> None:
+        """Save zone shutdown temp to config entry options."""
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"zone_shutdown_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = value
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
