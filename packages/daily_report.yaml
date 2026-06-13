@@ -16,7 +16,7 @@ script:
     alias: "SensorLinx: Daily Performance Report"
     description: >-
       Runs the HVAC performance agent, applies supply water adjustments automatically,
-      posts changes to @andrew on Slack, and sends the full report to #aatom.
+      posts changes to @aschoenfeld on Slack via notify.schoenfeld.
     mode: single
     sequence:
       - action: shell_command.sensorlinx_daily_report_slack

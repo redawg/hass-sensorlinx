@@ -73,6 +73,16 @@ def main():
     rc, out, err = run_ssh(f"mkdir -p {REMOTE_SENSORLINX} {REMOTE_PACKAGES}")
     print(f"   rc={rc} err={err.strip()}")
 
+    print("\n1b. Ensure Slack config (@aschoenfeld)")
+    ensure = os.path.join(SCRIPT_DIR, "ensure_slack_aschoenfeld_config.sh")
+    if os.path.isfile(ensure):
+        proc = subprocess.run(["bash", ensure], capture_output=True, text=True, timeout=60)
+        print(f"   ensure script rc={proc.returncode}")
+        if proc.stdout.strip():
+            print(f"   {proc.stdout.strip()[:300]}")
+        if proc.returncode != 0 and proc.stderr.strip():
+            print(f"   (SSH optional) {proc.stderr.strip()[:200]}")
+
     print("\n2. Upload files")
     for local_rel, remote in FILES_TO_DEPLOY:
         local = os.path.abspath(os.path.join(REPO_ROOT, local_rel))
@@ -112,7 +122,7 @@ def main():
 
     print("\n6. Trigger test run")
     ha_run_script()
-    print("\nDone. Check Slack #schoenfeld for the report message.")
+    print("\nDone. Check Slack @aschoenfeld for the report message.")
 
 
 if __name__ == "__main__":
