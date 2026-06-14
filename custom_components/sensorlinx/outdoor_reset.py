@@ -27,7 +27,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dis
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE, DOMAIN
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .helpers import thm_device_info, zon_device_info
 from .night_setback import (
@@ -148,6 +148,7 @@ class OutdoorResetController(NightSetbackMixin):
         self._unsub_night_schedule = None
         self._unsub_night_motion = None
         self._unsub_day_restore = None
+        self._unsub_hvac_cool = None
         # Per-zone WWSD state: tracks whether each zone is currently in shutdown
         self._zone_in_shutdown: dict[str, bool] = {}
 
@@ -264,6 +265,50 @@ class OutdoorResetController(NightSetbackMixin):
                 pass
         return None
 
+    def _main_hvac_entity(self) -> str | None:
+        """Return the linked main HVAC climate entity, if configured and present."""
+        entity_id = self.params.main_hvac_climate_entity_id
+        if not entity_id:
+            return None
+        if self.hass.states.get(entity_id) is None:
+            return None
+        return entity_id
+
+    def _main_hvac_cooling(self) -> bool:
+        """True when the main forced-air HVAC is in cool mode."""
+        entity_id = self._main_hvac_entity()
+        if entity_id is None:
+            return False
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return False
+        return state.state == "cool"
+
+    async def _async_suppress_floor_heating_for_hvac_cool(
+        self, reason: str = "HVAC cool mode"
+    ) -> None:
+        """Turn off radiant zones and cancel supply boost while HVAC is cooling."""
+        changed = False
+        if self._supply_boost_active:
+            await self._async_end_supply_boost(cancelled=True, reason=reason)
+            changed = True
+        for entity_id in self._zone_climate_entities():
+            climate_state = self.hass.states.get(entity_id)
+            if climate_state and climate_state.state not in (
+                "off",
+                "unavailable",
+                "unknown",
+            ):
+                await self.hass.services.async_call(
+                    "climate",
+                    "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=True,
+                )
+                changed = True
+        if changed:
+            _LOGGER.info("Floor heating suppressed: %s", reason)
+
     async def async_setup(self) -> None:
         """Start periodic updates."""
         self._unsub_interval = async_track_time_interval(
@@ -282,7 +327,16 @@ class OutdoorResetController(NightSetbackMixin):
             self._unsub_inlet_boost = async_track_state_change_event(
                 self.hass, [inlet_entity], self._async_on_inlet_temp_change
             )
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if hvac_entity:
+            self._unsub_hvac_cool = async_track_state_change_event(
+                self.hass, [hvac_entity], self._async_on_hvac_mode_change
+            )
         await self._setup_night_setback()
+        if self._main_hvac_cooling():
+            await self._async_suppress_floor_heating_for_hvac_cool(
+                "HVAC already in cool mode"
+            )
 
     @callback
     def async_unload(self) -> None:
@@ -296,7 +350,29 @@ class OutdoorResetController(NightSetbackMixin):
             self._unsub_zone_boost()
         if self._unsub_inlet_boost:
             self._unsub_inlet_boost()
+        if self._unsub_hvac_cool:
+            self._unsub_hvac_cool()
         self._stop_boost_monitor()
+
+    @callback
+    def _async_on_hvac_mode_change(self, event) -> None:
+        """React immediately when main HVAC enters or leaves cool mode."""
+        self.hass.async_create_task(self._handle_hvac_mode_change(event))
+
+    async def _handle_hvac_mode_change(self, event) -> None:
+        if not self.enabled:
+            return
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+        old_state = event.data.get("old_state")
+        if new_state.state == "cool":
+            await self._async_suppress_floor_heating_for_hvac_cool(
+                "HVAC switched to cool mode"
+            )
+        elif old_state and old_state.state == "cool":
+            _LOGGER.info("HVAC left cool mode — resuming outdoor reset")
+            await self._apply_setpoints()
 
     async def _async_update(self, _now=None) -> None:
         """Apply setpoints to all THM zones."""
@@ -312,6 +388,10 @@ class OutdoorResetController(NightSetbackMixin):
 
     async def _apply_setpoints(self) -> None:
         """Set temperature on each climate entity based on the curve."""
+        if self._main_hvac_cooling():
+            await self._async_suppress_floor_heating_for_hvac_cool()
+            return
+
         outdoor = self.outdoor_temp
         if outdoor is None:
             _LOGGER.debug("Outdoor temp unavailable, skipping reset update")
@@ -535,6 +615,8 @@ class OutdoorResetController(NightSetbackMixin):
 
     async def _async_start_supply_boost(self) -> None:
         """Raise supply temp briefly when a zone calls for heat and loop dT is low."""
+        if self._main_hvac_cooling():
+            return
         if not self.params.supply_control_enabled or not self.params.supply_boost_enabled:
             return
         if self._supply_boost_active or not self.params.supply_entity_id:
@@ -1102,6 +1184,7 @@ class OutdoorResetParams:
         self.flow_rate_per_valve: float = DEFAULT_FLOW_RATE_PER_VALVE
         self.electricity_cost_per_kwh: float = DEFAULT_ELECTRICITY_COST
         self.zone_shutdown_temps: dict[str, float] = {}  # per-zone override (None = use system)
+        self.main_hvac_climate_entity_id: str | None = DEFAULT_MAIN_HVAC_CLIMATE
         self.night_setback: NightSetbackParams = NightSetbackParams()
 
 
@@ -1139,6 +1222,9 @@ async def async_setup_outdoor_reset(
             params.electricity_cost_per_kwh = float(electricity_cost)
         except (ValueError, TypeError):
             pass
+    params.main_hvac_climate_entity_id = entry.options.get(
+        CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE
+    )
 
     # Restore per-zone valve counts and floor mode from options
     for key, value in entry.options.items():

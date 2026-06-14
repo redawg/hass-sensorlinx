@@ -17,7 +17,9 @@ from .const import (
     CONF_BUILDING_ID,
     CONF_HEATED_FLOOR_CONTROLLER,
     CONF_HOT_WATER_SWITCH,
+    CONF_MAIN_HVAC_CLIMATE,
     CONF_RADIANT_FLOOR_SWITCH,
+    DEFAULT_MAIN_HVAC_CLIMATE,
     DOMAIN,
 )
 
@@ -251,6 +253,10 @@ def _heating_source_schema(
             )
         )
     )
+    hvac_default = defaults.get(CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE)
+    schema_dict[vol.Optional(CONF_MAIN_HVAC_CLIMATE, default=hvac_default)] = (
+        selector.EntitySelector(selector.EntitySelectorConfig(domain=["climate"]))
+    )
     return vol.Schema(schema_dict)
 
 
@@ -303,6 +309,9 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             cost = user_input.get(CONF_ELECTRICITY_COST)
             if cost is not None:
                 self._options[CONF_ELECTRICITY_COST] = float(cost)
+            hvac = user_input.get(CONF_MAIN_HVAC_CLIMATE, "")
+            if hvac:
+                self._options[CONF_MAIN_HVAC_CLIMATE] = hvac
             return await self.async_step_zone_valves()
 
         water_heaters = self._discover_water_heaters()
@@ -430,6 +439,10 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
                 controller.params.electricity_cost_per_kwh = float(
                     new_options[CONF_ELECTRICITY_COST]
                 )
+            if new_options.get(CONF_MAIN_HVAC_CLIMATE):
+                controller.params.main_hvac_climate_entity_id = new_options[
+                    CONF_MAIN_HVAC_CLIMATE
+                ]
             for key, value in new_options.items():
                 if key.startswith(CONF_ZONE_VALVE_PREFIX):
                     zone_key = key[len(CONF_ZONE_VALVE_PREFIX):]

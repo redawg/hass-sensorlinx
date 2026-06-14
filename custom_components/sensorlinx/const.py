@@ -7,7 +7,9 @@ CONF_BUILDING_ID = "building_id"
 CONF_HOT_WATER_SWITCH = "hot_water_switch_entity_id"
 CONF_RADIANT_FLOOR_SWITCH = "radiant_floor_switch_entity_id"
 CONF_HEATED_FLOOR_CONTROLLER = "heated_floor_controller_entity_id"
+CONF_MAIN_HVAC_CLIMATE = "main_hvac_climate_entity_id"
 
+DEFAULT_MAIN_HVAC_CLIMATE = "climate.main_floor"
 DEFAULT_SCAN_INTERVAL = 60
 
 DEVICE_TYPE_THM = "THM"
