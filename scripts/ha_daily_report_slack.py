@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Run daily performance report and post summary to Slack via HA notify.schoenfeld.
+"""Run daily performance report and post summary to Slack via the Slack Web API.
 
 Designed to run on Home Assistant at:
   /config/sensorlinx/ha_daily_report_slack.py
+
+Slack credentials (one of):
+  /config/sensorlinx/slack_bot_token.txt  (xoxb- bot token, preferred)
+  /config/sensorlinx/slack_webhook.txt      (incoming webhook URL)
+  SLACK_BOT_TOKEN / SLACK_WEBHOOK_URL env vars
 
 Also runnable locally from the repo for testing.
 """
@@ -24,23 +29,18 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from daily_hvac_report import main as run_report  # noqa: E402
 
-if Path("/config").exists():
-    _DEFAULT_HA = "http://127.0.0.1:8123"
-else:
-    _DEFAULT_HA = "http://172.16.255.250:8123"
-HA_HOST = os.environ.get("HA_HOST", _DEFAULT_HA)
 SLACK_CHANNEL_FILE = Path("/config/sensorlinx/slack_channel.txt")
 SLACK_MENTION_FILE = Path("/config/sensorlinx/slack_mention.txt")
+SLACK_BOT_TOKEN_FILE = Path("/config/sensorlinx/slack_bot_token.txt")
+SLACK_WEBHOOK_FILE = Path("/config/sensorlinx/slack_webhook.txt")
 REPORT_ARCHIVE = Path("/config/sensorlinx/daily_report_latest.txt")
 AGENT_LOG_PATH = (
     Path("/config/sensorlinx/agent_adjustments.jsonl")
     if Path("/config").exists()
     else SCRIPT_DIR / "agent_adjustments.jsonl"
 )
-DEFAULT_SLACK_CHANNEL = "@aschoenfeld"
+DEFAULT_SLACK_CHANNEL = "#sensorlinx-reports"
 DEFAULT_SLACK_MENTION = "@aschoenfeld"
-DEFAULT_NOTIFY_SERVICE = "schoenfeld"
-NOTIFY_SERVICE_FILE = Path("/config/sensorlinx/slack_notify_service.txt")
 
 ENTITY_LABELS = {
     "switch.sensorlinx_outdoor_reset_supply_water_reset_enabled": "Supply water reset",
@@ -48,12 +48,6 @@ ENTITY_LABELS = {
     "number.sensorlinx_outdoor_reset_supply_water_min_temp_mild": "Supply min (mild)",
     "number.sensorlinx_outdoor_reset_supply_water_max_temp_cold": "Supply max (cold)",
 }
-TOKEN_FILE = Path("/config/sensorlinx/.ha_token")
-DEFAULT_TOKEN = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-    "eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ."
-    "Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
-)
 # Slack text limit is ~4000 chars; keep chunks smaller for code fences + titles.
 SLACK_CHUNK_MAX = 2800
 SLACK_POST_DELAY = 1.0
@@ -61,10 +55,24 @@ SLACK_POST_DELAY = 1.0
 SECTION_RE = re.compile(r"^\s*(\d+)\.\s+([A-Z][A-Z0-9\s/&().'-]*)$")
 
 
-def load_token():
-    if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text(encoding="utf-8").strip()
-    return os.environ.get("HA_TOKEN", DEFAULT_TOKEN)
+def load_slack_bot_token():
+    if os.environ.get("SLACK_BOT_TOKEN"):
+        return os.environ["SLACK_BOT_TOKEN"].strip()
+    if SLACK_BOT_TOKEN_FILE.exists():
+        return SLACK_BOT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return None
+
+
+def load_slack_webhook():
+    if os.environ.get("SLACK_WEBHOOK_URL"):
+        return os.environ["SLACK_WEBHOOK_URL"].strip()
+    if SLACK_WEBHOOK_FILE.exists():
+        return SLACK_WEBHOOK_FILE.read_text(encoding="utf-8").strip()
+    return None
+
+
+def slack_configured():
+    return bool(load_slack_bot_token() or load_slack_webhook())
 
 
 def load_slack_mention():
@@ -73,14 +81,6 @@ def load_slack_mention():
     if SLACK_MENTION_FILE.exists():
         return SLACK_MENTION_FILE.read_text(encoding="utf-8").strip()
     return DEFAULT_SLACK_MENTION
-
-
-def load_notify_service():
-    if os.environ.get("SLACK_NOTIFY_SERVICE"):
-        return os.environ["SLACK_NOTIFY_SERVICE"].strip()
-    if NOTIFY_SERVICE_FILE.exists():
-        return NOTIFY_SERVICE_FILE.read_text(encoding="utf-8").strip()
-    return DEFAULT_NOTIFY_SERVICE
 
 
 def load_slack_channel():
@@ -95,28 +95,40 @@ def load_slack_channel():
     return ch
 
 
-def ha_post(path, payload, token, retries=3):
-    url = f"{HA_HOST.rstrip('/')}{path}"
-    data = json.dumps(payload).encode("utf-8")
-    last_error = None
-    for attempt in range(retries):
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return resp.status, resp.read().decode("utf-8")
-        except (urllib.error.URLError, ConnectionResetError) as exc:
-            last_error = exc
-            if attempt + 1 < retries:
-                time.sleep(2 * (attempt + 1))
-    raise last_error
+def _slack_post_api(message, channel, title=None):
+    """Post a message using chat.postMessage and a bot token."""
+    token = load_slack_bot_token()
+    text = f"*{title}*\n{message}" if title else message
+    payload = {"channel": channel, "text": text, "mrkdwn": True}
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read().decode("utf-8"))
+    if not body.get("ok"):
+        return 400, body.get("error", "unknown_error")
+    return 200, ""
+
+
+def _slack_post_webhook(message, title=None):
+    """Post a message using an incoming webhook URL."""
+    webhook = load_slack_webhook()
+    text = f"*{title}*\n{message}" if title else message
+    payload = json.dumps({"text": text, "mrkdwn": True}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.status, resp.read().decode("utf-8")
 
 
 def extract_report_body(report_text):
@@ -315,22 +327,16 @@ def build_slack_messages(report_text, result):
     return messages
 
 
-def send_slack(message, token, channel=None, title="SensorLinx Daily Report"):
+def send_slack(message, channel=None, title="SensorLinx Daily Report"):
     channel = channel or load_slack_channel()
-    notify_service = load_notify_service()
-    status, body = ha_post(
-        f"/api/services/notify/{notify_service}",
-        {
-            "message": message,
-            "title": title,
-            "target": channel,
-        },
-        token,
-    )
-    return status, body
+    if load_slack_bot_token():
+        return _slack_post_api(message, channel, title=title)
+    if load_slack_webhook():
+        return _slack_post_webhook(message, title=title)
+    return 503, "Slack not configured"
 
 
-def send_slack_messages(messages, token, channel=None):
+def send_slack_messages(messages, channel=None):
     channel = channel or load_slack_channel()
     sent = 0
     for i, message in enumerate(messages):
@@ -340,7 +346,7 @@ def send_slack_messages(messages, token, channel=None):
             title = "SensorLinx Agent Changes"
         else:
             title = f"SensorLinx Report ({i + 1}/{len(messages)})"
-        status, body = send_slack(message, token, channel=channel, title=title)
+        status, body = send_slack(message, channel=channel, title=title)
         if status != 200:
             return status, body, sent
         sent += 1
@@ -358,7 +364,6 @@ def archive_report(report_text):
 
 
 def main():
-    token = load_token()
     buf = io.StringIO()
     old_stdout = sys.stdout
     sys.stdout = buf
@@ -372,23 +377,30 @@ def main():
     log_adjustments(result)
     messages = build_slack_messages(report_text, result)
 
+    if not slack_configured():
+        print(
+            "Slack not configured — report archived only. "
+            "Set /config/sensorlinx/slack_bot_token.txt or slack_webhook.txt"
+        )
+        return 0
+
     print(f"Posting {len(messages)} Slack message(s)")
     for i, message in enumerate(messages, 1):
         print(f"\n--- Slack message {i}/{len(messages)} ---\n{message[:500]}...")
 
     try:
-        status, body, sent = send_slack_messages(messages, token)
-        print(f"Slack notify: HTTP {status}, sent {sent}/{len(messages)}")
+        status, body, sent = send_slack_messages(messages)
+        print(f"Slack post: HTTP {status}, sent {sent}/{len(messages)}")
         if status != 200:
             print(body)
             return 1
         if sent != len(messages):
             return 1
     except urllib.error.HTTPError as exc:
-        print(f"Slack notify failed: HTTP {exc.code} {exc.read().decode('utf-8')[:300]}")
+        print(f"Slack post failed: HTTP {exc.code} {exc.read().decode('utf-8')[:300]}")
         return 1
     except urllib.error.URLError as exc:
-        print(f"Slack notify failed: {exc}")
+        print(f"Slack post failed: {exc}")
         return 1
 
     return 0

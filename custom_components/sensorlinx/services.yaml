@@ -2,7 +2,7 @@ run_daily_report:
   name: Run Daily Performance Report
   description: >-
     Runs the HVAC performance agent, automatically applies supply water adjustments,
-    posts agent changes to @aschoenfeld on Slack via notify.schoenfeld.
+    and posts the report to Slack via the Slack Web API (bot token or webhook).
     Normally runs automatically at 7:00 AM.
 
 set_supply_entity:

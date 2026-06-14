@@ -1,4 +1,4 @@
-"""Schedule and service handler for daily performance reports to Slack."""
+"""Schedule and service handler for daily performance reports."""
 
 from __future__ import annotations
 
@@ -16,25 +16,8 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 REPORT_SCRIPT = Path(__file__).parent / "report_scripts" / "ha_daily_report_slack.py"
-SLACK_CHANNEL_FILE = Path("/config/sensorlinx/slack_channel.txt")
-DEFAULT_SLACK_CHANNEL = "@aschoenfeld"
-DEFAULT_NOTIFY_SERVICE = "schoenfeld"
 SCHEDULE_HOUR = 7
 SCHEDULE_MINUTE = 0
-
-
-def _slack_channel() -> str:
-    if SLACK_CHANNEL_FILE.exists():
-        ch = SLACK_CHANNEL_FILE.read_text(encoding="utf-8").strip()
-    else:
-        ch = DEFAULT_SLACK_CHANNEL
-    if ch and not ch.startswith(("#", "@")):
-        ch = f"#{ch}"
-    return ch
-
-
-def _notify_service() -> str:
-    return DEFAULT_NOTIFY_SERVICE
 
 
 def _run_report_script() -> tuple[int, str]:
@@ -53,35 +36,16 @@ def _run_report_script() -> tuple[int, str]:
 
 
 async def async_run_daily_report(hass: HomeAssistant) -> None:
-    """Run the daily report and post to Slack."""
+    """Run the daily report (Slack delivery handled by the report script)."""
     _LOGGER.info("Starting daily performance report")
     try:
         returncode, output = await hass.async_add_executor_job(_run_report_script)
     except asyncio.TimeoutError:
         _LOGGER.error("Daily report timed out after 300s")
-        await hass.services.async_call(
-            "notify",
-            _notify_service(),
-            {
-                "message": "SensorLinx daily report FAILED: timed out after 5 minutes",
-                "target": _slack_channel(),
-            },
-        )
         return
 
     if returncode != 0:
         _LOGGER.error("Daily report failed (rc=%s): %s", returncode, output[-500:])
-        await hass.services.async_call(
-            "notify",
-            _notify_service(),
-            {
-                "message": (
-                    f"SensorLinx daily report FAILED (exit {returncode}):\n"
-                    f"```{output[-1500:]}```"
-                ),
-                "target": _slack_channel(),
-            },
-        )
         return
 
     _LOGGER.info("Daily report completed successfully")

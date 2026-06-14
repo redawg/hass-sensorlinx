@@ -1,10 +1,15 @@
 # SensorLinx Daily Performance Report
-# Scheduled report + Slack notification via notify.schoenfeld
+# Scheduled report + Slack notification via Slack Web API (bot token or webhook)
 #
 # Requires scripts deployed to /config/sensorlinx/:
 #   ha_daily_report_slack.py
 #   daily_hvac_report.py
 #   daily_report_agent.py (optional)
+#
+# Slack credentials on HA (one of):
+#   /config/sensorlinx/slack_bot_token.txt
+#   /config/sensorlinx/slack_webhook.txt
+# Optional: slack_channel.txt, slack_mention.txt
 
 shell_command:
   sensorlinx_daily_report_slack: >-
@@ -16,7 +21,7 @@ script:
     alias: "SensorLinx: Daily Performance Report"
     description: >-
       Runs the HVAC performance agent, applies supply water adjustments automatically,
-      posts changes to @aschoenfeld on Slack via notify.schoenfeld.
+      and posts the report to Slack via the Slack Web API.
     mode: single
     sequence:
       - action: shell_command.sensorlinx_daily_report_slack

@@ -73,7 +73,7 @@ def main():
     rc, out, err = run_ssh(f"mkdir -p {REMOTE_SENSORLINX} {REMOTE_PACKAGES}")
     print(f"   rc={rc} err={err.strip()}")
 
-    print("\n1b. Ensure Slack config (@aschoenfeld)")
+    print("\n1b. Ensure Slack channel/mention config")
     ensure = os.path.join(SCRIPT_DIR, "ensure_slack_aschoenfeld_config.sh")
     if os.path.isfile(ensure):
         proc = subprocess.run(["bash", ensure], capture_output=True, text=True, timeout=60)
@@ -122,7 +122,7 @@ def main():
 
     print("\n6. Trigger test run")
     ha_run_script()
-    print("\nDone. Check Slack @aschoenfeld for the report message.")
+    print("\nDone. Check Slack for the report message (requires slack_bot_token.txt or slack_webhook.txt on HA).")
 
 
 if __name__ == "__main__":
