@@ -52,6 +52,14 @@ DEFAULT_MAX_COOL_ADJUSTMENT = 4.0
 DEFAULT_MIN_COOL_SETPOINT = 70.0
 DEFAULT_BEDROOM_FANS_ENABLED = True
 DEFAULT_BEDROOM_FAN_SPEED = 66  # percentage (33/66/100 on these fans)
+DEFAULT_SMART_FAN_CIRCULATION = True
+DEFAULT_FURNACE_FAN_WATTS = 400.0
+DEFAULT_BEDROOM_FAN_WATTS = 55.0
+DEFAULT_COMPRESSOR_WATTS = 3500.0
+DEFAULT_MIN_FAN_ROI = 1.0  # benefit $/hr must meet or exceed cost $/hr
+DEFAULT_HEAT_DISTRIBUTION_GAIN = 0.05  # fraction of firing kW per °F stratification
+DEFAULT_COMPRESSOR_DUTY_PER_DEG = 0.04  # duty reduction per °F above threshold
+DEFAULT_TANKLESS_KW_WHEN_HEATING = 12.0
 
 
 class CoolingControlParams:
@@ -72,6 +80,11 @@ class CoolingControlParams:
         self.sidney_fan: str = DEFAULT_SIDNEY_FAN
         self.bedroom_fans_enabled: bool = DEFAULT_BEDROOM_FANS_ENABLED
         self.bedroom_fan_speed: int = DEFAULT_BEDROOM_FAN_SPEED
+        self.smart_fan_circulation_enabled: bool = DEFAULT_SMART_FAN_CIRCULATION
+        self.furnace_fan_watts: float = DEFAULT_FURNACE_FAN_WATTS
+        self.bedroom_fan_watts: float = DEFAULT_BEDROOM_FAN_WATTS
+        self.compressor_watts: float = DEFAULT_COMPRESSOR_WATTS
+        self.min_fan_roi: float = DEFAULT_MIN_FAN_ROI
 
     @property
     def upstairs_fan_entities(self) -> list[str]:
@@ -98,6 +111,8 @@ class CoolingControlMixin:
     _programmatic_fan_change: bool
     _unsub_cool_fans: Any
     _unsub_cooling_pause: Any
+    _furnace_fan_circulation_active: bool
+    _last_fan_roi: dict[str, Any]
 
     def _cooling_params(self) -> CoolingControlParams:
         return self.params.cooling_control
@@ -113,6 +128,8 @@ class CoolingControlMixin:
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
         self._programmatic_fan_change = False
+        self._furnace_fan_circulation_active = False
+        self._last_fan_roi = {}
 
         self._restore_cooling_pause_from_options()
 
@@ -305,6 +322,7 @@ class CoolingControlMixin:
             self._upstairs_bias_active = False
             self._last_cool_adjustment = 0.0
             await self._async_turn_off_cooling_fans()
+            await self._async_stop_furnace_circulation_fan()
             return
 
         old_temp = None
@@ -334,7 +352,7 @@ class CoolingControlMixin:
             self._capture_user_cool_setpoint()
 
         await self._apply_upstairs_cool_bias()
-        await self._sync_upstairs_bedroom_fans()
+        await self._sync_smart_fan_circulation()
 
     async def _async_cooling_control_tick(self, _now=None) -> None:
         if not self.enabled:
@@ -345,13 +363,13 @@ class CoolingControlMixin:
             return
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
-        await self._sync_upstairs_bedroom_fans()
+        await self._sync_smart_fan_circulation()
 
     async def _on_hvac_entered_cool_mode(self) -> None:
         """Called when HVAC switches to cool — start upstairs monitoring."""
         self._capture_user_cool_setpoint()
         await self._apply_upstairs_cool_bias()
-        await self._sync_upstairs_bedroom_fans()
+        await self._sync_smart_fan_circulation()
 
     async def _on_hvac_left_cool_mode(self) -> None:
         """Reset upstairs bias state when leaving cool mode."""
@@ -359,6 +377,7 @@ class CoolingControlMixin:
         self._upstairs_bias_active = False
         self._last_cool_adjustment = 0.0
         await self._async_turn_off_cooling_fans()
+        await self._async_stop_furnace_circulation_fan()
 
     def _capture_user_cool_setpoint(self) -> None:
         entity_id = self.params.main_hvac_climate_entity_id
@@ -374,6 +393,90 @@ class CoolingControlMixin:
             self._user_cool_setpoint = float(temp)
         except (TypeError, ValueError):
             pass
+
+    def _available_bedroom_fan_count(self) -> int:
+        cc = self._cooling_params()
+        count = 0
+        for entity_id in cc.upstairs_fan_entities:
+            state = self.hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                count += 1
+        return count
+
+    def _estimated_fan_watts(self, include_furnace: bool, include_bedrooms: bool) -> float:
+        cc = self._cooling_params()
+        watts = 0.0
+        if include_furnace:
+            watts += cc.furnace_fan_watts
+        if include_bedrooms:
+            watts += cc.bedroom_fan_watts * self._available_bedroom_fan_count()
+        return watts
+
+    def _fan_hourly_cost_usd(self, include_furnace: bool, include_bedrooms: bool) -> float:
+        kwh = self._estimated_fan_watts(include_furnace, include_bedrooms) / 1000.0
+        return kwh * self.params.electricity_cost_per_kwh
+
+    def _tankless_is_heating(self) -> bool:
+        state = self.hass.states.get("binary_sensor.main_water_heater_heating")
+        return state is not None and state.state == "on"
+
+    def _evaluate_fan_circulation_roi(
+        self, gap: float | None
+    ) -> tuple[bool, str, float, float]:
+        """Return (worth_it, scenario, cost_usd_per_hr, benefit_usd_per_hr)."""
+        cc = self._cooling_params()
+        if gap is None:
+            return False, "no_data", 0.0, 0.0
+
+        threshold = cc.stratification_threshold
+        excess = max(0.0, abs(gap) - threshold)
+        if excess <= 0:
+            return False, "balanced", 0.0, 0.0
+
+        rate = self.params.electricity_cost_per_kwh
+
+        # Floor heat: push warmth upstairs (gap negative = upstairs colder)
+        if gap < -threshold and self._any_zone_heating() and self._tankless_is_heating():
+            include_furnace = True
+            include_bedrooms = cc.bedroom_fans_enabled
+            cost = self._fan_hourly_cost_usd(include_furnace, include_bedrooms)
+            benefit_kwh = (
+                DEFAULT_TANKLESS_KW_WHEN_HEATING
+                * DEFAULT_HEAT_DISTRIBUTION_GAIN
+                * excess
+            )
+            benefit = benefit_kwh * rate
+            worth = benefit >= cost * cc.min_fan_roi
+            return worth, "heating_distribute", round(cost, 4), round(benefit, 4)
+
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        hvac = self.hass.states.get(hvac_entity) if hvac_entity else None
+        if hvac is None:
+            return False, "no_hvac", 0.0, 0.0
+
+        include_furnace = True
+        include_bedrooms = cc.bedroom_fans_enabled
+        cost = self._fan_hourly_cost_usd(include_furnace, include_bedrooms)
+
+        # Compressor running: fans may reduce duty cycle
+        if hvac.state == "cool" and hvac.attributes.get("hvac_action") == "cooling":
+            duty = min(0.30, excess * DEFAULT_COMPRESSOR_DUTY_PER_DEG)
+            benefit_kwh = (cc.compressor_watts / 1000.0) * duty
+            benefit = benefit_kwh * rate
+            worth = benefit >= cost * cc.min_fan_roi
+            return worth, "cooling_compressor", round(cost, 4), round(benefit, 4)
+
+        # Fan-only mixing (no compressor): low benefit unless very hot outside
+        if gap > threshold:
+            outdoor = self.outdoor_temp
+            benefit_kwh = 0.0
+            if outdoor is not None and outdoor >= 78 and excess >= 3:
+                benefit_kwh = 0.25
+            benefit = benefit_kwh * rate
+            worth = benefit >= cost * cc.min_fan_roi
+            return worth, "fan_only_mix", round(cost, 4), round(benefit, 4)
+
+        return False, "no_scenario", round(cost, 4), 0.0
 
     def _read_temp_entity(self, entity_id: str) -> float | None:
         if not entity_id:
@@ -568,14 +671,16 @@ class CoolingControlMixin:
             await self._async_set_hvac_cool(target, reason)
 
         if gap > cc.stratification_threshold + 1 and state:
-            fan_mode = state.attributes.get("fan_mode")
-            if fan_mode != "on":
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_fan_mode",
-                    {"entity_id": hvac_entity, "fan_mode": "on"},
-                    blocking=True,
-                )
+            worth, _, _, _ = self._evaluate_fan_circulation_roi(gap)
+            if worth:
+                fan_mode = state.attributes.get("fan_mode")
+                if fan_mode != "on":
+                    await self.hass.services.async_call(
+                        "climate",
+                        "set_fan_mode",
+                        {"entity_id": hvac_entity, "fan_mode": "on"},
+                        blocking=True,
+                    )
 
     async def _async_set_hvac_cool(self, target: float, reason: str) -> None:
         hvac_entity = self.params.main_hvac_climate_entity_id
@@ -610,32 +715,124 @@ class CoolingControlMixin:
             blocking=True,
         )
 
-    async def _sync_upstairs_bedroom_fans(self) -> None:
-        """Turn on Hunter/Sidney fans when upstairs is stratified during cooling."""
+    async def _sync_smart_fan_circulation(self) -> None:
+        """Run fans only when estimated energy benefit exceeds cost."""
         if self.is_cooling_paused:
-            return
-        cc = self._cooling_params()
-        if not cc.bedroom_fans_enabled:
             await self._async_turn_off_cooling_fans()
+            await self._async_stop_furnace_circulation_fan()
             return
 
-        hvac_entity = self.params.main_hvac_climate_entity_id
-        if not hvac_entity:
-            await self._async_turn_off_cooling_fans()
-            return
-        hvac_state = self.hass.states.get(hvac_entity)
-        if hvac_state is None or hvac_state.state != "cool":
-            await self._async_turn_off_cooling_fans()
+        cc = self._cooling_params()
+        if not cc.smart_fan_circulation_enabled:
             return
 
         gap = self.stratification_gap
-        if gap is None or gap <= cc.stratification_threshold:
+        worth, scenario, cost_hr, benefit_hr = self._evaluate_fan_circulation_roi(gap)
+        self._last_fan_roi = {
+            "worth_it": worth,
+            "scenario": scenario,
+            "cost_usd_per_hr": cost_hr,
+            "benefit_usd_per_hr": benefit_hr,
+            "gap": gap,
+        }
+
+        if not worth:
             await self._async_turn_off_cooling_fans()
+            await self._async_stop_furnace_circulation_fan()
+            _LOGGER.debug(
+                "Fan circulation skipped (%s): cost $%.3f/hr benefit $%.3f/hr gap=%s",
+                scenario,
+                cost_hr,
+                benefit_hr,
+                gap,
+            )
             return
 
-        await self._async_turn_on_cooling_fans(
-            f"upstairs stratification {gap:.1f}°F",
+        _LOGGER.info(
+            "Fan circulation ON (%s): cost $%.3f/hr benefit $%.3f/hr gap=%.1f°F",
+            scenario,
+            cost_hr,
+            benefit_hr,
+            gap or 0,
         )
+
+        if scenario == "heating_distribute":
+            await self._async_start_furnace_circulation_fan(
+                f"ROI heat distribute (gap {gap:.1f}°F)",
+            )
+            if cc.bedroom_fans_enabled:
+                await self._async_turn_on_cooling_fans(
+                    f"ROI heat distribute (gap {gap:.1f}°F)",
+                )
+            return
+
+        if scenario in ("cooling_compressor", "fan_only_mix"):
+            if scenario == "fan_only_mix":
+                await self._async_start_furnace_circulation_fan(
+                    f"ROI fan mix (gap {gap:.1f}°F)",
+                )
+            elif cc.bedroom_fans_enabled or scenario == "cooling_compressor":
+                hvac_entity = self.params.main_hvac_climate_entity_id
+                if hvac_entity:
+                    state = self.hass.states.get(hvac_entity)
+                    if state and state.attributes.get("fan_mode") != "on":
+                        await self.hass.services.async_call(
+                            "climate",
+                            "set_fan_mode",
+                            {"entity_id": hvac_entity, "fan_mode": "on"},
+                            blocking=True,
+                        )
+            if cc.bedroom_fans_enabled:
+                await self._async_turn_on_cooling_fans(
+                    f"ROI {scenario} (gap {gap:.1f}°F)",
+                )
+
+    async def _async_start_furnace_circulation_fan(self, reason: str) -> None:
+        """Blower only — no burner or compressor."""
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if not hvac_entity:
+            return
+        state = self.hass.states.get(hvac_entity)
+        if state is None:
+            return
+        if state.state not in ("off",):
+            await self.hass.services.async_call(
+                "climate",
+                "set_hvac_mode",
+                {"entity_id": hvac_entity, "hvac_mode": "off"},
+                blocking=True,
+            )
+        if state.attributes.get("fan_mode") != "on":
+            _LOGGER.info("Furnace circulation fan ON (%s)", reason)
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": hvac_entity, "fan_mode": "on"},
+                blocking=True,
+            )
+        self._furnace_fan_circulation_active = True
+
+    async def _async_stop_furnace_circulation_fan(self) -> None:
+        if not self._furnace_fan_circulation_active:
+            return
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if not hvac_entity:
+            self._furnace_fan_circulation_active = False
+            return
+        state = self.hass.states.get(hvac_entity)
+        if state and state.attributes.get("fan_mode") == "on" and state.state == "off":
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": hvac_entity, "fan_mode": "auto"},
+                blocking=True,
+            )
+            _LOGGER.info("Furnace circulation fan OFF (ROI no longer positive)")
+        self._furnace_fan_circulation_active = False
+
+    async def _sync_upstairs_bedroom_fans(self) -> None:
+        """Deprecated path — use _sync_smart_fan_circulation."""
+        await self._sync_smart_fan_circulation()
 
     async def _async_turn_on_cooling_fans(self, reason: str) -> None:
         cc = self._cooling_params()
@@ -705,6 +902,7 @@ def get_cooling_control_switch_entities(
         PrecoolEnableSwitch(coordinator, controller),
         UpstairsBiasEnableSwitch(coordinator, controller),
         BedroomFansEnableSwitch(coordinator, controller),
+        SmartFanCirculationSwitch(coordinator, controller),
     ]
 
 
@@ -1009,12 +1207,47 @@ class BedroomFansEnableSwitch(SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._controller.params.cooling_control.bedroom_fans_enabled = True
         self.async_write_ha_state()
-        await self._controller._sync_upstairs_bedroom_fans()
+        await self._controller._sync_smart_fan_circulation()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.cooling_control.bedroom_fans_enabled = False
         self.async_write_ha_state()
         await self._controller._async_turn_off_cooling_fans()
+
+
+class SmartFanCirculationSwitch(SwitchEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Smart Fan Circulation (Energy ROI)"
+    _attr_icon = "mdi:fan-auto"
+
+    def __init__(self, coordinator, controller: OutdoorResetController) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_smart_fan_circulation"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "cooling_control")},
+            "name": "SensorLinx Cooling Control",
+            "manufacturer": "HBX Controls",
+            "model": "Upstairs-Aware Cooling",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.cooling_control.smart_fan_circulation_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.cooling_control.smart_fan_circulation_enabled = True
+        self.async_write_ha_state()
+        await self._controller._sync_smart_fan_circulation()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.cooling_control.smart_fan_circulation_enabled = False
+        self.async_write_ha_state()
+        await self._controller._async_turn_off_cooling_fans()
+        await self._controller._async_stop_furnace_circulation_fan()
 
 
 class CoolingControlStatusSensor(SensorEntity):
@@ -1049,6 +1282,15 @@ class CoolingControlStatusSensor(SensorEntity):
             return "disabled"
         if self._controller._cooling_fans_active:
             return "bedroom_fans"
+        if self._controller._furnace_fan_circulation_active:
+            return "furnace_fan"
+        roi = self._controller._last_fan_roi
+        if roi.get("worth_it") is False and roi.get("scenario") not in (
+            None,
+            "balanced",
+            "no_data",
+        ):
+            return "fan_skipped_roi"
         if self._controller._upstairs_bias_active:
             return "upstairs_bias"
         if self._controller.precool_active_today:
@@ -1086,4 +1328,14 @@ class CoolingControlStatusSensor(SensorEntity):
             "precool_triggered_today": self._controller.precool_active_today,
             "upstairs_sensor": cc.upstairs_sensor,
             "main_floor_sensor": cc.main_floor_sensor,
+            "smart_fan_circulation_enabled": cc.smart_fan_circulation_enabled,
+            "fan_circulation_worth_it": self._controller._last_fan_roi.get("worth_it"),
+            "fan_circulation_scenario": self._controller._last_fan_roi.get("scenario"),
+            "fan_cost_usd_per_hr": self._controller._last_fan_roi.get("cost_usd_per_hr"),
+            "fan_benefit_usd_per_hr": self._controller._last_fan_roi.get(
+                "benefit_usd_per_hr"
+            ),
+            "furnace_fan_circulation_active": (
+                self._controller._furnace_fan_circulation_active
+            ),
         }
