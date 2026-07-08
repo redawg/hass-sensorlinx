@@ -361,7 +361,7 @@ class CoolingControlMixin:
             return
 
         excess = gap - cc.stratification_threshold
-        adjustment = min(cc.max_cool_adjustment, excess)
+        adjustment = min(cc.max_cool_adjustment, max(1.0, excess))
         target = max(DEFAULT_MIN_COOL_SETPOINT, round(baseline - adjustment, 0))
 
         if abs(adjustment - self._last_cool_adjustment) < 0.5:
