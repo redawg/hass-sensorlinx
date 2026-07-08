@@ -12,6 +12,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_state_change_event,
     async_track_time_interval,
 )
@@ -120,6 +121,12 @@ class CoolingControlMixin:
 
         await self._async_cooling_control_tick()
 
+        @callback
+        def _startup_resync(_now) -> None:
+            self.hass.async_create_task(self._async_cooling_control_tick())
+
+        async_call_later(self.hass, 45, _startup_resync)
+
     def _unload_cooling_control(self) -> None:
         for attr in (
             "_unsub_cool_interval",
@@ -179,6 +186,7 @@ class CoolingControlMixin:
             self._capture_user_cool_setpoint()
 
         await self._apply_upstairs_cool_bias()
+        await self._sync_upstairs_bedroom_fans()
 
     async def _async_cooling_control_tick(self, _now=None) -> None:
         if not self.enabled:
@@ -191,6 +199,7 @@ class CoolingControlMixin:
         """Called when HVAC switches to cool — start upstairs monitoring."""
         self._capture_user_cool_setpoint()
         await self._apply_upstairs_cool_bias()
+        await self._sync_upstairs_bedroom_fans()
 
     async def _on_hvac_left_cool_mode(self) -> None:
         """Reset upstairs bias state when leaving cool mode."""
