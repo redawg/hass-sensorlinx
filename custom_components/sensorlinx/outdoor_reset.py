@@ -42,10 +42,14 @@ from .cooling_control import (
 )
 from .const import (
     CONF_MAIN_FLOOR_TEMP_SENSOR,
+    CONF_HUNTER_FAN,
     CONF_MAIN_HVAC_CLIMATE,
+    CONF_SIDNEY_FAN,
     CONF_UPSTAIRS_TEMP_SENSOR,
+    DEFAULT_HUNTER_FAN,
     DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
     DEFAULT_MAIN_HVAC_CLIMATE,
+    DEFAULT_SIDNEY_FAN,
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
@@ -171,6 +175,7 @@ class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
         self._upstairs_bias_active: bool = False
         self._precool_triggered_date = None
         self._last_cool_adjustment: float = 0.0
+        self._cooling_fans_active: set[str] = set()
         # Per-zone WWSD state: tracks whether each zone is currently in shutdown
         self._zone_in_shutdown: dict[str, bool] = {}
 
@@ -1257,6 +1262,12 @@ async def async_setup_outdoor_reset(
     )
     params.cooling_control.main_floor_sensor = entry.options.get(
         CONF_MAIN_FLOOR_TEMP_SENSOR, DEFAULT_MAIN_FLOOR_TEMP_SENSOR
+    )
+    params.cooling_control.hunter_fan = entry.options.get(
+        CONF_HUNTER_FAN, DEFAULT_HUNTER_FAN
+    )
+    params.cooling_control.sidney_fan = entry.options.get(
+        CONF_SIDNEY_FAN, DEFAULT_SIDNEY_FAN
     )
 
     # Restore per-zone valve counts and floor mode from options

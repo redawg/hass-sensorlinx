@@ -17,12 +17,16 @@ from .const import (
     CONF_BUILDING_ID,
     CONF_HEATED_FLOOR_CONTROLLER,
     CONF_HOT_WATER_SWITCH,
+    CONF_HUNTER_FAN,
     CONF_MAIN_FLOOR_TEMP_SENSOR,
     CONF_MAIN_HVAC_CLIMATE,
     CONF_RADIANT_FLOOR_SWITCH,
+    CONF_SIDNEY_FAN,
     CONF_UPSTAIRS_TEMP_SENSOR,
+    DEFAULT_HUNTER_FAN,
     DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
     DEFAULT_MAIN_HVAC_CLIMATE,
+    DEFAULT_SIDNEY_FAN,
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
@@ -271,6 +275,14 @@ def _heating_source_schema(
     schema_dict[vol.Optional(CONF_MAIN_FLOOR_TEMP_SENSOR, default=main_floor_default)] = (
         selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"]))
     )
+    hunter_default = defaults.get(CONF_HUNTER_FAN, DEFAULT_HUNTER_FAN)
+    schema_dict[vol.Optional(CONF_HUNTER_FAN, default=hunter_default)] = (
+        selector.EntitySelector(selector.EntitySelectorConfig(domain=["fan"]))
+    )
+    sidney_default = defaults.get(CONF_SIDNEY_FAN, DEFAULT_SIDNEY_FAN)
+    schema_dict[vol.Optional(CONF_SIDNEY_FAN, default=sidney_default)] = (
+        selector.EntitySelector(selector.EntitySelectorConfig(domain=["fan"]))
+    )
     return vol.Schema(schema_dict)
 
 
@@ -332,6 +344,12 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             main_floor = user_input.get(CONF_MAIN_FLOOR_TEMP_SENSOR, "")
             if main_floor:
                 self._options[CONF_MAIN_FLOOR_TEMP_SENSOR] = main_floor
+            hunter = user_input.get(CONF_HUNTER_FAN, "")
+            if hunter:
+                self._options[CONF_HUNTER_FAN] = hunter
+            sidney = user_input.get(CONF_SIDNEY_FAN, "")
+            if sidney:
+                self._options[CONF_SIDNEY_FAN] = sidney
             return await self.async_step_zone_valves()
 
         water_heaters = self._discover_water_heaters()
@@ -471,6 +489,10 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
                 controller.params.cooling_control.main_floor_sensor = new_options[
                     CONF_MAIN_FLOOR_TEMP_SENSOR
                 ]
+            if new_options.get(CONF_HUNTER_FAN):
+                controller.params.cooling_control.hunter_fan = new_options[CONF_HUNTER_FAN]
+            if new_options.get(CONF_SIDNEY_FAN):
+                controller.params.cooling_control.sidney_fan = new_options[CONF_SIDNEY_FAN]
             for key, value in new_options.items():
                 if key.startswith(CONF_ZONE_VALVE_PREFIX):
                     zone_key = key[len(CONF_ZONE_VALVE_PREFIX):]

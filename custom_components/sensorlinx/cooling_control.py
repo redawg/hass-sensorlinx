@@ -17,9 +17,13 @@ from homeassistant.helpers.event import (
 )
 
 from .const import (
+    CONF_HUNTER_FAN,
     CONF_MAIN_FLOOR_TEMP_SENSOR,
+    CONF_SIDNEY_FAN,
     CONF_UPSTAIRS_TEMP_SENSOR,
+    DEFAULT_HUNTER_FAN,
     DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
+    DEFAULT_SIDNEY_FAN,
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
@@ -40,6 +44,8 @@ DEFAULT_PRECOOL_END_HOUR = 14
 DEFAULT_STRATIFICATION_THRESHOLD = 2.0  # °F gap before setpoint trim
 DEFAULT_MAX_COOL_ADJUSTMENT = 4.0
 DEFAULT_MIN_COOL_SETPOINT = 70.0
+DEFAULT_BEDROOM_FANS_ENABLED = True
+DEFAULT_BEDROOM_FAN_SPEED = 66  # percentage (33/66/100 on these fans)
 
 
 class CoolingControlParams:
@@ -56,6 +62,15 @@ class CoolingControlParams:
         self.max_cool_adjustment: float = DEFAULT_MAX_COOL_ADJUSTMENT
         self.upstairs_sensor: str = DEFAULT_UPSTAIRS_TEMP_SENSOR
         self.main_floor_sensor: str = DEFAULT_MAIN_FLOOR_TEMP_SENSOR
+        self.hunter_fan: str = DEFAULT_HUNTER_FAN
+        self.sidney_fan: str = DEFAULT_SIDNEY_FAN
+        self.bedroom_fans_enabled: bool = DEFAULT_BEDROOM_FANS_ENABLED
+        self.bedroom_fan_speed: int = DEFAULT_BEDROOM_FAN_SPEED
+
+    @property
+    def upstairs_fan_entities(self) -> list[str]:
+        """Configured upstairs bedroom fan entity IDs."""
+        return [eid for eid in (self.hunter_fan, self.sidney_fan) if eid]
 
 
 class CoolingControlMixin:
@@ -70,6 +85,7 @@ class CoolingControlMixin:
     _upstairs_bias_active: bool
     _precool_triggered_date: date | None
     _last_cool_adjustment: float
+    _cooling_fans_active: set[str]
 
     def _cooling_params(self) -> CoolingControlParams:
         return self.params.cooling_control
@@ -81,6 +97,7 @@ class CoolingControlMixin:
         self._upstairs_bias_active = False
         self._precool_triggered_date = None
         self._last_cool_adjustment = 0.0
+        self._cooling_fans_active = set()
 
         self._unsub_cool_interval = async_track_time_interval(
             self.hass, self._async_cooling_control_tick, COOL_CHECK_INTERVAL
@@ -132,6 +149,7 @@ class CoolingControlMixin:
             self._user_cool_setpoint = None
             self._upstairs_bias_active = False
             self._last_cool_adjustment = 0.0
+            await self._async_turn_off_cooling_fans()
             return
 
         old_temp = None
@@ -167,6 +185,7 @@ class CoolingControlMixin:
             return
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
+        await self._sync_upstairs_bedroom_fans()
 
     async def _on_hvac_entered_cool_mode(self) -> None:
         """Called when HVAC switches to cool — start upstairs monitoring."""
@@ -178,6 +197,7 @@ class CoolingControlMixin:
         self._user_cool_setpoint = None
         self._upstairs_bias_active = False
         self._last_cool_adjustment = 0.0
+        await self._async_turn_off_cooling_fans()
 
     def _capture_user_cool_setpoint(self) -> None:
         entity_id = self.params.main_hvac_climate_entity_id
@@ -364,18 +384,25 @@ class CoolingControlMixin:
         adjustment = min(cc.max_cool_adjustment, max(1.0, excess))
         target = max(DEFAULT_MIN_COOL_SETPOINT, round(baseline - adjustment, 0))
 
-        if abs(adjustment - self._last_cool_adjustment) < 0.5:
-            return
-
         reason = (
             f"upstairs bias: gap {gap:.1f}°F "
             f"(upstairs {self.upstairs_temp:.1f}, main {self.main_floor_temp:.1f})"
         )
         self._upstairs_bias_active = True
         self._last_cool_adjustment = adjustment
-        await self._async_set_hvac_cool(target, reason)
 
-        if gap > cc.stratification_threshold + 1:
+        state = self.hass.states.get(hvac_entity)
+        current_temp = state.attributes.get("temperature") if state else None
+        needs_temp = True
+        if current_temp is not None:
+            try:
+                needs_temp = abs(float(current_temp) - target) >= 0.5
+            except (TypeError, ValueError):
+                pass
+        if needs_temp:
+            await self._async_set_hvac_cool(target, reason)
+
+        if gap > cc.stratification_threshold + 1 and state:
             fan_mode = state.attributes.get("fan_mode")
             if fan_mode != "on":
                 await self.hass.services.async_call(
@@ -418,6 +445,68 @@ class CoolingControlMixin:
             blocking=True,
         )
 
+    async def _sync_upstairs_bedroom_fans(self) -> None:
+        """Turn on Hunter/Sidney fans when upstairs is stratified during cooling."""
+        cc = self._cooling_params()
+        if not cc.bedroom_fans_enabled:
+            await self._async_turn_off_cooling_fans()
+            return
+
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if not hvac_entity:
+            await self._async_turn_off_cooling_fans()
+            return
+        hvac_state = self.hass.states.get(hvac_entity)
+        if hvac_state is None or hvac_state.state != "cool":
+            await self._async_turn_off_cooling_fans()
+            return
+
+        gap = self.stratification_gap
+        if gap is None or gap <= cc.stratification_threshold:
+            await self._async_turn_off_cooling_fans()
+            return
+
+        await self._async_turn_on_cooling_fans(
+            f"upstairs stratification {gap:.1f}°F",
+        )
+
+    async def _async_turn_on_cooling_fans(self, reason: str) -> None:
+        cc = self._cooling_params()
+        speed = cc.bedroom_fan_speed
+        for entity_id in cc.upstairs_fan_entities:
+            if entity_id in self._cooling_fans_active:
+                continue
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in ("unavailable", "unknown"):
+                _LOGGER.debug("Skipping unavailable fan %s", entity_id)
+                continue
+            if state.state == "on":
+                continue
+            _LOGGER.info("Cooling assist: %s → on @ %d%% (%s)", entity_id, speed, reason)
+            await self.hass.services.async_call(
+                "fan",
+                "turn_on",
+                {"entity_id": entity_id, "percentage": speed},
+                blocking=True,
+            )
+            self._cooling_fans_active.add(entity_id)
+
+    async def _async_turn_off_cooling_fans(self) -> None:
+        if not self._cooling_fans_active:
+            return
+        for entity_id in list(self._cooling_fans_active):
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in ("unavailable", "unknown"):
+                continue
+            _LOGGER.info("Cooling assist: %s → off (stratification resolved)", entity_id)
+            await self.hass.services.async_call(
+                "fan",
+                "turn_off",
+                {"entity_id": entity_id},
+                blocking=True,
+            )
+        self._cooling_fans_active.clear()
+
 
 def get_cooling_control_number_entities(
     coordinator, controller: OutdoorResetController
@@ -431,6 +520,7 @@ def get_cooling_control_number_entities(
             coordinator, controller, cc.stratification_threshold
         ),
         MaxCoolAdjustmentNumberEntity(coordinator, controller, cc.max_cool_adjustment),
+        BedroomFanSpeedNumberEntity(coordinator, controller, cc.bedroom_fan_speed),
     ]
 
 
@@ -440,6 +530,7 @@ def get_cooling_control_switch_entities(
     return [
         PrecoolEnableSwitch(coordinator, controller),
         UpstairsBiasEnableSwitch(coordinator, controller),
+        BedroomFansEnableSwitch(coordinator, controller),
     ]
 
 
@@ -678,6 +769,80 @@ class MaxCoolAdjustmentNumberEntity(_CoolingNumberBase):
         await self._controller._apply_upstairs_cool_bias()
 
 
+class BedroomFanSpeedNumberEntity(RestoreNumber):
+    _attr_has_entity_name = True
+    _attr_name = "Bedroom Fans: Speed"
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:fan-speed-2"
+    _attr_native_min_value = 33
+    _attr_native_max_value = 100
+    _attr_native_step = 33
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, coordinator, controller: OutdoorResetController, default: float) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_bedroom_fan_speed"
+        self._attr_native_value = default
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "cooling_control")},
+            "name": "SensorLinx Cooling Control",
+            "manufacturer": "HBX Controls",
+            "model": "Upstairs-Aware Cooling",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last and last.native_value is not None:
+            self._attr_native_value = int(last.native_value)
+        self._controller.params.cooling_control.bedroom_fan_speed = int(
+            self._attr_native_value
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = int(value)
+        self._controller.params.cooling_control.bedroom_fan_speed = int(value)
+        self.async_write_ha_state()
+
+
+class BedroomFansEnableSwitch(SwitchEntity):
+    _attr_has_entity_name = True
+    _attr_name = "Bedroom Fans Assist"
+    _attr_icon = "mdi:fan"
+
+    def __init__(self, coordinator, controller: OutdoorResetController) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_bedroom_fans_enabled"
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "cooling_control")},
+            "name": "SensorLinx Cooling Control",
+            "manufacturer": "HBX Controls",
+            "model": "Upstairs-Aware Cooling",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.cooling_control.bedroom_fans_enabled
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.cooling_control.bedroom_fans_enabled = True
+        self.async_write_ha_state()
+        await self._controller._sync_upstairs_bedroom_fans()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._controller.params.cooling_control.bedroom_fans_enabled = False
+        self.async_write_ha_state()
+        await self._controller._async_turn_off_cooling_fans()
+
+
 class CoolingControlStatusSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_name = "Cooling Control Status"
@@ -700,8 +865,14 @@ class CoolingControlStatusSensor(SensorEntity):
     @property
     def native_value(self) -> str:
         cc = self._controller.params.cooling_control
-        if not cc.precool_enabled and not cc.upstairs_bias_enabled:
+        if (
+            not cc.precool_enabled
+            and not cc.upstairs_bias_enabled
+            and not cc.bedroom_fans_enabled
+        ):
             return "disabled"
+        if self._controller._cooling_fans_active:
+            return "bedroom_fans"
         if self._controller._upstairs_bias_active:
             return "upstairs_bias"
         if self._controller.precool_active_today:
@@ -718,6 +889,11 @@ class CoolingControlStatusSensor(SensorEntity):
         return {
             "precool_enabled": cc.precool_enabled,
             "upstairs_bias_enabled": cc.upstairs_bias_enabled,
+            "bedroom_fans_enabled": cc.bedroom_fans_enabled,
+            "bedroom_fan_speed": cc.bedroom_fan_speed,
+            "bedroom_fans_active": sorted(self._controller._cooling_fans_active),
+            "hunter_fan": cc.hunter_fan,
+            "sidney_fan": cc.sidney_fan,
             "upstairs_temp": self._controller.upstairs_temp,
             "main_floor_temp": self._controller.main_floor_temp,
             "stratification_gap": self._controller.stratification_gap,
