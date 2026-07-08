@@ -13,11 +13,15 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import (
     async_call_later,
+    async_track_point_in_time,
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_COOLING_PAUSE_REASON,
+    CONF_COOLING_PAUSED_UNTIL,
     CONF_HUNTER_FAN,
     CONF_MAIN_FLOOR_TEMP_SENSOR,
     CONF_SIDNEY_FAN,
@@ -35,6 +39,7 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 COOL_CHECK_INTERVAL = timedelta(minutes=15)
+MANUAL_FAN_PAUSE_HOURS = 48
 
 DEFAULT_PRECOOL_ENABLED = True
 DEFAULT_UPSTAIRS_BIAS_ENABLED = True
@@ -87,6 +92,12 @@ class CoolingControlMixin:
     _precool_triggered_date: date | None
     _last_cool_adjustment: float
     _cooling_fans_active: set[str]
+    _entry_id: str | None
+    _cooling_paused_until: datetime | None
+    _cooling_pause_reason: str | None
+    _programmatic_fan_change: bool
+    _unsub_cool_fans: Any
+    _unsub_cooling_pause: Any
 
     def _cooling_params(self) -> CoolingControlParams:
         return self.params.cooling_control
@@ -99,6 +110,11 @@ class CoolingControlMixin:
         self._precool_triggered_date = None
         self._last_cool_adjustment = 0.0
         self._cooling_fans_active = set()
+        self._cooling_paused_until = None
+        self._cooling_pause_reason = None
+        self._programmatic_fan_change = False
+
+        self._restore_cooling_pause_from_options()
 
         self._unsub_cool_interval = async_track_time_interval(
             self.hass, self._async_cooling_control_tick, COOL_CHECK_INTERVAL
@@ -119,6 +135,12 @@ class CoolingControlMixin:
             )
             self._capture_user_cool_setpoint()
 
+        fan_entities = cc.upstairs_fan_entities
+        if fan_entities:
+            self._unsub_cool_fans = async_track_state_change_event(
+                self.hass, fan_entities, self._async_on_bedroom_fan_change
+            )
+
         await self._async_cooling_control_tick()
 
         @callback
@@ -132,11 +154,137 @@ class CoolingControlMixin:
             "_unsub_cool_interval",
             "_unsub_cool_sensors",
             "_unsub_hvac_setpoint",
+            "_unsub_cool_fans",
+            "_unsub_cooling_pause",
         ):
             unsub = getattr(self, attr, None)
             if unsub:
                 unsub()
                 setattr(self, attr, None)
+
+    @property
+    def is_cooling_paused(self) -> bool:
+        """True while cooling automations are suspended after manual fan use."""
+        if self._cooling_paused_until is None:
+            return False
+        if dt_util.now() >= self._cooling_paused_until:
+            return False
+        return True
+
+    def _restore_cooling_pause_from_options(self) -> None:
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        paused_raw = entry.options.get(CONF_COOLING_PAUSED_UNTIL)
+        if not paused_raw:
+            return
+        try:
+            until = datetime.fromisoformat(str(paused_raw))
+            if until.tzinfo is None:
+                until = dt_util.as_local(until)
+        except (ValueError, TypeError):
+            return
+        if dt_util.now() >= until:
+            self.hass.async_create_task(self._clear_cooling_pause())
+            return
+        self._cooling_paused_until = until
+        self._cooling_pause_reason = entry.options.get(CONF_COOLING_PAUSE_REASON)
+        self._schedule_cooling_pause_end()
+
+    async def _persist_cooling_pause(self) -> None:
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        new_options = dict(entry.options)
+        if self._cooling_paused_until is None:
+            new_options.pop(CONF_COOLING_PAUSED_UNTIL, None)
+            new_options.pop(CONF_COOLING_PAUSE_REASON, None)
+        else:
+            new_options[CONF_COOLING_PAUSED_UNTIL] = self._cooling_paused_until.isoformat()
+            if self._cooling_pause_reason:
+                new_options[CONF_COOLING_PAUSE_REASON] = self._cooling_pause_reason
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
+
+    def _schedule_cooling_pause_end(self) -> None:
+        if self._unsub_cooling_pause:
+            self._unsub_cooling_pause()
+            self._unsub_cooling_pause = None
+        if self._cooling_paused_until is None:
+            return
+
+        @callback
+        def _on_pause_expired(_now: datetime) -> None:
+            self.hass.async_create_task(self._clear_cooling_pause())
+
+        self._unsub_cooling_pause = async_track_point_in_time(
+            self.hass, _on_pause_expired, self._cooling_paused_until
+        )
+
+    async def _clear_cooling_pause(self) -> None:
+        if self._cooling_paused_until is None and not self.is_cooling_paused:
+            return
+        _LOGGER.info("Cooling automations resumed after manual-fan pause")
+        self._cooling_paused_until = None
+        self._cooling_pause_reason = None
+        if self._unsub_cooling_pause:
+            self._unsub_cooling_pause()
+            self._unsub_cooling_pause = None
+        await self._persist_cooling_pause()
+
+    async def _pause_cooling_for_manual_fan(self, entity_id: str) -> None:
+        until = dt_util.now() + timedelta(hours=MANUAL_FAN_PAUSE_HOURS)
+        self._cooling_paused_until = until
+        friendly = self.hass.states.get(entity_id)
+        name = (
+            friendly.attributes.get("friendly_name", entity_id)
+            if friendly
+            else entity_id
+        )
+        self._cooling_pause_reason = f"Manual fan on: {name}"
+        _LOGGER.info(
+            "Cooling automations paused until %s (%s)",
+            until.strftime("%Y-%m-%d %H:%M"),
+            self._cooling_pause_reason,
+        )
+        await self._release_cooling_automation_state()
+        await self._persist_cooling_pause()
+        self._schedule_cooling_pause_end()
+
+    async def _release_cooling_automation_state(self) -> None:
+        """Stop active cooling assists without touching manually controlled fans."""
+        if self._upstairs_bias_active and self._user_cool_setpoint is not None:
+            await self._async_set_hvac_cool(
+                self._user_cool_setpoint,
+                "manual fan override — restoring setpoint",
+            )
+        self._upstairs_bias_active = False
+        self._last_cool_adjustment = 0.0
+        await self._async_turn_off_cooling_fans()
+
+    @callback
+    def _async_on_bedroom_fan_change(self, event) -> None:
+        self.hass.async_create_task(self._async_handle_bedroom_fan_change(event))
+
+    async def _async_handle_bedroom_fan_change(self, event) -> None:
+        if self.is_cooling_paused:
+            return
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        entity_id = event.data.get("entity_id")
+        if new_state is None or not entity_id:
+            return
+        if new_state.state != "on":
+            return
+        if old_state is None or old_state.state in ("unavailable", "unknown", "on"):
+            return
+        if entity_id in self._cooling_fans_active or self._programmatic_fan_change:
+            return
+        await self._pause_cooling_for_manual_fan(entity_id)
 
     @callback
     def _async_on_cool_sensor_change(self, _event) -> None:
@@ -190,6 +338,10 @@ class CoolingControlMixin:
 
     async def _async_cooling_control_tick(self, _now=None) -> None:
         if not self.enabled:
+            return
+        if self._cooling_paused_until and not self.is_cooling_paused:
+            await self._clear_cooling_pause()
+        if self.is_cooling_paused:
             return
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
@@ -257,6 +409,8 @@ class CoolingControlMixin:
 
     async def _check_precool(self) -> None:
         """Start cool mode before afternoon heat based on weather forecast."""
+        if self.is_cooling_paused:
+            return
         cc = self._cooling_params()
         if not cc.precool_enabled:
             return
@@ -352,6 +506,8 @@ class CoolingControlMixin:
 
     async def _apply_upstairs_cool_bias(self) -> None:
         """Lower cool setpoint when upstairs runs warmer than main floor."""
+        if self.is_cooling_paused:
+            return
         cc = self._cooling_params()
         if not cc.upstairs_bias_enabled:
             return
@@ -456,6 +612,8 @@ class CoolingControlMixin:
 
     async def _sync_upstairs_bedroom_fans(self) -> None:
         """Turn on Hunter/Sidney fans when upstairs is stratified during cooling."""
+        if self.is_cooling_paused:
+            return
         cc = self._cooling_params()
         if not cc.bedroom_fans_enabled:
             await self._async_turn_off_cooling_fans()
@@ -492,13 +650,20 @@ class CoolingControlMixin:
             if state.state == "on":
                 continue
             _LOGGER.info("Cooling assist: %s → on @ %d%% (%s)", entity_id, speed, reason)
-            await self.hass.services.async_call(
-                "fan",
-                "turn_on",
-                {"entity_id": entity_id, "percentage": speed},
-                blocking=True,
-            )
+            self._programmatic_fan_change = True
             self._cooling_fans_active.add(entity_id)
+            try:
+                await self.hass.services.async_call(
+                    "fan",
+                    "turn_on",
+                    {"entity_id": entity_id, "percentage": speed},
+                    blocking=True,
+                )
+            except Exception:
+                self._cooling_fans_active.discard(entity_id)
+                raise
+            finally:
+                self._programmatic_fan_change = False
 
     async def _async_turn_off_cooling_fans(self) -> None:
         if not self._cooling_fans_active:
@@ -873,6 +1038,8 @@ class CoolingControlStatusSensor(SensorEntity):
 
     @property
     def native_value(self) -> str:
+        if self._controller.is_cooling_paused:
+            return "paused"
         cc = self._controller.params.cooling_control
         if (
             not cc.precool_enabled
@@ -896,6 +1063,13 @@ class CoolingControlStatusSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         cc = self._controller.params.cooling_control
         return {
+            "cooling_paused": self._controller.is_cooling_paused,
+            "cooling_paused_until": (
+                self._controller._cooling_paused_until.isoformat()
+                if self._controller._cooling_paused_until
+                else None
+            ),
+            "cooling_pause_reason": self._controller._cooling_pause_reason,
             "precool_enabled": cc.precool_enabled,
             "upstairs_bias_enabled": cc.upstairs_bias_enabled,
             "bedroom_fans_enabled": cc.bedroom_fans_enabled,

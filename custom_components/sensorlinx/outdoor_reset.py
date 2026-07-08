@@ -143,10 +143,12 @@ class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
         hass: HomeAssistant,
         coordinator: SensorlinxCoordinator,
         params: OutdoorResetParams,
+        entry_id: str | None = None,
     ) -> None:
         self.hass = hass
         self.coordinator = coordinator
         self.params = params
+        self._entry_id = entry_id
         self._unsub_interval = None
         self._unsub_state = None
         self._unsub_zone_boost = None
@@ -176,6 +178,11 @@ class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
         self._precool_triggered_date = None
         self._last_cool_adjustment: float = 0.0
         self._cooling_fans_active: set[str] = set()
+        self._cooling_paused_until = None
+        self._cooling_pause_reason = None
+        self._programmatic_fan_change = False
+        self._unsub_cool_fans = None
+        self._unsub_cooling_pause = None
         # Per-zone WWSD state: tracks whether each zone is currently in shutdown
         self._zone_in_shutdown: dict[str, bool] = {}
 
@@ -1300,7 +1307,7 @@ async def async_setup_outdoor_reset(
             except (ValueError, TypeError):
                 pass
 
-    controller = OutdoorResetController(hass, coordinator, params)
+    controller = OutdoorResetController(hass, coordinator, params, entry.entry_id)
     await controller.async_setup()
 
     # Register services for configuring external entity links
