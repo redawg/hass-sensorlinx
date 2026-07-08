@@ -27,15 +27,30 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dis
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE, DOMAIN
-from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
-from .helpers import thm_device_info, zon_device_info
 from .night_setback import (
     NightSetbackMixin,
     NightSetbackParams,
     get_night_setback_number_entities,
     get_night_setback_switch_entities,
 )
+from .cooling_control import (
+    CoolingControlMixin,
+    CoolingControlParams,
+    get_cooling_control_number_entities,
+    get_cooling_control_sensor_entities,
+    get_cooling_control_switch_entities,
+)
+from .const import (
+    CONF_MAIN_FLOOR_TEMP_SENSOR,
+    CONF_MAIN_HVAC_CLIMATE,
+    CONF_UPSTAIRS_TEMP_SENSOR,
+    DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
+    DEFAULT_MAIN_HVAC_CLIMATE,
+    DEFAULT_UPSTAIRS_TEMP_SENSOR,
+    DOMAIN,
+)
+from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
+from .helpers import thm_device_info, zon_device_info
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -116,7 +131,7 @@ def compute_target(outdoor: float, base: float, overshoot: float,
     return round(base + overshoot * ((shutdown - outdoor) / temp_range), 1)
 
 
-class OutdoorResetController(NightSetbackMixin):
+class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
     """Manages the outdoor reset logic and periodically updates zone setpoints."""
 
     def __init__(
@@ -149,6 +164,13 @@ class OutdoorResetController(NightSetbackMixin):
         self._unsub_night_motion = None
         self._unsub_day_restore = None
         self._unsub_hvac_cool = None
+        self._unsub_cool_interval = None
+        self._unsub_cool_sensors = None
+        self._unsub_hvac_setpoint = None
+        self._user_cool_setpoint: float | None = None
+        self._upstairs_bias_active: bool = False
+        self._precool_triggered_date = None
+        self._last_cool_adjustment: float = 0.0
         # Per-zone WWSD state: tracks whether each zone is currently in shutdown
         self._zone_in_shutdown: dict[str, bool] = {}
 
@@ -333,6 +355,7 @@ class OutdoorResetController(NightSetbackMixin):
                 self.hass, [hvac_entity], self._async_on_hvac_mode_change
             )
         await self._setup_night_setback()
+        await self._setup_cooling_control()
         if self._main_hvac_cooling():
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC already in cool mode"
@@ -342,6 +365,7 @@ class OutdoorResetController(NightSetbackMixin):
     def async_unload(self) -> None:
         """Remove listeners."""
         self._unload_night_setback()
+        self._unload_cooling_control()
         if self._unsub_interval:
             self._unsub_interval()
         if self._unsub_state:
@@ -370,8 +394,10 @@ class OutdoorResetController(NightSetbackMixin):
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC switched to cool mode"
             )
+            await self._on_hvac_entered_cool_mode()
         elif old_state and old_state.state == "cool":
             _LOGGER.info("HVAC left cool mode — resuming outdoor reset")
+            await self._on_hvac_left_cool_mode()
             await self._apply_setpoints()
 
     async def _async_update(self, _now=None) -> None:
@@ -1186,6 +1212,7 @@ class OutdoorResetParams:
         self.zone_shutdown_temps: dict[str, float] = {}  # per-zone override (None = use system)
         self.main_hvac_climate_entity_id: str | None = DEFAULT_MAIN_HVAC_CLIMATE
         self.night_setback: NightSetbackParams = NightSetbackParams()
+        self.cooling_control: CoolingControlParams = CoolingControlParams()
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1251,12 @@ async def async_setup_outdoor_reset(
             pass
     params.main_hvac_climate_entity_id = entry.options.get(
         CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE
+    )
+    params.cooling_control.upstairs_sensor = entry.options.get(
+        CONF_UPSTAIRS_TEMP_SENSOR, DEFAULT_UPSTAIRS_TEMP_SENSOR
+    )
+    params.cooling_control.main_floor_sensor = entry.options.get(
+        CONF_MAIN_FLOOR_TEMP_SENSOR, DEFAULT_MAIN_FLOOR_TEMP_SENSOR
     )
 
     # Restore per-zone valve counts and floor mode from options
@@ -1393,6 +1426,7 @@ def get_number_entities(
         ElectricityCostNumberEntity(coordinator, controller),
     ]
     entities.extend(get_night_setback_number_entities(coordinator, controller))
+    entities.extend(get_cooling_control_number_entities(coordinator, controller))
 
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -1454,6 +1488,7 @@ def get_sensor_entities(
         HydronicDeltaTSensor(coordinator, controller),
         HydronicBtuSensor(coordinator, controller),
     ]
+    entities.extend(get_cooling_control_sensor_entities(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
@@ -1482,6 +1517,7 @@ def get_switch_entities(
         PreheatEnableSwitch(coordinator, controller),
     ]
     entities.extend(get_night_setback_switch_entities(coordinator, controller))
+    entities.extend(get_cooling_control_switch_entities(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(

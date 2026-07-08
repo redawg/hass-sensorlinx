@@ -17,9 +17,13 @@ from .const import (
     CONF_BUILDING_ID,
     CONF_HEATED_FLOOR_CONTROLLER,
     CONF_HOT_WATER_SWITCH,
+    CONF_MAIN_FLOOR_TEMP_SENSOR,
     CONF_MAIN_HVAC_CLIMATE,
     CONF_RADIANT_FLOOR_SWITCH,
+    CONF_UPSTAIRS_TEMP_SENSOR,
+    DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
     DEFAULT_MAIN_HVAC_CLIMATE,
+    DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
 
@@ -257,6 +261,16 @@ def _heating_source_schema(
     schema_dict[vol.Optional(CONF_MAIN_HVAC_CLIMATE, default=hvac_default)] = (
         selector.EntitySelector(selector.EntitySelectorConfig(domain=["climate"]))
     )
+    upstairs_default = defaults.get(CONF_UPSTAIRS_TEMP_SENSOR, DEFAULT_UPSTAIRS_TEMP_SENSOR)
+    schema_dict[vol.Optional(CONF_UPSTAIRS_TEMP_SENSOR, default=upstairs_default)] = (
+        selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"]))
+    )
+    main_floor_default = defaults.get(
+        CONF_MAIN_FLOOR_TEMP_SENSOR, DEFAULT_MAIN_FLOOR_TEMP_SENSOR
+    )
+    schema_dict[vol.Optional(CONF_MAIN_FLOOR_TEMP_SENSOR, default=main_floor_default)] = (
+        selector.EntitySelector(selector.EntitySelectorConfig(domain=["sensor"]))
+    )
     return vol.Schema(schema_dict)
 
 
@@ -312,6 +326,12 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             hvac = user_input.get(CONF_MAIN_HVAC_CLIMATE, "")
             if hvac:
                 self._options[CONF_MAIN_HVAC_CLIMATE] = hvac
+            upstairs = user_input.get(CONF_UPSTAIRS_TEMP_SENSOR, "")
+            if upstairs:
+                self._options[CONF_UPSTAIRS_TEMP_SENSOR] = upstairs
+            main_floor = user_input.get(CONF_MAIN_FLOOR_TEMP_SENSOR, "")
+            if main_floor:
+                self._options[CONF_MAIN_FLOOR_TEMP_SENSOR] = main_floor
             return await self.async_step_zone_valves()
 
         water_heaters = self._discover_water_heaters()
@@ -442,6 +462,14 @@ class SensorlinxOptionsFlowHandler(config_entries.OptionsFlow):
             if new_options.get(CONF_MAIN_HVAC_CLIMATE):
                 controller.params.main_hvac_climate_entity_id = new_options[
                     CONF_MAIN_HVAC_CLIMATE
+                ]
+            if new_options.get(CONF_UPSTAIRS_TEMP_SENSOR):
+                controller.params.cooling_control.upstairs_sensor = new_options[
+                    CONF_UPSTAIRS_TEMP_SENSOR
+                ]
+            if new_options.get(CONF_MAIN_FLOOR_TEMP_SENSOR):
+                controller.params.cooling_control.main_floor_sensor = new_options[
+                    CONF_MAIN_FLOOR_TEMP_SENSOR
                 ]
             for key, value in new_options.items():
                 if key.startswith(CONF_ZONE_VALVE_PREFIX):
