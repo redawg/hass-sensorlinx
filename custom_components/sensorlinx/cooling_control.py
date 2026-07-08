@@ -371,9 +371,9 @@ class CoolingControlMixin:
             f"upstairs bias: gap {gap:.1f}°F "
             f"(upstairs {self.upstairs_temp:.1f}, main {self.main_floor_temp:.1f})"
         )
-        await self._async_set_hvac_cool(target, reason)
         self._upstairs_bias_active = True
         self._last_cool_adjustment = adjustment
+        await self._async_set_hvac_cool(target, reason)
 
         if gap > cc.stratification_threshold + 1:
             fan_mode = state.attributes.get("fan_mode")
