@@ -50,6 +50,7 @@ DEFAULT_PRECOOL_END_HOUR = 14
 DEFAULT_STRATIFICATION_THRESHOLD = 2.0  # °F gap before setpoint trim
 DEFAULT_MAX_COOL_ADJUSTMENT = 4.0
 DEFAULT_MIN_COOL_SETPOINT = 70.0
+DEFAULT_MAX_OUTDOOR_FOR_COOLING = 75.0  # no compressor cooling below this outdoor temp
 DEFAULT_BEDROOM_FANS_ENABLED = True
 DEFAULT_BEDROOM_FAN_SPEED = 66  # percentage (33/66/100 on these fans)
 DEFAULT_SMART_FAN_CIRCULATION = True
@@ -74,6 +75,7 @@ class CoolingControlParams:
         self.precool_end_hour: int = DEFAULT_PRECOOL_END_HOUR
         self.stratification_threshold: float = DEFAULT_STRATIFICATION_THRESHOLD
         self.max_cool_adjustment: float = DEFAULT_MAX_COOL_ADJUSTMENT
+        self.max_outdoor_for_cooling: float = DEFAULT_MAX_OUTDOOR_FOR_COOLING
         self.upstairs_sensor: str = DEFAULT_UPSTAIRS_TEMP_SENSOR
         self.main_floor_sensor: str = DEFAULT_MAIN_FLOOR_TEMP_SENSOR
         self.hunter_fan: str = DEFAULT_HUNTER_FAN
@@ -361,6 +363,7 @@ class CoolingControlMixin:
             await self._clear_cooling_pause()
         if self.is_cooling_paused:
             return
+        await self._async_enforce_outdoor_cooling_limit()
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
         await self._sync_smart_fan_circulation()
@@ -510,9 +513,52 @@ class CoolingControlMixin:
         today = date.today()
         return self._precool_triggered_date == today
 
+    def _outdoor_allows_cooling(self) -> bool:
+        """False when outdoor air is below the cooling cutoff."""
+        outdoor = self.outdoor_temp
+        if outdoor is None:
+            return True
+        return outdoor >= self._cooling_params().max_outdoor_for_cooling
+
+    async def _async_enforce_outdoor_cooling_limit(self) -> None:
+        """Turn off integration-driven cooling when outdoor is too mild."""
+        if self._outdoor_allows_cooling():
+            return
+        outdoor = self.outdoor_temp
+        limit = self._cooling_params().max_outdoor_for_cooling
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if not hvac_entity:
+            return
+        state = self.hass.states.get(hvac_entity)
+        if state is None or state.state != "cool":
+            self._upstairs_bias_active = False
+            self._last_cool_adjustment = 0.0
+            return
+        if not (self._upstairs_bias_active or self.precool_active_today):
+            return
+        _LOGGER.info(
+            "Outdoor %.1f°F < %.1f°F limit — turning off integration cooling",
+            outdoor or 0,
+            limit,
+        )
+        await self.hass.services.async_call(
+            "climate",
+            "set_hvac_mode",
+            {"entity_id": hvac_entity, "hvac_mode": "off"},
+            blocking=True,
+        )
+        self._user_cool_setpoint = None
+        self._upstairs_bias_active = False
+        self._last_cool_adjustment = 0.0
+        self._precool_triggered_date = None
+        await self._async_turn_off_cooling_fans()
+        await self._async_stop_furnace_circulation_fan()
+
     async def _check_precool(self) -> None:
         """Start cool mode before afternoon heat based on weather forecast."""
         if self.is_cooling_paused:
+            return
+        if not self._outdoor_allows_cooling():
             return
         cc = self._cooling_params()
         if not cc.precool_enabled:
@@ -611,6 +657,8 @@ class CoolingControlMixin:
         """Lower cool setpoint when upstairs runs warmer than main floor."""
         if self.is_cooling_paused:
             return
+        if not self._outdoor_allows_cooling():
+            return
         cc = self._cooling_params()
         if not cc.upstairs_bias_enabled:
             return
@@ -699,6 +747,17 @@ class CoolingControlMixin:
                 pass
 
         if not needs_mode and not needs_temp:
+            return
+
+        if needs_mode and not self._outdoor_allows_cooling():
+            outdoor = self.outdoor_temp
+            limit = self._cooling_params().max_outdoor_for_cooling
+            _LOGGER.info(
+                "Cooling blocked: outdoor %.1f°F < %.1f°F limit (%s)",
+                outdoor or 0,
+                limit,
+                reason,
+            )
             return
 
         _LOGGER.info(
@@ -891,6 +950,9 @@ def get_cooling_control_number_entities(
             coordinator, controller, cc.stratification_threshold
         ),
         MaxCoolAdjustmentNumberEntity(coordinator, controller, cc.max_cool_adjustment),
+        MaxOutdoorForCoolingNumberEntity(
+            coordinator, controller, cc.max_outdoor_for_cooling
+        ),
         BedroomFanSpeedNumberEntity(coordinator, controller, cc.bedroom_fan_speed),
     ]
 
@@ -1141,6 +1203,36 @@ class MaxCoolAdjustmentNumberEntity(_CoolingNumberBase):
         await self._controller._apply_upstairs_cool_bias()
 
 
+class MaxOutdoorForCoolingNumberEntity(_CoolingNumberBase):
+    def __init__(self, coordinator, controller: OutdoorResetController, default: float) -> None:
+        super().__init__(
+            coordinator,
+            controller,
+            "Cooling: Max Outdoor Temp",
+            "sensorlinx_max_outdoor_for_cooling",
+            default,
+            65,
+            90,
+            1,
+            "mdi:thermometer-chevron-down",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last and last.native_value is not None:
+            self._attr_native_value = last.native_value
+        self._controller.params.cooling_control.max_outdoor_for_cooling = float(
+            self._attr_native_value
+        )
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.cooling_control.max_outdoor_for_cooling = float(value)
+        self.async_write_ha_state()
+        await self._controller._async_enforce_outdoor_cooling_limit()
+
+
 class BedroomFanSpeedNumberEntity(RestoreNumber):
     _attr_has_entity_name = True
     _attr_name = "Bedroom Fans: Speed"
@@ -1326,6 +1418,9 @@ class CoolingControlStatusSensor(SensorEntity):
             "upstairs_bias_active": self._controller._upstairs_bias_active,
             "last_cool_adjustment": self._controller._last_cool_adjustment,
             "precool_triggered_today": self._controller.precool_active_today,
+            "outdoor_temp": self._controller.outdoor_temp,
+            "max_outdoor_for_cooling": cc.max_outdoor_for_cooling,
+            "outdoor_allows_cooling": self._controller._outdoor_allows_cooling(),
             "upstairs_sensor": cc.upstairs_sensor,
             "main_floor_sensor": cc.main_floor_sensor,
             "smart_fan_circulation_enabled": cc.smart_fan_circulation_enabled,
