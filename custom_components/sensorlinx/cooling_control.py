@@ -363,6 +363,7 @@ class CoolingControlMixin:
             await self._clear_cooling_pause()
         if self.is_cooling_paused:
             return
+        await self._async_orchestrate_hvac_mode()
         await self._async_enforce_outdoor_cooling_limit()
         await self._check_precool()
         await self._apply_upstairs_cool_bias()

@@ -40,6 +40,13 @@ from .cooling_control import (
     get_cooling_control_sensor_entities,
     get_cooling_control_switch_entities,
 )
+from .hvac_orchestrator import (
+    HvacOrchestratorMixin,
+    HvacOrchestratorParams,
+    get_orchestrator_number_entities,
+    get_orchestrator_sensor_entities,
+    get_orchestrator_switch_entities,
+)
 from .const import (
     CONF_MAIN_FLOOR_TEMP_SENSOR,
     CONF_HUNTER_FAN,
@@ -135,7 +142,7 @@ def compute_target(outdoor: float, base: float, overshoot: float,
     return round(base + overshoot * ((shutdown - outdoor) / temp_range), 1)
 
 
-class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
+class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSetbackMixin):
     """Manages the outdoor reset logic and periodically updates zone setpoints."""
 
     def __init__(
@@ -182,6 +189,7 @@ class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
         self._last_fan_roi: dict[str, Any] = {}
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
+        self._init_orchestrator_state()
         self._programmatic_fan_change = False
         self._unsub_cool_fans = None
         self._unsub_cooling_pause = None
@@ -1032,22 +1040,20 @@ class OutdoorResetController(CoolingControlMixin, NightSetbackMixin):
         return None
 
     def _compute_preheat_lead_time(self) -> float:
-        """Compute how many minutes before shutdown the system needs to start.
-
-        Based on thermal lag and how far below target the floors currently are.
-        """
-        max_deficit = 0.0
+        """Minutes before shutdown needed — worst case across zones."""
+        lead_minutes = 0.0
         for thm in self.coordinator.get_thm_devices():
             zone_name = thm.name.lower().replace(" ", "_")
             raw_floor = self._read_zone_floor_temp(zone_name)
             floor_temp = self.effective_floor_temp(zone_name, raw_floor)
+            deficit = 0.0
             if floor_temp is not None:
-                floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+                floor_target = self.params.floor_targets.get(
+                    zone_name, DEFAULT_FLOOR_TARGET
+                )
                 deficit = max(0, floor_target - floor_temp)
-                max_deficit = max(max_deficit, deficit)
-
-        # If floors are already at target, still need some lead time for thermal mass
-        lead_minutes = self.params.thermal_lag * max(max_deficit, 2.0)
+            lag = self.zone_thermal_lag(zone_name)
+            lead_minutes = max(lead_minutes, lag * max(deficit, 2.0))
         return lead_minutes
 
     async def _check_preheat(self, outdoor: float) -> None:
@@ -1227,6 +1233,7 @@ class OutdoorResetParams:
         self.main_hvac_climate_entity_id: str | None = DEFAULT_MAIN_HVAC_CLIMATE
         self.night_setback: NightSetbackParams = NightSetbackParams()
         self.cooling_control: CoolingControlParams = CoolingControlParams()
+        self.orchestrator: HvacOrchestratorParams = HvacOrchestratorParams()
 
 
 # ---------------------------------------------------------------------------
@@ -1300,6 +1307,12 @@ async def async_setup_outdoor_reset(
             zone_key = key[len("floor_bias_"):]
             try:
                 params.zone_floor_sensor_bias[zone_key] = float(value)
+            except (ValueError, TypeError):
+                pass
+        elif key.startswith("thermal_lag_"):
+            zone_key = key[len("thermal_lag_"):]
+            try:
+                params.orchestrator.zone_thermal_lag[zone_key] = float(value)
             except (ValueError, TypeError):
                 pass
         elif key.startswith("zone_shutdown_"):
@@ -1447,6 +1460,7 @@ def get_number_entities(
     ]
     entities.extend(get_night_setback_number_entities(coordinator, controller))
     entities.extend(get_cooling_control_number_entities(coordinator, controller))
+    entities.extend(get_orchestrator_number_entities(coordinator, controller))
 
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -1509,6 +1523,7 @@ def get_sensor_entities(
         HydronicBtuSensor(coordinator, controller),
     ]
     entities.extend(get_cooling_control_sensor_entities(coordinator, controller))
+    entities.extend(get_orchestrator_sensor_entities(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
@@ -1538,6 +1553,7 @@ def get_switch_entities(
     ]
     entities.extend(get_night_setback_switch_entities(coordinator, controller))
     entities.extend(get_cooling_control_switch_entities(coordinator, controller))
+    entities.extend(get_orchestrator_switch_entities(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(

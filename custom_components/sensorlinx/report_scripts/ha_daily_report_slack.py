@@ -210,8 +210,14 @@ def format_adjustment_line(adj):
 
 def log_adjustments(result):
     """Persist applied agent actions for audit trail."""
-    applied = result.get("applied") if result else None
-    if not applied:
+    if not result:
+        return
+    actions = []
+    for key in ("applied", "orchestrator_applied"):
+        for a in result.get(key) or []:
+            if a.get("applied"):
+                actions.append(a)
+    if not actions:
         return
     entry = {
         "ts": datetime.now().isoformat(),
@@ -225,7 +231,7 @@ def log_adjustments(result):
                 "reason": a.get("reason"),
                 "applied": a.get("applied"),
             }
-            for a in applied
+            for a in actions
         ],
     }
     try:

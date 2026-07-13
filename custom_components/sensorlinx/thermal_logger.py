@@ -276,6 +276,13 @@ class ThermalDataLogger:
             result["ecobee_humidity"] = None
             result["ecobee_fan"] = None
 
+        gap = self.controller.stratification_gap
+        if gap is not None:
+            result["stratification_gap"] = round(gap, 2)
+        orch = self.controller.orchestrator_status()
+        result["orchestrator_decision"] = orch.get("last_decision")
+        result["orchestrator_active_mode"] = orch.get("active_mode")
+
         # Remote sensor temperatures
         sensor_temps = {}
         for name, entity_id in ECOBEE_REMOTE_SENSORS.items():
