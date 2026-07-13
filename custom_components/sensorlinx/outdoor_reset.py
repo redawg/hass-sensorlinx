@@ -889,14 +889,15 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         self._temp_history.append((datetime.now(), outdoor))
 
     async def _estimate_minutes_to_shutdown_async(self, outdoor: float) -> float | None:
-        """Async version that checks forecast first, then falls back to trend."""
+        """Estimate time to WWSD shutdown from actual outdoor trend."""
         shutdown = self.params.shutdown
         if outdoor < shutdown:
             return 0.0
 
-        minutes_from_forecast = await self._check_forecast_for_shutdown()
-        if minutes_from_forecast is not None:
-            return minutes_from_forecast
+        if not self.params.orchestrator.enabled:
+            minutes_from_forecast = await self._check_forecast_for_shutdown()
+            if minutes_from_forecast is not None:
+                return minutes_from_forecast
 
         return self._estimate_minutes_to_shutdown_trend(outdoor)
 

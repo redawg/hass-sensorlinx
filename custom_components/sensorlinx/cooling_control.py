@@ -160,6 +160,7 @@ class CoolingControlMixin:
                 self.hass, fan_entities, self._async_on_bedroom_fan_change
             )
 
+        await self._setup_hvac_orchestrator()
         await self._async_cooling_control_tick()
 
         @callback
@@ -169,6 +170,7 @@ class CoolingControlMixin:
         async_call_later(self.hass, 45, _startup_resync)
 
     def _unload_cooling_control(self) -> None:
+        self._unload_hvac_orchestrator()
         for attr in (
             "_unsub_cool_interval",
             "_unsub_cool_sensors",
@@ -363,7 +365,6 @@ class CoolingControlMixin:
             await self._clear_cooling_pause()
         if self.is_cooling_paused:
             return
-        await self._async_orchestrate_hvac_mode()
         await self._async_enforce_outdoor_cooling_limit()
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
@@ -556,7 +557,7 @@ class CoolingControlMixin:
         await self._async_stop_furnace_circulation_fan()
 
     async def _check_precool(self) -> None:
-        """Start cool mode before afternoon heat based on weather forecast."""
+        """Start cool mode when actual outdoor temp supports pre-cool."""
         if self.is_cooling_paused:
             return
         if not self._outdoor_allows_cooling():
@@ -581,20 +582,28 @@ class CoolingControlMixin:
             return
 
         outdoor = self.outdoor_temp
-        if outdoor is not None and outdoor < cc.precool_threshold - 8:
+        if outdoor is None:
             return
 
-        afternoon_high = await self._forecast_afternoon_high()
-        if afternoon_high is None or afternoon_high < cc.precool_threshold:
-            return
+        if self.params.orchestrator.enabled:
+            if outdoor < cc.max_outdoor_for_cooling:
+                return
+        else:
+            if outdoor < cc.precool_threshold - 8:
+                return
+            afternoon_high = await self._forecast_afternoon_high()
+            if afternoon_high is None or afternoon_high < cc.precool_threshold:
+                return
 
         target = cc.precool_target
-        if afternoon_high >= cc.precool_threshold + 5:
-            target = max(DEFAULT_MIN_COOL_SETPOINT, cc.precool_target - 1)
+        if not self.params.orchestrator.enabled:
+            afternoon_high = await self._forecast_afternoon_high()
+            if afternoon_high and afternoon_high >= cc.precool_threshold + 5:
+                target = max(DEFAULT_MIN_COOL_SETPOINT, cc.precool_target - 1)
 
         await self._async_set_hvac_cool(
             target,
-            f"pre-cool: forecast high {afternoon_high:.0f}°F",
+            f"pre-cool: actual outdoor {outdoor:.0f}°F",
         )
         self._precool_triggered_date = date.today()
         self._user_cool_setpoint = target

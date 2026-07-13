@@ -1,37 +1,47 @@
-"""Forecast + actual-temp HVAC mode orchestration for whole-house and zone timing."""
+"""Actual-temp HVAC mode orchestration with hourly and realtime threshold checks."""
 
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.number import NumberEntity, NumberMode, RestoreNumber
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import UnitOfTemperature
+from homeassistant.core import callback
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 
 from .const import DOMAIN
+
+OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
 
 if TYPE_CHECKING:
     from .outdoor_reset import OutdoorResetController
 
 _LOGGER = logging.getLogger(__name__)
 
+ORCHESTRATOR_INTERVAL = timedelta(hours=1)
+OUTDOOR_REALTIME_DEBOUNCE = timedelta(minutes=5)
+
 DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 20
 DEFAULT_PRECOOL_LEAD_MINUTES = 60
-DEFAULT_COOL_OFF_OUTDOOR_MARGIN = 3.0  # °F below max_outdoor before leaving cool
-DEFAULT_HEAT_ON_OUTDOOR_MARGIN = 2.0  # °F below shutdown before entering heat
-DEFAULT_FORECAST_HIGH_MARGIN = 2.0  # °F below precool threshold to skip cool day
-DEFAULT_FORECAST_LOW_HEAT_MARGIN = 5.0  # °F below shutdown triggers heat planning
-DEFAULT_ZONE_THERMAL_LAG = 20.0  # min/°F fallback per zone
+DEFAULT_COOL_OFF_OUTDOOR_MARGIN = 3.0
+DEFAULT_HEAT_ON_OUTDOOR_MARGIN = 2.0
+DEFAULT_INDOOR_COOL_MARGIN = 1.0
+DEFAULT_ZONE_THERMAL_LAG = 20.0
+MIN_VALID_HEAT_SETPOINT = 60.0
 
 
 class HvacOrchestratorParams:
-    """Runtime configuration for forecast-driven HVAC mode switching."""
+    """Runtime configuration for actual-temp HVAC mode switching."""
 
     def __init__(self) -> None:
         self.enabled: bool = DEFAULT_ORCHESTRATOR_ENABLED
@@ -41,13 +51,12 @@ class HvacOrchestratorParams:
         self.precool_lead_minutes: int = DEFAULT_PRECOOL_LEAD_MINUTES
         self.cool_off_outdoor_margin: float = DEFAULT_COOL_OFF_OUTDOOR_MARGIN
         self.heat_on_outdoor_margin: float = DEFAULT_HEAT_ON_OUTDOOR_MARGIN
-        self.forecast_high_margin: float = DEFAULT_FORECAST_HIGH_MARGIN
-        self.forecast_low_heat_margin: float = DEFAULT_FORECAST_LOW_HEAT_MARGIN
+        self.indoor_cool_margin: float = DEFAULT_INDOOR_COOL_MARGIN
         self.zone_thermal_lag: dict[str, float] = {}
 
 
 class HvacOrchestratorMixin:
-    """Mixin for OutdoorResetController — heat/cool/off from forecast + outdoor."""
+    """Mixin for OutdoorResetController — heat/cool/off from actual temps."""
 
     params: Any
     hass: Any
@@ -56,6 +65,12 @@ class HvacOrchestratorMixin:
     _orchestrator_last_reason: str
     _orchestrator_last_decision: str
     _orchestrator_saved_hvac: dict[str, Any] | None
+    _orchestrator_day_high: float | None
+    _orchestrator_day_date: date | None
+    _orchestrator_last_run: datetime | None
+    _orchestrator_last_outdoor_trigger: datetime | None
+    _unsub_orch_interval: Any
+    _unsub_orch_outdoor: Any
 
     def _orchestrator_params(self) -> HvacOrchestratorParams:
         return self.params.orchestrator
@@ -65,16 +80,121 @@ class HvacOrchestratorMixin:
         self._orchestrator_last_reason = "startup"
         self._orchestrator_last_decision = "none"
         self._orchestrator_saved_hvac = None
+        self._orchestrator_day_high = None
+        self._orchestrator_day_date = None
+        self._orchestrator_last_run = None
+        self._orchestrator_last_outdoor_trigger = None
+        self._unsub_orch_interval = None
+        self._unsub_orch_outdoor = None
+
+    async def _setup_hvac_orchestrator(self) -> None:
+        """Hourly mode review plus realtime outdoor threshold crossings."""
+        self._unsub_orch_interval = async_track_time_interval(
+            self.hass, self._async_orchestrator_hourly_tick, ORCHESTRATOR_INTERVAL
+        )
+        self._unsub_orch_outdoor = async_track_state_change_event(
+            self.hass,
+            [OUTDOOR_TEMP_ENTITY],
+            self._async_on_orchestrator_outdoor_change,
+        )
+        outdoor = self.outdoor_temp
+        if outdoor is not None:
+            self._orchestrator_update_day_high(outdoor)
+            self._record_outdoor_temp(outdoor)
+        await self._async_orchestrate_hvac_mode(force=True)
+
+    def _unload_hvac_orchestrator(self) -> None:
+        for attr in ("_unsub_orch_interval", "_unsub_orch_outdoor"):
+            unsub = getattr(self, attr, None)
+            if unsub:
+                unsub()
+                setattr(self, attr, None)
 
     def zone_thermal_lag(self, zone_name: str) -> float:
-        """Per-zone preheat lead multiplier (min per °F floor deficit)."""
         lag = self._orchestrator_params().zone_thermal_lag.get(zone_name)
         if lag is not None:
             return lag
         return self.params.thermal_lag
 
-    async def _async_orchestrate_hvac_mode(self) -> None:
-        """Choose heat/cool/off from forecast highs/lows and actual outdoor."""
+    def _orchestrator_update_day_high(self, outdoor: float | None) -> None:
+        if outdoor is None:
+            return
+        today = date.today()
+        if self._orchestrator_day_date != today:
+            self._orchestrator_day_date = today
+            self._orchestrator_day_high = outdoor
+        elif (
+            self._orchestrator_day_high is None
+            or outdoor > self._orchestrator_day_high
+        ):
+            self._orchestrator_day_high = outdoor
+
+    def _orchestrator_outdoor_trend(self) -> float | None:
+        """Return outdoor change rate in °F per minute (negative = cooling)."""
+        if len(self._temp_history) < 3:
+            return None
+        oldest_time, oldest_temp = self._temp_history[0]
+        newest_time, newest_temp = self._temp_history[-1]
+        minutes = (newest_time - oldest_time).total_seconds() / 60.0
+        if minutes < 10:
+            return None
+        return (newest_temp - oldest_temp) / minutes
+
+    def _outdoor_crossed_orchestrator_threshold(
+        self, old_temp: float | None, new_temp: float | None
+    ) -> bool:
+        if old_temp is None or new_temp is None:
+            return new_temp is not None
+        cc = self._cooling_params()
+        cool_limit = cc.max_outdoor_for_cooling
+        cool_off = cool_limit - self._orchestrator_params().cool_off_outdoor_margin
+        heat_on = self.params.shutdown - self._orchestrator_params().heat_on_outdoor_margin
+        shutdown = self.params.shutdown
+        thresholds = (cool_limit, cool_off, heat_on, shutdown)
+        for threshold in thresholds:
+            if (old_temp < threshold <= new_temp) or (old_temp >= threshold > new_temp):
+                return True
+        return abs(new_temp - old_temp) >= 2.0
+
+    @callback
+    def _async_on_orchestrator_outdoor_change(self, event) -> None:
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if new_state is None or new_state.state in ("unavailable", "unknown"):
+            return
+        try:
+            new_temp = float(new_state.state)
+        except (TypeError, ValueError):
+            return
+        old_temp = None
+        if old_state and old_state.state not in ("unavailable", "unknown"):
+            try:
+                old_temp = float(old_state.state)
+            except (TypeError, ValueError):
+                pass
+
+        self._orchestrator_update_day_high(new_temp)
+        self._record_outdoor_temp(new_temp)
+
+        now = datetime.now()
+        if self._orchestrator_last_outdoor_trigger is not None:
+            if now - self._orchestrator_last_outdoor_trigger < OUTDOOR_REALTIME_DEBOUNCE:
+                return
+        if not self._outdoor_crossed_orchestrator_threshold(old_temp, new_temp):
+            return
+
+        self._orchestrator_last_outdoor_trigger = now
+        self.hass.async_create_task(
+            self._async_orchestrate_hvac_mode(force=True, trigger="outdoor")
+        )
+
+    async def _async_orchestrator_hourly_tick(self, _now=None) -> None:
+        await self._async_orchestrate_hvac_mode(force=True, trigger="hourly")
+
+    async def _async_orchestrate_hvac_mode(
+        self, *, force: bool = False, trigger: str = "scheduled"
+    ) -> None:
+        """Choose heat/cool/off from actual outdoor and indoor temps."""
         if not self.enabled:
             return
         oc = self._orchestrator_params()
@@ -92,120 +212,133 @@ class HvacOrchestratorMixin:
 
         cc = self._cooling_params()
         outdoor = self.outdoor_temp
+        main = self.main_floor_temp
         now = datetime.now()
-        afternoon_high = await self._forecast_afternoon_high()
-        overnight_low = await self._forecast_overnight_low()
+        self._orchestrator_update_day_high(outdoor)
+        if outdoor is not None:
+            self._record_outdoor_temp(outdoor)
+
         cool_limit = cc.max_outdoor_for_cooling
         cool_off_limit = cool_limit - oc.cool_off_outdoor_margin
         heat_on_limit = self.params.shutdown - oc.heat_on_outdoor_margin
-        precool_needed_high = cc.precool_threshold - oc.forecast_high_margin
-        heat_needed_low = self.params.shutdown - oc.forecast_low_heat_margin
+        shutdown = self.params.shutdown
+        trend = self._orchestrator_outdoor_trend()
+        current_mode = state.state
 
         want_cool = False
         want_heat = False
         want_off = False
         reason = ""
-        current_mode = state.state
 
-        if outdoor is not None and afternoon_high is not None:
-            hot_day_expected = afternoon_high >= precool_needed_high
-            if (
-                outdoor >= cool_limit
-                and hot_day_expected
-                and now.hour < oc.evening_cool_cutoff_hour
-            ):
-                want_cool = True
-                reason = (
-                    f"outdoor {outdoor:.0f}°F >= {cool_limit:.0f}°F, "
-                    f"forecast high {afternoon_high:.0f}°F"
-                )
-            elif (
-                current_mode == "cool"
-                and self._orchestrator_active_mode == "cool"
-                and outdoor >= cool_off_limit
-                and hot_day_expected
-                and now.hour < oc.evening_cool_cutoff_hour
-            ):
-                want_cool = True
-                reason = f"holding cool (outdoor {outdoor:.0f}°F, high {afternoon_high:.0f}°F)"
-            elif (
-                current_mode == "cool"
-                and outdoor is not None
-                and outdoor < cool_off_limit
-                and not hot_day_expected
-            ):
-                want_off = True
-                reason = f"outdoor {outdoor:.0f}°F — no cooling needed today"
-            elif (
-                current_mode == "cool"
-                and outdoor is not None
-                and outdoor < cool_limit
-                and hot_day_expected
-                and now.hour < cc.precool_start_hour + 1
-            ):
-                want_off = True
-                reason = (
-                    f"waiting for afternoon heat (outdoor {outdoor:.0f}°F, "
-                    f"high {afternoon_high:.0f}°F expected)"
-                )
+        if outdoor is not None and outdoor >= cool_limit and now.hour < oc.evening_cool_cutoff_hour:
+            want_cool = True
+            reason = f"actual outdoor {outdoor:.0f}°F >= {cool_limit:.0f}°F"
+        elif (
+            self._orchestrator_active_mode == "cool"
+            and outdoor is not None
+            and outdoor >= cool_off_limit
+            and now.hour < oc.evening_cool_cutoff_hour
+        ):
+            want_cool = True
+            reason = f"holding cool (actual outdoor {outdoor:.0f}°F)"
 
-        if outdoor is not None and outdoor < heat_on_limit:
+        if (
+            not want_heat
+            and outdoor is not None
+            and outdoor < heat_on_limit
+        ):
             want_heat = True
             want_off = False
-            reason = f"outdoor {outdoor:.1f}°F < heat threshold {heat_on_limit:.1f}°F"
+            reason = f"actual outdoor {outdoor:.1f}°F < {heat_on_limit:.1f}°F"
+        elif (
+            self._orchestrator_active_mode == "heat"
+            and outdoor is not None
+            and outdoor < shutdown
+        ):
+            want_heat = True
+            reason = f"holding heat (actual outdoor {outdoor:.0f}°F < {shutdown:.0f}°F)"
         elif (
             not want_cool
-            and overnight_low is not None
-            and overnight_low < heat_needed_low
-            and now.hour >= oc.evening_cool_cutoff_hour - 2
             and outdoor is not None
-            and outdoor < self.params.shutdown + 5
+            and outdoor < shutdown + 3
+            and now.hour >= oc.evening_cool_cutoff_hour - 2
+            and trend is not None
+            and trend < -0.02
         ):
             want_heat = True
             want_off = False
             reason = (
-                f"evening preheat: forecast low {overnight_low:.0f}°F "
-                f"(outdoor {outdoor:.0f}°F)"
+                f"actual evening cool-down: outdoor {outdoor:.0f}°F "
+                f"(trend {trend:.2f}°F/min)"
             )
-        elif (
-            self._orchestrator_active_mode == "heat"
+
+        if (
+            not want_heat
+            and not want_cool
             and outdoor is not None
-            and outdoor < self.params.shutdown
+            and outdoor >= cool_limit
+            and main is not None
+            and main > oc.cool_setpoint + oc.indoor_cool_margin
         ):
-            want_heat = True
-            reason = f"holding heat until outdoor >= {self.params.shutdown:.0f}°F"
+            want_cool = True
+            reason = (
+                f"actual indoor {main:.0f}°F warm with outdoor {outdoor:.0f}°F"
+            )
 
         if want_cool and want_heat:
-            want_heat = False
-        if want_cool:
-            want_off = False
+            if outdoor is not None and outdoor >= cool_limit:
+                want_heat = False
+            else:
+                want_cool = False
+
+        if not want_cool and not want_heat:
+            if (
+                current_mode == "cool"
+                and outdoor is not None
+                and outdoor < cool_off_limit
+            ):
+                want_off = True
+                reason = (
+                    f"actual outdoor {outdoor:.0f}°F below cool release "
+                    f"{cool_off_limit:.0f}°F"
+                )
+            elif (
+                outdoor is not None
+                and shutdown <= outdoor < cool_off_limit
+                and (
+                    current_mode in ("cool", "heat")
+                    or self._orchestrator_active_mode in ("cool", "heat")
+                )
+            ):
+                want_off = True
+                reason = (
+                    f"mild actual outdoor {outdoor:.0f}°F "
+                    f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
+                )
+            elif (
+                now.hour >= oc.evening_cool_cutoff_hour
+                and self._orchestrator_active_mode == "cool"
+                and outdoor is not None
+                and outdoor < cool_limit
+            ):
+                want_off = True
+                reason = f"evening: actual outdoor {outdoor:.0f}°F below {cool_limit:.0f}°F"
 
         if want_cool:
             await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
         elif want_heat:
             await self._orchestrator_apply_heat(hvac_entity, oc, reason)
-        elif want_off or self._orchestrator_active_mode in ("cool", "heat"):
-            if want_off or (
-                self._orchestrator_active_mode is not None
-                and current_mode in ("cool", "heat")
-                and outdoor is not None
-                and cool_off_limit <= outdoor < cool_limit
-                and now.hour >= oc.evening_cool_cutoff_hour
-            ):
-                await self._orchestrator_apply_off(
-                    hvac_entity,
-                    reason or "mild conditions — no heat/cool needed",
-                )
-            else:
-                self._orchestrator_last_decision = "standby"
-                self._orchestrator_last_reason = (
-                    f"outdoor={outdoor}, high={afternoon_high}, low={overnight_low}"
-                )
+        elif want_off:
+            await self._orchestrator_apply_off(hvac_entity, reason)
         else:
             self._orchestrator_last_decision = "standby"
             self._orchestrator_last_reason = (
-                f"outdoor={outdoor}, high={afternoon_high}, low={overnight_low}"
+                f"actual outdoor={outdoor}, main={main}, "
+                f"day_high={self._orchestrator_day_high}, trend={trend}, "
+                f"trigger={trigger}"
             )
+
+        self._orchestrator_last_run = now
 
     async def _orchestrator_apply_cool(
         self, hvac_entity: str, oc: HvacOrchestratorParams, cc: Any, reason: str
@@ -214,7 +347,16 @@ class HvacOrchestratorMixin:
         cc.upstairs_bias_enabled = True
         state = self.hass.states.get(hvac_entity)
         current = state.state if state else None
-        target = cc.precool_target if self.precool_active_today else oc.cool_setpoint
+        outdoor = self.outdoor_temp
+        target = oc.cool_setpoint
+
+        now = datetime.now()
+        if (
+            cc.precool_start_hour <= now.hour < cc.precool_end_hour
+            and outdoor is not None
+            and outdoor >= cc.max_outdoor_for_cooling
+        ):
+            target = cc.precool_target
 
         if self._orchestrator_active_mode != "cool":
             self._orchestrator_save_hvac_state(state)
@@ -236,22 +378,9 @@ class HvacOrchestratorMixin:
         self._orchestrator_active_mode = "cool"
         self._orchestrator_last_decision = "cool"
         self._orchestrator_last_reason = reason
+        if target == cc.precool_target:
+            self._precool_triggered_date = date.today()
         _LOGGER.info("Orchestrator → COOL @ %.0f°F: %s", target, reason)
-
-        now = datetime.now()
-        cc_params = self._cooling_params()
-        if (
-            cc_params.precool_start_hour <= now.hour < cc_params.precool_end_hour
-            and not self.precool_active_today
-        ):
-            afternoon_high = await self._forecast_afternoon_high()
-            if afternoon_high and afternoon_high >= cc_params.precool_threshold:
-                await self._async_set_hvac_cool(
-                    cc_params.precool_target,
-                    f"orchestrator pre-cool: forecast high {afternoon_high:.0f}°F",
-                )
-                self._precool_triggered_date = date.today()
-                self._user_cool_setpoint = cc_params.precool_target
 
     async def _orchestrator_apply_heat(
         self, hvac_entity: str, oc: HvacOrchestratorParams, reason: str
@@ -269,12 +398,7 @@ class HvacOrchestratorMixin:
         current = state.state if state else None
         target = max(
             MIN_VALID_HEAT_SETPOINT,
-            round(
-                oc.heat_setpoint
-                if oc.heat_setpoint
-                else self.calculated_target,
-                0,
-            ),
+            round(oc.heat_setpoint or self.calculated_target, 0),
         )
 
         if self._orchestrator_active_mode != "heat":
@@ -332,43 +456,6 @@ class HvacOrchestratorMixin:
             "temperature": float(temp) if temp is not None else None,
         }
 
-    async def _forecast_overnight_low(self) -> float | None:
-        """Lowest forecast temp from now through 6 AM tomorrow."""
-        forecast_entities: list[str] = []
-        if self.params.forecast_entity_id:
-            forecast_entities.append(self.params.forecast_entity_id)
-        for st in self.hass.states.async_all("weather"):
-            if st.entity_id not in forecast_entities:
-                forecast_entities.append(st.entity_id)
-
-        from datetime import timedelta
-
-        now = datetime.now()
-        end = now + timedelta(hours=18)
-        best: float | None = None
-
-        for entity_id in forecast_entities:
-            forecast = await self._fetch_hourly_forecast_list(entity_id)
-            if not forecast:
-                continue
-            for entry in forecast:
-                fc_time_str = entry.get("datetime")
-                fc_temp = entry.get("temperature")
-                if fc_time_str is None or fc_temp is None:
-                    continue
-                try:
-                    fc_temp_f = float(fc_temp)
-                    fc_time = datetime.fromisoformat(
-                        fc_time_str.replace("Z", "+00:00")
-                    ).replace(tzinfo=None)
-                except (ValueError, TypeError):
-                    continue
-                if fc_time < now or fc_time > end:
-                    continue
-                if best is None or fc_temp_f < best:
-                    best = fc_temp_f
-        return best
-
     def orchestrator_status(self) -> dict[str, Any]:
         oc = self._orchestrator_params()
         return {
@@ -376,14 +463,22 @@ class HvacOrchestratorMixin:
             "active_mode": self._orchestrator_active_mode,
             "last_decision": self._orchestrator_last_decision,
             "last_reason": self._orchestrator_last_reason,
+            "decision_source": "actual",
             "heat_setpoint": oc.heat_setpoint,
             "cool_setpoint": oc.cool_setpoint,
-            "precool_lead_minutes": oc.precool_lead_minutes,
+            "actual_day_high": self._orchestrator_day_high,
+            "outdoor_trend_f_per_min": self._orchestrator_outdoor_trend(),
+            "last_run": (
+                self._orchestrator_last_run.isoformat()
+                if self._orchestrator_last_run
+                else None
+            ),
+            "next_hourly_check": (
+                (self._orchestrator_last_run + ORCHESTRATOR_INTERVAL).isoformat()
+                if self._orchestrator_last_run
+                else None
+            ),
         }
-
-
-# Import after mixin to avoid circular import at module level in outdoor_reset
-MIN_VALID_HEAT_SETPOINT = 60.0
 
 
 def get_orchestrator_switch_entities(coordinator, controller: OutdoorResetController) -> list:
@@ -428,7 +523,7 @@ class HvacOrchestratorEnableSwitch(SwitchEntity):
             "identifiers": {(DOMAIN, "hvac_orchestrator")},
             "name": "SensorLinx HVAC Orchestrator",
             "manufacturer": "HBX Controls",
-            "model": "Forecast Mode Control",
+            "model": "Actual-Temp Mode Control",
         }
 
     @property
@@ -438,7 +533,7 @@ class HvacOrchestratorEnableSwitch(SwitchEntity):
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._controller.params.orchestrator.enabled = True
         self.async_write_ha_state()
-        await self._controller._async_orchestrate_hvac_mode()
+        await self._controller._async_orchestrate_hvac_mode(force=True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.orchestrator.enabled = False
@@ -467,7 +562,7 @@ class OrchestratorHeatSetpointNumber(RestoreNumber):
             "identifiers": {(DOMAIN, "hvac_orchestrator")},
             "name": "SensorLinx HVAC Orchestrator",
             "manufacturer": "HBX Controls",
-            "model": "Forecast Mode Control",
+            "model": "Actual-Temp Mode Control",
         }
 
     async def async_added_to_hass(self) -> None:
@@ -509,7 +604,7 @@ class OrchestratorCoolSetpointNumber(RestoreNumber):
             "identifiers": {(DOMAIN, "hvac_orchestrator")},
             "name": "SensorLinx HVAC Orchestrator",
             "manufacturer": "HBX Controls",
-            "model": "Forecast Mode Control",
+            "model": "Actual-Temp Mode Control",
         }
 
     async def async_added_to_hass(self) -> None:
@@ -551,7 +646,7 @@ class OrchestratorPrecoolLeadNumber(RestoreNumber):
             "identifiers": {(DOMAIN, "hvac_orchestrator")},
             "name": "SensorLinx HVAC Orchestrator",
             "manufacturer": "HBX Controls",
-            "model": "Forecast Mode Control",
+            "model": "Actual-Temp Mode Control",
         }
 
     async def async_added_to_hass(self) -> None:
@@ -575,8 +670,6 @@ class OrchestratorPrecoolLeadNumber(RestoreNumber):
 
 
 class ZoneThermalLagNumberEntity(RestoreNumber):
-    """Per-zone preheat lead time multiplier (minutes per °F floor deficit)."""
-
     _attr_has_entity_name = True
     _attr_native_unit_of_measurement = "min/°F"
     _attr_mode = NumberMode.BOX
@@ -648,7 +741,7 @@ class HvacOrchestratorStatusSensor(SensorEntity):
             "identifiers": {(DOMAIN, "hvac_orchestrator")},
             "name": "SensorLinx HVAC Orchestrator",
             "manufacturer": "HBX Controls",
-            "model": "Forecast Mode Control",
+            "model": "Actual-Temp Mode Control",
         }
 
     @property
@@ -662,6 +755,7 @@ class HvacOrchestratorStatusSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         attrs = dict(self._controller.orchestrator_status())
         attrs["outdoor_temp"] = self._controller.outdoor_temp
+        attrs["main_floor_temp"] = self._controller.main_floor_temp
         attrs["outdoor_allows_cooling"] = self._controller._outdoor_allows_cooling()
         attrs["preheat_active"] = self._controller.preheat_active
         attrs["precool_triggered_today"] = self._controller.precool_active_today
