@@ -898,6 +898,12 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             minutes_from_forecast = await self._check_forecast_for_shutdown()
             if minutes_from_forecast is not None:
                 return minutes_from_forecast
+        elif getattr(self, "_daily_plan", None) and self._daily_plan.planned_heat_at:
+            plan = self._daily_plan
+            if plan.cold_night_planned and plan.planned_heat_at:
+                minutes = (plan.planned_heat_at - datetime.now()).total_seconds() / 60.0
+                if minutes > 0:
+                    return minutes
 
         return self._estimate_minutes_to_shutdown_trend(outdoor)
 

@@ -588,7 +588,14 @@ class CoolingControlMixin:
         if self.params.orchestrator.enabled:
             if outdoor < cc.max_outdoor_for_cooling:
                 return
+            plan = getattr(self, "_daily_plan", None)
+            plan_note = (
+                f" (plan: peak {plan.forecast_high:.0f}°F)"
+                if plan and plan.forecast_high
+                else ""
+            )
         else:
+            plan_note = ""
             if outdoor < cc.precool_threshold - 8:
                 return
             afternoon_high = await self._forecast_afternoon_high()
@@ -603,7 +610,7 @@ class CoolingControlMixin:
 
         await self._async_set_hvac_cool(
             target,
-            f"pre-cool: actual outdoor {outdoor:.0f}°F",
+            f"pre-cool: actual outdoor {outdoor:.0f}°F{plan_note}",
         )
         self._precool_triggered_date = date.today()
         self._user_cool_setpoint = target
@@ -653,8 +660,11 @@ class CoolingControlMixin:
                 blocking=True,
                 return_response=True,
             )
-            if response and entity_id in response:
-                return response[entity_id].get("forecast", []) or []
+            payload = response
+            if isinstance(response, dict) and "response" in response:
+                payload = response["response"]
+            if payload and entity_id in payload:
+                return payload[entity_id].get("forecast", []) or []
         except Exception as exc:
             _LOGGER.debug("Forecast service failed for %s: %s", entity_id, exc)
 
