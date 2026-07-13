@@ -809,8 +809,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             return False
 
         try:
-            if entity_id.startswith("climate."):
-                current = float(state.attributes.get("temperature", 0))
+            if entity_id.startswith("climate.") or entity_id.startswith("water_heater."):
+                current = float(state.attributes.get("temperature", 0) or 0)
             else:
                 current = float(state.state)
         except (ValueError, TypeError):
@@ -2257,7 +2257,27 @@ class SupplyWaterControlSwitch(SwitchEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         self._controller.params.supply_control_enabled = True
+        if not self._controller.params.supply_entity_id:
+            # Default to the house tankless water heater if not configured.
+            entity_id = "water_heater.main_water_heater"
+            self._controller.params.supply_entity_id = entity_id
+            if self._controller._entry_id:
+                live_entry = self.hass.config_entries.async_get_entry(
+                    self._controller._entry_id
+                )
+                if live_entry is not None:
+                    new_options = dict(live_entry.options)
+                    new_options["supply_entity_id"] = entity_id
+                    self.hass.data.setdefault(DOMAIN, {})[
+                        f"{self._controller._entry_id}_skip_reload"
+                    ] = True
+                    self.hass.config_entries.async_update_entry(
+                        live_entry, options=new_options
+                    )
         self.async_write_ha_state()
+        outdoor = self._controller.outdoor_temp
+        if outdoor is not None:
+            await self._controller._apply_supply_water_temp(outdoor)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.supply_control_enabled = False
