@@ -21,8 +21,14 @@ BASE = "http://172.16.255.250:8123"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ.Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
 headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-ZONES = ["laundry", "living_room", "main_area", "main_office"]
-ZONE_LABELS = {"laundry": "Laundry", "living_room": "Living Room", "main_area": "Main Area", "main_office": "Main Office"}
+ZONES = ["laundry", "living_room", "main_area", "main_office", "primary_bath"]
+ZONE_LABELS = {
+    "laundry": "Laundry",
+    "living_room": "Living Room",
+    "main_area": "Main Area",
+    "main_office": "Main Office",
+    "primary_bath": "Primary Bath",
+}
 
 SUPPLY_ENTITIES = {
     "min_temp": "number.sensorlinx_outdoor_reset_supply_water_min_temp_mild",
@@ -39,10 +45,12 @@ IDEAL_DELTA_T = (10.0, 20.0)
 TANKLESS_MAX_TEMP = 140.0
 ZONE_FLOOR_TYPE = {
     "laundry": "tile",
+    "primary_bath": "tile",
     "living_room": "wood",
     "main_area": "wood",
     "main_office": "wood",
 }
+SCHEDULE_MANAGED_ZONES = frozenset({"primary_bath"})
 DEFAULT_WOOD_FLOOR_MAX = 80.0
 DEFAULT_TILE_FLOOR_MAX = 88.0
 DEFAULT_ZONE_FLOOR_SENSOR_BIAS = {"living_room": -5.0}
@@ -946,7 +954,8 @@ def main(apply_supply=False):
         else:
             grade = "Needs attention"
 
-        print(f"  {ZONE_LABELS[z]:<14} {score:<8} {current_room:<10} {target_str:<9} {heat_pct:<8} {grade} - {reason}")
+        schedule_note = " (Watts schedule)" if z in SCHEDULE_MANAGED_ZONES else ""
+        print(f"  {ZONE_LABELS[z]:<14} {score:<8} {current_room:<10} {target_str:<9} {heat_pct:<8} {grade} - {reason}{schedule_note}")
 
     overall = sum(zone_scores.values()) / len(zone_scores) if zone_scores else 0
     print()

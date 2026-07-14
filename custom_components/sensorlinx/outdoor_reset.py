@@ -61,6 +61,12 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
+from .heating_zones import (
+    DEFAULT_EXTERNAL_ZONES,
+    HeatingZone,
+    get_heating_zones,
+    zone_for_key,
+)
 from .helpers import thm_device_info, zon_device_info
 
 _LOGGER = logging.getLogger(__name__)
@@ -74,7 +80,7 @@ DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
 DEFAULT_FLOOR_MAX = 80.0  # wood floor safety cap
 DEFAULT_TILE_FLOOR_MAX = 88.0  # tile zones (e.g. laundry) may run hotter
-TILE_FLOOR_ZONES = frozenset({"laundry"})
+TILE_FLOOR_ZONES = frozenset({"laundry", "primary_bath"})
 DEFAULT_FLOOR_TARGET = 70.0
 
 
@@ -269,10 +275,29 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         return round(raw_floor_temp + self.floor_sensor_bias(zone_name), 1)
 
     def _is_floor_mode_zone(self, zone_name: str) -> bool:
+        zone = zone_for_key(zone_name, self.coordinator, self.params.external_zones)
+        if zone is not None and zone.direct_floor_thermostat:
+            return True
         return bool(self.params.floor_control_enabled.get(zone_name, False))
+
+    def get_heating_zones(self) -> list[HeatingZone]:
+        """All THM and external zones available in Home Assistant."""
+        return get_heating_zones(
+            self.hass, self.coordinator, self.params.external_zones
+        )
+
+    def is_schedule_managed_zone(self, zone_name: str) -> bool:
+        """Zones whose setpoints are owned by an on-device schedule (e.g. Watts Home)."""
+        zone = zone_for_key(zone_name, self.coordinator, self.params.external_zones)
+        if zone is not None and zone.schedule_managed:
+            return True
+        return bool(self.params.schedule_managed_zones.get(zone_name, False))
 
     async def _ensure_zone_ready_for_heat(self, zone_name: str) -> None:
         """Clear THM away mode so commanded setpoints can call for heat."""
+        zone = zone_for_key(zone_name, self.coordinator, self.params.external_zones)
+        if zone is not None and zone.direct_floor_thermostat:
+            return
         away_entity = f"switch.{zone_name}_away_mode"
         state = self.hass.states.get(away_entity)
         if state is not None and state.state == "on":
@@ -301,6 +326,26 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
 
     def _read_zone_floor_temp(self, zone_name: str) -> float | None:
         """Read raw floor sensor from HA."""
+        zone = zone_for_key(zone_name, self.coordinator, self.params.external_zones)
+        if zone is not None and zone.direct_floor_thermostat:
+            climate_state = self.hass.states.get(zone.climate_entity_id)
+            if climate_state is not None:
+                current = climate_state.attributes.get("current_temperature")
+                if current is not None:
+                    try:
+                        return float(current)
+                    except (TypeError, ValueError):
+                        pass
+            for sensor_id in (zone.floor_temp_sensor, zone.room_temp_sensor):
+                if not sensor_id:
+                    continue
+                state = self.hass.states.get(sensor_id)
+                if state and state.state not in ("unavailable", "unknown"):
+                    try:
+                        return float(state.state)
+                    except (ValueError, TypeError):
+                        pass
+            return None
         floor_state = self.hass.states.get(f"sensor.{zone_name}_floor_temperature")
         if floor_state and floor_state.state not in ("unavailable", "unknown"):
             try:
@@ -420,7 +465,27 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         elif old_state and old_state.state == "cool":
             _LOGGER.info("HVAC left cool mode — resuming outdoor reset")
             await self._on_hvac_left_cool_mode()
+            await self._async_restore_schedule_managed_zones()
             await self._apply_setpoints()
+
+    async def _async_restore_schedule_managed_zones(self) -> None:
+        """Re-arm Watts Home schedules after cool suppression (heat mode only, no setpoint)."""
+        for zone in self.get_heating_zones():
+            if not self.is_schedule_managed_zone(zone.zone_key):
+                continue
+            state = self.hass.states.get(zone.climate_entity_id)
+            if state is None or state.state not in ("off",):
+                continue
+            await self.hass.services.async_call(
+                "climate",
+                "set_hvac_mode",
+                {"entity_id": zone.climate_entity_id, "hvac_mode": "heat"},
+                blocking=True,
+            )
+            _LOGGER.info(
+                "Schedule-managed %s: restored heat mode (Watts Home schedule owns setpoint)",
+                zone.zone_key,
+            )
 
     async def _async_update(self, _now=None) -> None:
         """Apply setpoints to all THM zones."""
@@ -460,9 +525,32 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 outdoor, self.params.shutdown,
             )
 
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            entity_id = f"climate.{zone_name}_{zone_name}"
+        for zone in self.get_heating_zones():
+            zone_name = zone.zone_key
+            entity_id = zone.climate_entity_id
+            schedule_managed = self.is_schedule_managed_zone(zone_name)
+
+            # Schedule-managed zones (Watts Home): monitor only, don't override setpoints/WWSD
+            if schedule_managed:
+                raw_floor_temp = self._read_zone_floor_temp(zone_name)
+                floor_temp = self.effective_floor_temp(zone_name, raw_floor_temp)
+                zone_cap = self.zone_floor_max(zone_name)
+                if floor_temp is not None and floor_temp >= zone_cap:
+                    _LOGGER.warning(
+                        "Schedule-managed %s: floor %.1f°F >= max %.1f°F, safety off",
+                        zone_name, floor_temp, zone_cap,
+                    )
+                    await self.hass.services.async_call(
+                        "climate", "turn_off",
+                        {"entity_id": entity_id},
+                        blocking=True,
+                    )
+                else:
+                    _LOGGER.debug(
+                        "Schedule-managed %s: Watts Home schedule controls setpoints",
+                        zone_name,
+                    )
+                continue
 
             # Per-zone shutdown with deadband hysteresis to prevent cycling
             zone_shutdown = self.is_zone_shutdown(zone_name, outdoor) and not self._preheat_active
@@ -506,30 +594,16 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 )
                 continue
 
-            # Determine setpoint based on control mode
-            floor_mode = self.params.floor_control_enabled.get(zone_name, False)
-
-            if self.params.night_setback.active:
-                zone_target = self._zone_night_target(
-                    zone_name, floor_mode, floor_temp, outdoor
-                )
-            elif floor_mode:
-                # Floor control mode: dynamic floor target based on outdoor temp
-                base_floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
-                floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
-                zone_target = self._compute_floor_mode_setpoint(
-                    floor_temp, floor_target, zone_name
-                )
-            else:
-                # Room control mode: use outdoor reset curve + offset
-                offset = self.params.zone_offsets.get(zone_name, 0.0)
-                zone_target = self.zone_target(offset)
+            zone_target = self._resolve_zone_target(
+                zone, zone_name, floor_temp, outdoor
+            )
 
             climate_state = self.hass.states.get(entity_id)
             if not self._climate_needs_setpoint_update(climate_state, zone_target):
                 _LOGGER.debug("Skipping %s - already at %.1f°F", zone_name, zone_target)
                 continue
 
+            floor_mode = self._is_floor_mode_zone(zone_name)
             _LOGGER.debug(
                 "Setting %s to %.1f°F (mode=%s, outdoor=%.1f)",
                 zone_name, zone_target, "floor" if floor_mode else "room", outdoor,
@@ -540,6 +614,43 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 {"entity_id": entity_id, "temperature": zone_target, "hvac_mode": "heat"},
                 blocking=True,
             )
+
+    def _resolve_zone_target(
+        self,
+        zone: HeatingZone,
+        zone_name: str,
+        floor_temp: float | None,
+        outdoor: float,
+    ) -> float:
+        """Compute commanded setpoint for a zone from curve, floor mode, or night setback."""
+        floor_mode = self._is_floor_mode_zone(zone_name)
+
+        if self.params.night_setback.active:
+            return self._zone_night_target(zone_name, floor_mode, floor_temp, outdoor, zone)
+
+        if floor_mode:
+            base_floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+            floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
+            if zone.direct_floor_thermostat:
+                return self._compute_direct_floor_setpoint(
+                    floor_temp, floor_target, zone_name
+                )
+            return self._compute_floor_mode_setpoint(
+                floor_temp, floor_target, zone_name
+            )
+
+        offset = self.params.zone_offsets.get(zone_name, 0.0)
+        return self.zone_target(offset)
+
+    def planned_zone_target(self, zone: HeatingZone) -> float | None:
+        """Reference target from the heating curve (not applied for schedule-managed zones)."""
+        outdoor = self.outdoor_temp
+        if outdoor is None:
+            return None
+        floor_temp = self.effective_floor_temp(
+            zone.zone_key, self._read_zone_floor_temp(zone.zone_key)
+        )
+        return self._resolve_zone_target(zone, zone.zone_key, floor_temp, outdoor)
 
     def _dynamic_floor_target(self, base_target: float, outdoor: float) -> float:
         """Compute dynamic floor target: base in mild weather, base+boost in cold.
@@ -587,16 +698,30 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         cap = self.zone_floor_max(zone_name)
         return round(max(65.0, min(setpoint, cap - 2)), 1)
 
+    def _compute_direct_floor_setpoint(
+        self, floor_temp: float | None, floor_target: float, zone_name: str
+    ) -> float:
+        """Setpoint for direct floor thermostats (e.g. Watts Home Sunstat)."""
+        cap = self.zone_floor_max(zone_name)
+        if floor_temp is None:
+            return round(min(floor_target + 2.0, cap), 1)
+
+        error = floor_target - floor_temp
+        if error > 1.0:
+            setpoint = min(floor_target + 3.0, cap)
+        elif error < -1.0:
+            setpoint = max(floor_target - 2.0, 65.0)
+        else:
+            setpoint = floor_target
+        return round(max(65.0, min(setpoint, cap)), 1)
+
     @property
     def supply_boost_active(self) -> bool:
         """Whether supply water fast heat-up boost is active."""
         return self._supply_boost_active
 
     def _zone_climate_entities(self) -> list[str]:
-        return [
-            f"climate.{thm.name.lower().replace(' ', '_')}_{thm.name.lower().replace(' ', '_')}"
-            for thm in self.coordinator.get_thm_devices()
-        ]
+        return [zone.climate_entity_id for zone in self.get_heating_zones()]
 
     def _climate_is_heating(self, state) -> bool:
         if state is None or state.state in ("unavailable", "unknown"):
@@ -1049,8 +1174,10 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
     def _compute_preheat_lead_time(self) -> float:
         """Minutes before shutdown needed — worst case across zones."""
         lead_minutes = 0.0
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
+        for zone in self.get_heating_zones():
+            zone_name = zone.zone_key
+            if self.is_schedule_managed_zone(zone_name):
+                continue
             raw_floor = self._read_zone_floor_temp(zone_name)
             floor_temp = self.effective_floor_temp(zone_name, raw_floor)
             deficit = 0.0
@@ -1192,9 +1319,9 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 return None
             return round(WATER_BTU_FACTOR * actual_flow * dt, 0)
         total_flow = 0.0
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            entity_id = f"climate.{zone_name}_{zone_name}"
+        for zone in self.get_heating_zones():
+            zone_name = zone.zone_key
+            entity_id = zone.climate_entity_id
             state = self.hass.states.get(entity_id)
             if state and state.state == "heat":
                 total_flow += self.zone_flow_rate(zone_name)
@@ -1241,6 +1368,8 @@ class OutdoorResetParams:
         self.night_setback: NightSetbackParams = NightSetbackParams()
         self.cooling_control: CoolingControlParams = CoolingControlParams()
         self.orchestrator: HvacOrchestratorParams = HvacOrchestratorParams()
+        self.external_zones: tuple[HeatingZone, ...] = DEFAULT_EXTERNAL_ZONES
+        self.schedule_managed_zones: dict[str, bool] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1330,6 +1459,21 @@ async def async_setup_outdoor_reset(
                 pass
 
     controller = OutdoorResetController(hass, coordinator, params, entry.entry_id)
+
+    for zone in params.external_zones:
+        if hass.states.get(zone.climate_entity_id) is None:
+            continue
+        if zone.schedule_managed:
+            params.schedule_managed_zones[zone.zone_key] = True
+        elif zone.direct_floor_thermostat:
+            params.floor_control_enabled.setdefault(zone.zone_key, True)
+        if not zone.schedule_managed:
+            params.floor_targets.setdefault(zone.zone_key, DEFAULT_FLOOR_TARGET)
+        if zone.zone_key in TILE_FLOOR_ZONES:
+            params.zone_floor_max.setdefault(
+                zone.zone_key, default_zone_floor_max(zone.zone_key, params.floor_max)
+            )
+
     await controller.async_setup()
 
     # Register services for configuring external entity links
@@ -1514,6 +1658,39 @@ def get_number_entities(
             )
         )
 
+    for zone in controller.get_heating_zones():
+        if not zone.direct_floor_thermostat:
+            continue
+        zone_name = zone.zone_key
+        zone_cap = default_zone_floor_max(zone_name, controller.params.floor_max)
+        cap_slider_max = 95 if zone_name in TILE_FLOOR_ZONES else 85
+        common = [
+            OutdoorResetZoneFloorMaxEntity(
+                coordinator, controller, zone_name,
+                f"Floor Max (Safety): {zone.label}", zone_cap, 70, cap_slider_max, 1,
+                None, entry_id,
+            ),
+            OutdoorResetZoneFloorBiasEntity(
+                coordinator, controller, zone_name,
+                f"Floor Sensor Bias: {zone.label}", 0.0, -15, 5, 0.5,
+                None, entry_id,
+            ),
+        ]
+        if zone.schedule_managed:
+            entities.extend(common)
+            continue
+        entities.extend(common + [
+            OutdoorResetFloorTargetEntity(
+                coordinator, controller, zone_name,
+                f"Floor Target: {zone.label}", DEFAULT_FLOOR_TARGET, 65, zone_cap, 0.5,
+                None, entry_id,
+            ),
+            ZoneShutdownTempEntity(
+                coordinator, controller, zone_name,
+                f"WWSD Shutdown: {zone.label}", None, entry_id,
+            ),
+        ])
+
     return entities
 
 
@@ -1538,6 +1715,13 @@ def get_sensor_entities(
                 coordinator, controller, zone_name, f"Target: {thm.name}",
             )
         )
+    for zone in controller.get_heating_zones():
+        if zone.direct_floor_thermostat:
+            entities.append(
+                OutdoorResetZoneTargetSensor(
+                    coordinator, controller, zone.zone_key, f"Target: {zone.label}",
+                )
+            )
     # WWSD sensor reads raw device data from ZON and THM devices
     for zon in coordinator.get_zon_devices():
         entities.append(WwsdDeviceSensor(coordinator, controller, zon))
@@ -1996,13 +2180,37 @@ class OutdoorResetZoneTargetSensor(SensorEntity):
 
     @property
     def native_value(self) -> float:
+        if self._controller._is_floor_mode_zone(self._zone_key):
+            base = self._controller.params.floor_targets.get(
+                self._zone_key, DEFAULT_FLOOR_TARGET
+            )
+            outdoor = self._controller.outdoor_temp
+            if outdoor is not None:
+                return self._controller._dynamic_floor_target(base, outdoor)
+            return base
         offset = self._controller.params.zone_offsets.get(self._zone_key, 0.0)
         return self._controller.zone_target(offset)
 
-
-# ---------------------------------------------------------------------------
-# Switch entity for enable/disable
-# ---------------------------------------------------------------------------
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        attrs: dict[str, Any] = {}
+        if self._controller.is_schedule_managed_zone(self._zone_key):
+            attrs["schedule_managed"] = True
+            attrs["setpoint_owner"] = "watts_home"
+            attrs["planned_reference"] = self.native_value
+            zone = zone_for_key(
+                self._zone_key,
+                self._controller.coordinator,
+                self._controller.params.external_zones,
+            )
+            if zone is not None:
+                state = self.hass.states.get(zone.climate_entity_id)
+                if state is not None:
+                    attrs["device_mode"] = state.state
+                    attrs["device_setpoint"] = state.attributes.get("temperature")
+                    attrs["device_action"] = state.attributes.get("hvac_action")
+                    attrs["device_temperature"] = state.attributes.get("current_temperature")
+        return attrs
 
 class OutdoorResetEnableSwitch(SwitchEntity):
     """Enable or disable the outdoor reset system."""
@@ -2663,8 +2871,8 @@ class HydronicBtuSensor(SensorEntity):
             "actual_flow_gpm": actual_flow,
             "flow_rate_per_valve_gpm": self._controller.params.flow_rate_per_valve,
         }
-        for thm in self._coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
+        for zone in self._controller.get_heating_zones():
+            zone_name = zone.zone_key
             valves = self._controller.params.zone_valve_counts.get(zone_name, DEFAULT_VALVE_COUNT)
             flow = self._controller.zone_flow_rate(zone_name)
             btu = self._controller.zone_btu_output(zone_name)

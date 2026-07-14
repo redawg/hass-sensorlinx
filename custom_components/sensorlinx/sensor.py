@@ -289,5 +289,5 @@ class ThermalLogStatusSensor(SensorEntity):
             "log_path": path,
             "sample_interval_minutes": 5,
             "log_size_kb": size_kb,
-            "zones_per_sample": len(self._logger.coordinator.get_thm_devices()),
+            "zones_per_sample": len(self._logger.controller.get_heating_zones()),
         }

@@ -21,8 +21,14 @@ BASE = "http://172.16.255.250:8123"
 TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJlNDM2OWE2YTVmYjk0ODIzOTFmNDA3OTdiM2NiZmFiYyIsImlhdCI6MTc3ODU0NzMyNCwiZXhwIjoyMDkzOTA3MzI0fQ.Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
 headers = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
-ZONES = ["laundry", "living_room", "main_area", "main_office"]
-ZONE_LABELS = {"laundry": "Laundry", "living_room": "Living Room", "main_area": "Main Area", "main_office": "Main Office"}
+ZONES = ["laundry", "living_room", "main_area", "main_office", "primary_bath"]
+ZONE_LABELS = {
+    "laundry": "Laundry",
+    "living_room": "Living Room",
+    "main_area": "Main Area",
+    "main_office": "Main Office",
+    "primary_bath": "Primary Bath",
+}
 
 SUPPLY_ENTITIES = {
     "min_temp": "number.sensorlinx_outdoor_reset_supply_water_min_temp_mild",

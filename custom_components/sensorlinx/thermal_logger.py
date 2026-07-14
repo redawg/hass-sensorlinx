@@ -35,6 +35,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
 
 from .coordinator import SensorlinxCoordinator
+from .heating_zones import HeatingZone
 from .outdoor_reset import OutdoorResetController, OUTDOOR_TEMP_ENTITY
 
 _LOGGER = logging.getLogger(__name__)
@@ -119,10 +120,8 @@ class ThermalDataLogger:
         if wh_state and wh_state.state == "on":
             return True
         # Check zone demand
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            entity_id = f"climate.{zone_name}_{zone_name}"
-            state = self.hass.states.get(entity_id)
+        for zone in self.controller.get_heating_zones():
+            state = self.hass.states.get(zone.climate_entity_id)
             if state and state.attributes.get("hvac_action") == "heating":
                 return True
         return False
@@ -168,9 +167,8 @@ class ThermalDataLogger:
         )
         # Build list of entities to watch for heating activity
         watch_entities = [TANKLESS_HEATING_ENTITY]
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            watch_entities.append(f"climate.{zone_name}_{zone_name}")
+        for zone in self.controller.get_heating_zones():
+            watch_entities.append(zone.climate_entity_id)
 
         self._unsub_state_listener = async_track_state_change_event(
             self.hass,
@@ -204,29 +202,64 @@ class ThermalDataLogger:
         tankless_data = self._get_tankless_state()
 
         samples = []
-        for thm in self.coordinator.get_thm_devices():
-            zone_name = thm.name.lower().replace(" ", "_")
-            raw = thm.raw
+        for zone in self.controller.get_heating_zones():
+            sample = self._build_zone_sample(zone, timestamp, outdoor_temp, params, ecobee_data, tankless_data)
+            if sample is not None:
+                samples.append(sample)
 
-            room_temp = self._extract_room_temp(raw)
-            floor_temp = self._extract_floor_temp(raw, zone_name)
-            hvac_mode = self._extract_hvac_mode(raw)
-            hvac_action = self._extract_hvac_action(raw)
+        await self.hass.async_add_executor_job(self._write_samples, samples)
+
+    def _build_zone_sample(
+        self,
+        zone: HeatingZone,
+        timestamp: str,
+        outdoor_temp: float | None,
+        params: Any,
+        ecobee_data: dict[str, Any],
+        tankless_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        zone_name = zone.zone_key
+        if zone.direct_floor_thermostat:
+            climate_state = self.hass.states.get(zone.climate_entity_id)
+            if climate_state is None:
+                return None
+            attrs = climate_state.attributes
+            schedule_managed = self.controller.is_schedule_managed_zone(zone_name)
+            room_temp = None
+            if zone.room_temp_sensor:
+                room_state = self.hass.states.get(zone.room_temp_sensor)
+                if room_state and room_state.state not in ("unavailable", "unknown"):
+                    try:
+                        room_temp = float(room_state.state)
+                    except (ValueError, TypeError):
+                        pass
+            if room_temp is None and attrs.get("current_temperature") is not None:
+                try:
+                    room_temp = float(attrs["current_temperature"])
+                except (TypeError, ValueError):
+                    pass
+            floor_temp = self._extract_floor_temp_for_zone(zone_name, zone)
+            hvac_mode = climate_state.state
+            hvac_action = attrs.get("hvac_action")
             offset = params.zone_offsets.get(zone_name, 0.0)
-            target = self.controller.zone_target(offset)
-
-            # Get the actual commanded setpoint on the device
-            target_block = raw.get("target", {})
-            commanded = float(target_block.get("value", 0)) if isinstance(target_block, dict) else None
-
-            sample = {
+            target = self.controller.planned_zone_target(zone)
+            commanded = attrs.get("temperature")
+            if commanded is not None:
+                try:
+                    commanded = float(commanded)
+                except (TypeError, ValueError):
+                    commanded = None
+            return {
                 "ts": timestamp,
                 "sample_mode": "fast" if self._fast_mode else "normal",
                 "outdoor_temp": outdoor_temp,
                 "zone": zone_name,
+                "zone_source": "watts_home",
+                "schedule_managed": schedule_managed,
                 "room_temp": room_temp,
                 "floor_temp": floor_temp,
                 "curve_target": target,
+                "planned_reference": target,
                 "commanded_setpoint": commanded,
                 "hvac_mode": hvac_mode,
                 "hvac_action": hvac_action,
@@ -240,9 +273,49 @@ class ThermalDataLogger:
                 **ecobee_data,
                 **tankless_data,
             }
-            samples.append(sample)
 
-        await self.hass.async_add_executor_job(self._write_samples, samples)
+        thm = next(
+            (t for t in self.coordinator.get_thm_devices()
+             if t.name.lower().replace(" ", "_") == zone_name),
+            None,
+        )
+        if thm is None:
+            return None
+        raw = thm.raw
+
+        room_temp = self._extract_room_temp(raw)
+        floor_temp = self._extract_floor_temp(raw, zone_name)
+        hvac_mode = self._extract_hvac_mode(raw)
+        hvac_action = self._extract_hvac_action(raw)
+        offset = params.zone_offsets.get(zone_name, 0.0)
+        target = self.controller.zone_target(offset)
+
+        # Get the actual commanded setpoint on the device
+        target_block = raw.get("target", {})
+        commanded = float(target_block.get("value", 0)) if isinstance(target_block, dict) else None
+
+        return {
+            "ts": timestamp,
+            "sample_mode": "fast" if self._fast_mode else "normal",
+            "outdoor_temp": outdoor_temp,
+            "zone": zone_name,
+            "zone_source": "sensorlinx_thm",
+            "room_temp": room_temp,
+            "floor_temp": floor_temp,
+            "curve_target": target,
+            "commanded_setpoint": commanded,
+            "hvac_mode": hvac_mode,
+            "hvac_action": hvac_action,
+            "base": params.base,
+            "overshoot": params.overshoot,
+            "shutdown": params.shutdown,
+            "design_outdoor": params.design_outdoor,
+            "floor_max": params.floor_max,
+            "zone_offset": offset,
+            "enabled": params.enabled,
+            **ecobee_data,
+            **tankless_data,
+        }
 
     def _write_samples(self, samples: list[dict[str, Any]]) -> None:
         """Write samples to JSONL file (runs in executor)."""
@@ -377,6 +450,15 @@ class ThermalDataLogger:
             return float(block["value"])
         rm = raw.get("rm") or raw.get("rmT")
         return float(rm) if rm is not None else None
+
+    def _extract_floor_temp_for_zone(
+        self, zone_name: str, zone: HeatingZone
+    ) -> float | None:
+        """Floor temperature for external (Watts Home) zones."""
+        raw_floor = self.controller._read_zone_floor_temp(zone_name)
+        if raw_floor is None:
+            return None
+        return self.controller.effective_floor_temp(zone_name, raw_floor)
 
     def _extract_floor_temp(self, raw: dict, zone_name: str) -> float | None:
         """Extract floor temp — try raw data first, then HA entity."""

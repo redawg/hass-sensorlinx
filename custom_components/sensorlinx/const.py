@@ -19,6 +19,10 @@ DEFAULT_MAIN_FLOOR_TEMP_SENSOR = "sensor.main_floor_current_temperature"
 DEFAULT_HUNTER_FAN = "fan.hunters_main_2"
 DEFAULT_SIDNEY_FAN = "fan.sindey_main_2"
 
+# Watts Home / external floor thermostats (not on SensorLinx THM API)
+DEFAULT_PRIMARY_BATH_CLIMATE = "climate.primary_bathroom_primary_bath_floor"
+DEFAULT_PRIMARY_BATH_ROOM_SENSOR = "sensor.ba_temperature"
+
 CONF_COOLING_PAUSED_UNTIL = "cooling_paused_until"
 CONF_COOLING_PAUSE_REASON = "cooling_pause_reason"
 DEFAULT_SCAN_INTERVAL = 60

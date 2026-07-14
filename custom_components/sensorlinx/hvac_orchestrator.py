@@ -791,6 +791,14 @@ def get_orchestrator_number_entities(coordinator, controller: OutdoorResetContro
                 coordinator, controller, zone_name, thm.name, default_lag
             )
         )
+    for zone in controller.get_heating_zones():
+        if zone.direct_floor_thermostat:
+            default_lag = controller.zone_thermal_lag(zone.zone_key)
+            entities.append(
+                ZoneThermalLagNumberEntity(
+                    coordinator, controller, zone.zone_key, zone.label, default_lag
+                )
+            )
     return entities
 
 

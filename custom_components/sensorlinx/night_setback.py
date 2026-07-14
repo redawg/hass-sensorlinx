@@ -148,6 +148,7 @@ class NightSetbackMixin:
         floor_mode: bool,
         floor_temp: float | None,
         outdoor: float,
+        zone: Any = None,
     ) -> float:
         """Compute setpoint for a zone while night setback is active."""
         ns = self._night_params()
@@ -155,6 +156,10 @@ class NightSetbackMixin:
             floor_target = ns.night_floor_targets.get(
                 zone_name, DEFAULT_NIGHT_FLOOR_TARGETS.get(zone_name, 70.0)
             )
+            if zone is not None and zone.direct_floor_thermostat:
+                return self._compute_direct_floor_setpoint(
+                    floor_temp, floor_target, zone_name
+                )
             return self._compute_floor_mode_setpoint(floor_temp, floor_target, zone_name)
         return ns.night_room_targets.get(
             zone_name, DEFAULT_NIGHT_ROOM_TARGETS.get(zone_name, 68.0)
