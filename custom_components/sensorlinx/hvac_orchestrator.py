@@ -328,9 +328,6 @@ class HvacOrchestratorMixin:
             self._orchestrator_mark_skip("orchestrator disabled")
             return
 
-        cooling_paused = bool(self.is_cooling_paused)
-        pause_reason = getattr(self, "_cooling_pause_reason", None) or "cooling pause"
-
         await self._async_refresh_daily_plan(force=(trigger in ("hourly", "startup", "startup_retry") or trigger.startswith("watchdog") or force))
         plan = self._daily_plan
 
@@ -352,8 +349,7 @@ class HvacOrchestratorMixin:
             self._record_outdoor_temp(outdoor)
 
         self._adjust_plan_for_actuals(plan, outdoor, now)
-        if not cooling_paused:
-            self._arm_plan_cooling_features(plan, now)
+        self._arm_plan_cooling_features(plan, now)
 
         cool_limit = cc.max_outdoor_for_cooling
         cool_off_limit = cool_limit - oc.cool_off_outdoor_margin
@@ -480,29 +476,6 @@ class HvacOrchestratorMixin:
             ):
                 want_off = True
                 reason = f"evening: actual outdoor {outdoor:.0f}°F below {cool_limit:.0f}°F"
-
-        # Cooling pause must NOT block heat/off — only suppress cool commands.
-        # Evening heat / cold outdoor clears the pause so recovery is automatic.
-        if cooling_paused and (want_heat or want_off):
-            _LOGGER.info(
-                "Clearing cooling pause for %s (was: %s)",
-                "heat" if want_heat else "off",
-                pause_reason,
-            )
-            await self._clear_cooling_pause()
-            cooling_paused = False
-        elif cooling_paused and want_cool:
-            self._orchestrator_mark_skip(
-                f"cool deferred — {pause_reason}",
-                decision="paused",
-            )
-            return
-        elif cooling_paused and not want_heat and not want_cool and not want_off:
-            self._orchestrator_mark_skip(
-                f"standby during {pause_reason}",
-                decision="paused",
-            )
-            return
 
         if want_cool:
             await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
@@ -722,181 +695,6 @@ class HvacOrchestratorMixin:
             )
         return note
 
-    async def _async_orchestrate_hvac_mode(
-        self, *, force: bool = False, trigger: str = "scheduled"
-    ) -> None:
-        """Execute from actual temps; day plan sets expectations and arms pre-cool."""
-        if not self.enabled:
-            return
-        oc = self._orchestrator_params()
-        if not oc.enabled:
-            return
-        if self.is_cooling_paused:
-            return
-
-        await self._async_refresh_daily_plan(force=(trigger == "hourly"))
-        plan = self._daily_plan
-
-        hvac_entity = self.params.main_hvac_climate_entity_id
-        if not hvac_entity:
-            return
-        state = self.hass.states.get(hvac_entity)
-        if state is None or state.state in ("unavailable", "unknown"):
-            return
-
-        cc = self._cooling_params()
-        outdoor = self.outdoor_temp
-        main = self.main_floor_temp
-        now = datetime.now()
-        self._orchestrator_update_day_high(outdoor)
-        if outdoor is not None:
-            self._record_outdoor_temp(outdoor)
-
-        self._adjust_plan_for_actuals(plan, outdoor, now)
-        self._arm_plan_cooling_features(plan, now)
-
-        cool_limit = cc.max_outdoor_for_cooling
-        cool_off_limit = cool_limit - oc.cool_off_outdoor_margin
-        heat_on_limit = self.params.shutdown - oc.heat_on_outdoor_margin
-        shutdown = self.params.shutdown
-        trend = self._orchestrator_outdoor_trend()
-        current_mode = state.state
-
-        want_cool = False
-        want_heat = False
-        want_off = False
-        reason = ""
-
-        # --- Actual-temp execution (always wins over plan) ---
-        if outdoor is not None and outdoor >= cool_limit and now.hour < oc.evening_cool_cutoff_hour:
-            want_cool = True
-            reason = f"actual outdoor {outdoor:.0f}°F >= {cool_limit:.0f}°F"
-        elif (
-            self._orchestrator_active_mode == "cool"
-            and outdoor is not None
-            and outdoor >= cool_off_limit
-            and now.hour < oc.evening_cool_cutoff_hour
-        ):
-            want_cool = True
-            reason = f"holding cool (actual outdoor {outdoor:.0f}°F)"
-
-        if (
-            not want_heat
-            and outdoor is not None
-            and outdoor < heat_on_limit
-        ):
-            want_heat = True
-            want_off = False
-            reason = f"actual outdoor {outdoor:.1f}°F < {heat_on_limit:.1f}°F"
-        elif (
-            self._orchestrator_active_mode == "heat"
-            and outdoor is not None
-            and outdoor < shutdown
-        ):
-            want_heat = True
-            reason = f"holding heat (actual outdoor {outdoor:.0f}°F < {shutdown:.0f}°F)"
-        elif (
-            not want_cool
-            and outdoor is not None
-            and outdoor < shutdown + 3
-            and now.hour >= oc.evening_cool_cutoff_hour - 2
-            and trend is not None
-            and trend < -0.02
-        ):
-            want_heat = True
-            want_off = False
-            reason = (
-                f"actual evening cool-down: outdoor {outdoor:.0f}°F "
-                f"(trend {trend:.2f}°F/min)"
-            )
-
-        # Plan-informed heat when forecast cold night and actual outdoor is dropping
-        if (
-            not want_cool
-            and not want_heat
-            and plan
-            and plan.cold_night_planned
-            and plan.planned_heat_at
-            and now >= plan.planned_heat_at
-            and outdoor is not None
-            and outdoor < shutdown + 5
-            and (trend is None or trend <= 0)
-        ):
-            want_heat = True
-            want_off = False
-            reason = (
-                f"plan + actual: cold night (forecast low {plan.forecast_low:.0f}°F, "
-                f"outdoor {outdoor:.0f}°F)"
-            )
-
-        if (
-            not want_heat
-            and not want_cool
-            and outdoor is not None
-            and outdoor >= cool_limit
-            and main is not None
-            and main > oc.cool_setpoint + oc.indoor_cool_margin
-        ):
-            want_cool = True
-            reason = (
-                f"actual indoor {main:.0f}°F warm with outdoor {outdoor:.0f}°F"
-            )
-
-        if want_cool and want_heat:
-            if outdoor is not None and outdoor >= cool_limit:
-                want_heat = False
-            else:
-                want_cool = False
-
-        if not want_cool and not want_heat:
-            if (
-                current_mode == "cool"
-                and outdoor is not None
-                and outdoor < cool_off_limit
-            ):
-                want_off = True
-                reason = (
-                    f"actual outdoor {outdoor:.0f}°F below cool release "
-                    f"{cool_off_limit:.0f}°F"
-                )
-            elif (
-                outdoor is not None
-                and shutdown <= outdoor < cool_off_limit
-                and (
-                    current_mode in ("cool", "heat")
-                    or self._orchestrator_active_mode in ("cool", "heat")
-                )
-            ):
-                want_off = True
-                reason = (
-                    f"mild actual outdoor {outdoor:.0f}°F "
-                    f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
-                )
-            elif (
-                now.hour >= oc.evening_cool_cutoff_hour
-                and self._orchestrator_active_mode == "cool"
-                and outdoor is not None
-                and outdoor < cool_limit
-            ):
-                want_off = True
-                reason = f"evening: actual outdoor {outdoor:.0f}°F below {cool_limit:.0f}°F"
-
-        if want_cool:
-            await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
-        elif want_heat:
-            await self._orchestrator_apply_heat(hvac_entity, oc, reason)
-        elif want_off:
-            await self._orchestrator_apply_off(hvac_entity, reason)
-        else:
-            self._orchestrator_last_decision = "planned" if plan and plan.hot_day_planned else "standby"
-            self._orchestrator_last_reason = (
-                f"plan: {self._plan_standby_note(plan, outdoor)} | "
-                f"actual outdoor={outdoor}, main={main}, "
-                f"day_high={self._orchestrator_day_high}, trigger={trigger}"
-            )
-
-        self._orchestrator_last_run = now
-
     def daily_plan_dict(self) -> dict[str, Any]:
         """Serialize today's plan for status sensors."""
         plan = self._daily_plan
@@ -1053,6 +851,7 @@ class HvacOrchestratorMixin:
             "outdoor_trend_f_per_min": self._orchestrator_outdoor_trend(),
             "cooling_paused": bool(self.is_cooling_paused),
             "cooling_pause_reason": getattr(self, "_cooling_pause_reason", None),
+            "manual_fans_held": sorted(getattr(self, "_manual_fan_entities", set())),
             "last_error": self._orchestrator_last_error,
             "consecutive_failures": self._orchestrator_consecutive_failures,
             "last_run": (

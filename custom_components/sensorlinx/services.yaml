@@ -49,10 +49,11 @@ run_hvac_orchestrator:
     and today's forecast plan. Use after reloads or if status is stuck.
 
 clear_cooling_pause:
-  name: Clear Cooling Pause
+  name: Clear Manual Fan Hold
   description: >-
-    Resume cooling automations after a manual bedroom-fan pause, then re-run
-    the HVAC orchestrator (allows evening heat handoff).
+    Release bedroom fans held after manual use so automation may control them
+    again, then re-run the HVAC orchestrator. HVAC/cooling never stop for a
+    manual fan — only fan override is blocked.
 
 set_hydronic_sensors:
   name: Set Hydronic Loop Sensors

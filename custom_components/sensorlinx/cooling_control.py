@@ -39,7 +39,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 COOL_CHECK_INTERVAL = timedelta(minutes=15)
-MANUAL_FAN_PAUSE_HOURS = 48
+MANUAL_FAN_HOLD_HOURS = 48  # keep fan ownership until manual off or timeout
+# Legacy alias
+MANUAL_FAN_PAUSE_HOURS = MANUAL_FAN_HOLD_HOURS
 
 DEFAULT_PRECOOL_ENABLED = True
 DEFAULT_UPSTAIRS_BIAS_ENABLED = True
@@ -107,6 +109,7 @@ class CoolingControlMixin:
     _precool_triggered_date: date | None
     _last_cool_adjustment: float
     _cooling_fans_active: set[str]
+    _manual_fan_entities: set[str]
     _entry_id: str | None
     _cooling_paused_until: datetime | None
     _cooling_pause_reason: str | None
@@ -127,6 +130,7 @@ class CoolingControlMixin:
         self._precool_triggered_date = None
         self._last_cool_adjustment = 0.0
         self._cooling_fans_active = set()
+        self._manual_fan_entities = set()
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
         self._programmatic_fan_change = False
@@ -188,12 +192,20 @@ class CoolingControlMixin:
 
     @property
     def is_cooling_paused(self) -> bool:
-        """True while cooling automations are suspended after manual fan use."""
+        """True while bedroom fans are under manual control (do not override them).
+
+        HVAC mode, pre-cool, upstairs bias, and furnace circulation still run.
+        """
+        if self._manual_fan_entities:
+            return True
         if self._cooling_paused_until is None:
             return False
         if dt_util.now() >= self._cooling_paused_until:
             return False
         return True
+
+    def is_fan_manually_held(self, entity_id: str) -> bool:
+        return entity_id in getattr(self, "_manual_fan_entities", set())
 
     def _restore_cooling_pause_from_options(self) -> None:
         if not self._entry_id:
@@ -250,32 +262,40 @@ class CoolingControlMixin:
         )
 
     async def _clear_cooling_pause(self) -> None:
-        if self._cooling_paused_until is None and not self.is_cooling_paused:
+        if (
+            self._cooling_paused_until is None
+            and not self._manual_fan_entities
+            and not self.is_cooling_paused
+        ):
             return
-        _LOGGER.info("Cooling automations resumed after manual-fan pause")
+        _LOGGER.info("Manual bedroom-fan hold cleared — automation may control fans again")
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
+        self._manual_fan_entities.clear()
         if self._unsub_cooling_pause:
             self._unsub_cooling_pause()
             self._unsub_cooling_pause = None
         await self._persist_cooling_pause()
 
     async def _pause_cooling_for_manual_fan(self, entity_id: str) -> None:
-        until = dt_util.now() + timedelta(hours=MANUAL_FAN_PAUSE_HOURS)
+        """Protect a manually operated bedroom fan — do not stop HVAC/cooling logic."""
+        until = dt_util.now() + timedelta(hours=MANUAL_FAN_HOLD_HOURS)
         self._cooling_paused_until = until
+        self._manual_fan_entities.add(entity_id)
+        # Relinquish automation ownership so we never turn this fan off.
+        self._cooling_fans_active.discard(entity_id)
         friendly = self.hass.states.get(entity_id)
         name = (
             friendly.attributes.get("friendly_name", entity_id)
             if friendly
             else entity_id
         )
-        self._cooling_pause_reason = f"Manual fan on: {name}"
+        self._cooling_pause_reason = f"Manual fan hold: {name}"
         _LOGGER.info(
-            "Cooling automations paused until %s (%s)",
+            "Bedroom fan hold until %s (%s) — HVAC/cooling continue; fan not overridden",
             until.strftime("%Y-%m-%d %H:%M"),
             self._cooling_pause_reason,
         )
-        await self._release_cooling_automation_state()
         await self._persist_cooling_pause()
         self._schedule_cooling_pause_end()
 
@@ -295,18 +315,32 @@ class CoolingControlMixin:
         self.hass.async_create_task(self._async_handle_bedroom_fan_change(event))
 
     async def _async_handle_bedroom_fan_change(self, event) -> None:
-        if self.is_cooling_paused:
-            return
         new_state = event.data.get("new_state")
         old_state = event.data.get("old_state")
         entity_id = event.data.get("entity_id")
         if new_state is None or not entity_id:
             return
+        if self._programmatic_fan_change:
+            return
+
+        # Manual off of a held fan → release that fan for automation again.
+        if (
+            entity_id in self._manual_fan_entities
+            and new_state.state == "off"
+            and old_state is not None
+            and old_state.state == "on"
+        ):
+            self._manual_fan_entities.discard(entity_id)
+            _LOGGER.info("Manual hold released for %s (fan turned off)", entity_id)
+            if not self._manual_fan_entities:
+                await self._clear_cooling_pause()
+            return
+
         if new_state.state != "on":
             return
         if old_state is None or old_state.state in ("unavailable", "unknown", "on"):
             return
-        if entity_id in self._cooling_fans_active or self._programmatic_fan_change:
+        if entity_id in self._cooling_fans_active:
             return
         await self._pause_cooling_for_manual_fan(entity_id)
 
@@ -366,8 +400,7 @@ class CoolingControlMixin:
             return
         if self._cooling_paused_until and not self.is_cooling_paused:
             await self._clear_cooling_pause()
-        if self.is_cooling_paused:
-            return
+        # Manual bedroom-fan hold does NOT skip HVAC/cooling — only fan ownership.
         await self._async_enforce_outdoor_cooling_limit()
         await self._check_precool()
         await self._apply_upstairs_cool_bias()
@@ -561,8 +594,6 @@ class CoolingControlMixin:
 
     async def _check_precool(self) -> None:
         """Start cool mode when actual outdoor temp supports pre-cool."""
-        if self.is_cooling_paused:
-            return
         if not self._outdoor_allows_cooling():
             return
         cc = self._cooling_params()
@@ -678,8 +709,6 @@ class CoolingControlMixin:
 
     async def _apply_upstairs_cool_bias(self) -> None:
         """Lower cool setpoint when upstairs runs warmer than main floor."""
-        if self.is_cooling_paused:
-            return
         if not self._outdoor_allows_cooling():
             return
         cc = self._cooling_params()
@@ -798,12 +827,11 @@ class CoolingControlMixin:
         )
 
     async def _sync_smart_fan_circulation(self) -> None:
-        """Run fans only when estimated energy benefit exceeds cost."""
-        if self.is_cooling_paused:
-            await self._async_turn_off_cooling_fans()
-            await self._async_stop_furnace_circulation_fan()
-            return
+        """Run fans only when estimated energy benefit exceeds cost.
 
+        Manually held bedroom fans are never turned on/off by this path.
+        Furnace circulation and Ecobee fan mode still follow ROI.
+        """
         cc = self._cooling_params()
         if not cc.smart_fan_circulation_enabled:
             return
@@ -816,6 +844,7 @@ class CoolingControlMixin:
             "cost_usd_per_hr": cost_hr,
             "benefit_usd_per_hr": benefit_hr,
             "gap": gap,
+            "manual_fans_held": sorted(self._manual_fan_entities),
         }
 
         if not worth:
@@ -920,6 +949,9 @@ class CoolingControlMixin:
         cc = self._cooling_params()
         speed = cc.bedroom_fan_speed
         for entity_id in cc.upstairs_fan_entities:
+            if entity_id in self._manual_fan_entities:
+                _LOGGER.debug("Skipping manually held fan %s", entity_id)
+                continue
             if entity_id in self._cooling_fans_active:
                 continue
             state = self.hass.states.get(entity_id)
@@ -948,17 +980,25 @@ class CoolingControlMixin:
         if not self._cooling_fans_active:
             return
         for entity_id in list(self._cooling_fans_active):
+            if entity_id in self._manual_fan_entities:
+                self._cooling_fans_active.discard(entity_id)
+                continue
             state = self.hass.states.get(entity_id)
             if state is None or state.state in ("unavailable", "unknown"):
+                self._cooling_fans_active.discard(entity_id)
                 continue
             _LOGGER.info("Cooling assist: %s → off (stratification resolved)", entity_id)
-            await self.hass.services.async_call(
-                "fan",
-                "turn_off",
-                {"entity_id": entity_id},
-                blocking=True,
-            )
-        self._cooling_fans_active.clear()
+            self._programmatic_fan_change = True
+            try:
+                await self.hass.services.async_call(
+                    "fan",
+                    "turn_off",
+                    {"entity_id": entity_id},
+                    blocking=True,
+                )
+            finally:
+                self._programmatic_fan_change = False
+                self._cooling_fans_active.discard(entity_id)
 
 
 def get_cooling_control_number_entities(
@@ -1386,8 +1426,10 @@ class CoolingControlStatusSensor(SensorEntity):
 
     @property
     def native_value(self) -> str:
+        if self._controller._manual_fan_entities:
+            return "manual_fan_hold"
         if self._controller.is_cooling_paused:
-            return "paused"
+            return "manual_fan_hold"
         cc = self._controller.params.cooling_control
         if (
             not cc.precool_enabled
@@ -1413,14 +1455,16 @@ class CoolingControlStatusSensor(SensorEntity):
         hvac = self._controller.params.main_hvac_climate_entity_id
         state = self._controller.hass.states.get(hvac) if hvac else None
         if state and state.state == "cool":
-            return "cooling"
-        return "standby"
+            return "cool"
+        return "idle"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         cc = self._controller.params.cooling_control
         return {
             "cooling_paused": self._controller.is_cooling_paused,
+            "manual_fan_hold": bool(self._controller._manual_fan_entities),
+            "manual_fans_held": sorted(self._controller._manual_fan_entities),
             "cooling_paused_until": (
                 self._controller._cooling_paused_until.isoformat()
                 if self._controller._cooling_paused_until
