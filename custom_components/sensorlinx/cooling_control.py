@@ -166,6 +166,9 @@ class CoolingControlMixin:
         @callback
         def _startup_resync(_now) -> None:
             self.hass.async_create_task(self._async_cooling_control_tick())
+            self.hass.async_create_task(
+                self._async_orchestrate_hvac_mode(force=True, trigger="startup_resync")
+            )
 
         async_call_later(self.hass, 45, _startup_resync)
 

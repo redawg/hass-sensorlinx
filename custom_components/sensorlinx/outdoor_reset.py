@@ -1547,6 +1547,22 @@ async def async_setup_outdoor_reset(
     hass.services.async_register(DOMAIN, "apply_night_setback", handle_apply_night_setback)
     hass.services.async_register(DOMAIN, "restore_day_setback", handle_restore_day_setback)
 
+    async def handle_run_hvac_orchestrator(_call):
+        await controller._async_orchestrate_hvac_mode(force=True, trigger="service")
+
+    async def handle_clear_cooling_pause(_call):
+        await controller._clear_cooling_pause()
+        await controller._async_orchestrate_hvac_mode(
+            force=True, trigger="clear_cooling_pause"
+        )
+
+    hass.services.async_register(
+        DOMAIN, "run_hvac_orchestrator", handle_run_hvac_orchestrator
+    )
+    hass.services.async_register(
+        DOMAIN, "clear_cooling_pause", handle_clear_cooling_pause
+    )
+
     return controller
 
 

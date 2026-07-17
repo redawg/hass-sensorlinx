@@ -12,7 +12,9 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import callback
+from homeassistant.core import callback
 from homeassistant.helpers.event import (
+    async_call_later,
     async_track_state_change_event,
     async_track_time_interval,
 )
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 ORCHESTRATOR_INTERVAL = timedelta(hours=1)
+ORCHESTRATOR_WATCHDOG_INTERVAL = timedelta(minutes=15)
+ORCHESTRATOR_STALE_AFTER = timedelta(minutes=75)
+ORCHESTRATOR_STARTUP_RETRY = timedelta(seconds=60)
 OUTDOOR_REALTIME_DEBOUNCE = timedelta(minutes=5)
 PLAN_ACTUAL_DIVERGENCE = 6.0  # °F — cancel hot-day plan if actual peak lags forecast
 
@@ -100,9 +105,13 @@ class HvacOrchestratorMixin:
     _orchestrator_day_date: date | None
     _orchestrator_last_run: datetime | None
     _orchestrator_last_outdoor_trigger: datetime | None
+    _orchestrator_last_error: str | None
+    _orchestrator_consecutive_failures: int
     _daily_plan: DailyHvacPlan | None
     _unsub_orch_interval: Any
     _unsub_orch_outdoor: Any
+    _unsub_orch_watchdog: Any
+    _unsub_orch_startup_retry: Any
 
     def _orchestrator_params(self) -> HvacOrchestratorParams:
         return self.params.orchestrator
@@ -116,9 +125,20 @@ class HvacOrchestratorMixin:
         self._orchestrator_day_date = None
         self._orchestrator_last_run = None
         self._orchestrator_last_outdoor_trigger = None
+        self._orchestrator_last_error = None
+        self._orchestrator_consecutive_failures = 0
         self._daily_plan = None
         self._unsub_orch_interval = None
         self._unsub_orch_outdoor = None
+        self._unsub_orch_watchdog = None
+        self._unsub_orch_startup_retry = None
+
+    def _orchestrator_mark_skip(self, reason: str, *, decision: str = "skipped") -> None:
+        """Record why orchestration did not apply a mode (never leave stuck at startup)."""
+        self._orchestrator_last_decision = decision
+        self._orchestrator_last_reason = reason
+        self._orchestrator_last_run = datetime.now()
+        _LOGGER.debug("Orchestrator skipped: %s", reason)
 
     async def _setup_hvac_orchestrator(self) -> None:
         """Hourly mode review plus realtime outdoor threshold crossings."""
@@ -130,15 +150,33 @@ class HvacOrchestratorMixin:
             [OUTDOOR_TEMP_ENTITY],
             self._async_on_orchestrator_outdoor_change,
         )
+        self._unsub_orch_watchdog = async_track_time_interval(
+            self.hass, self._async_orchestrator_watchdog, ORCHESTRATOR_WATCHDOG_INTERVAL
+        )
         outdoor = self.outdoor_temp
         if outdoor is not None:
             self._orchestrator_update_day_high(outdoor)
             self._record_outdoor_temp(outdoor)
         await self._async_refresh_daily_plan(force=True)
-        await self._async_orchestrate_hvac_mode(force=True)
+        await self._async_orchestrate_hvac_mode(force=True, trigger="startup")
+
+        @callback
+        def _startup_retry(_now) -> None:
+            self.hass.async_create_task(
+                self._async_orchestrate_hvac_mode(force=True, trigger="startup_retry")
+            )
+
+        self._unsub_orch_startup_retry = async_call_later(
+            self.hass, ORCHESTRATOR_STARTUP_RETRY.total_seconds(), _startup_retry
+        )
 
     def _unload_hvac_orchestrator(self) -> None:
-        for attr in ("_unsub_orch_interval", "_unsub_orch_outdoor"):
+        for attr in (
+            "_unsub_orch_interval",
+            "_unsub_orch_outdoor",
+            "_unsub_orch_watchdog",
+            "_unsub_orch_startup_retry",
+        ):
             unsub = getattr(self, attr, None)
             if unsub:
                 unsub()
@@ -225,6 +263,262 @@ class HvacOrchestratorMixin:
     async def _async_orchestrator_hourly_tick(self, _now=None) -> None:
         await self._async_refresh_daily_plan(force=True)
         await self._async_orchestrate_hvac_mode(force=True, trigger="hourly")
+
+    async def _async_orchestrator_watchdog(self, _now=None) -> None:
+        """Recover if orchestration stalled after startup, crash, or cooling pause."""
+        oc = self._orchestrator_params()
+        if not self.enabled or not oc.enabled:
+            return
+
+        now = datetime.now()
+        last_run = self._orchestrator_last_run
+        stuck_startup = (
+            last_run is None
+            and self._orchestrator_last_decision in ("none", "skipped")
+            and self._orchestrator_last_reason.startswith("startup")
+        )
+        stale = last_run is not None and (now - last_run) > ORCHESTRATOR_STALE_AFTER
+        failed = self._orchestrator_consecutive_failures >= 2
+
+        if not (stuck_startup or stale or failed):
+            return
+
+        why = (
+            "stuck at startup"
+            if stuck_startup
+            else (
+                f"stale ({int((now - last_run).total_seconds() / 60)} min)"
+                if stale and last_run
+                else f"{self._orchestrator_consecutive_failures} consecutive failures"
+            )
+        )
+        _LOGGER.warning("Orchestrator watchdog recovery: %s", why)
+        await self._async_orchestrate_hvac_mode(force=True, trigger=f"watchdog:{why}")
+
+    async def _async_orchestrate_hvac_mode(
+        self, *, force: bool = False, trigger: str = "scheduled"
+    ) -> None:
+        """Execute from actual temps; day plan sets expectations and arms pre-cool."""
+        try:
+            await self._async_orchestrate_hvac_mode_safe(force=force, trigger=trigger)
+            self._orchestrator_last_error = None
+            self._orchestrator_consecutive_failures = 0
+        except Exception as err:  # noqa: BLE001 — must never leave orchestrator dead
+            self._orchestrator_consecutive_failures += 1
+            self._orchestrator_last_error = f"{type(err).__name__}: {err}"
+            self._orchestrator_mark_skip(
+                f"error on {trigger}: {self._orchestrator_last_error}",
+                decision="error",
+            )
+            _LOGGER.exception(
+                "Orchestrator failed (%s consecutive): %s",
+                self._orchestrator_consecutive_failures,
+                err,
+            )
+
+    async def _async_orchestrate_hvac_mode_safe(
+        self, *, force: bool = False, trigger: str = "scheduled"
+    ) -> None:
+        """Core orchestration — exceptions bubble to the protected wrapper."""
+        if not self.enabled:
+            self._orchestrator_mark_skip("outdoor reset disabled")
+            return
+        oc = self._orchestrator_params()
+        if not oc.enabled:
+            self._orchestrator_mark_skip("orchestrator disabled")
+            return
+
+        cooling_paused = bool(self.is_cooling_paused)
+        pause_reason = getattr(self, "_cooling_pause_reason", None) or "cooling pause"
+
+        await self._async_refresh_daily_plan(force=(trigger in ("hourly", "startup", "startup_retry") or trigger.startswith("watchdog") or force))
+        plan = self._daily_plan
+
+        hvac_entity = self.params.main_hvac_climate_entity_id
+        if not hvac_entity:
+            self._orchestrator_mark_skip("no main HVAC climate entity configured")
+            return
+        state = self.hass.states.get(hvac_entity)
+        if state is None or state.state in ("unavailable", "unknown"):
+            self._orchestrator_mark_skip(f"HVAC entity unavailable: {hvac_entity}")
+            return
+
+        cc = self._cooling_params()
+        outdoor = self.outdoor_temp
+        main = self.main_floor_temp
+        now = datetime.now()
+        self._orchestrator_update_day_high(outdoor)
+        if outdoor is not None:
+            self._record_outdoor_temp(outdoor)
+
+        self._adjust_plan_for_actuals(plan, outdoor, now)
+        if not cooling_paused:
+            self._arm_plan_cooling_features(plan, now)
+
+        cool_limit = cc.max_outdoor_for_cooling
+        cool_off_limit = cool_limit - oc.cool_off_outdoor_margin
+        heat_on_limit = self.params.shutdown - oc.heat_on_outdoor_margin
+        shutdown = self.params.shutdown
+        trend = self._orchestrator_outdoor_trend()
+        current_mode = state.state
+
+        want_cool = False
+        want_heat = False
+        want_off = False
+        reason = ""
+
+        # --- Actual-temp execution (always wins over plan) ---
+        if outdoor is not None and outdoor >= cool_limit and now.hour < oc.evening_cool_cutoff_hour:
+            want_cool = True
+            reason = f"actual outdoor {outdoor:.0f}°F >= {cool_limit:.0f}°F"
+        elif (
+            self._orchestrator_active_mode == "cool"
+            and outdoor is not None
+            and outdoor >= cool_off_limit
+            and now.hour < oc.evening_cool_cutoff_hour
+        ):
+            want_cool = True
+            reason = f"holding cool (actual outdoor {outdoor:.0f}°F)"
+
+        if (
+            not want_heat
+            and outdoor is not None
+            and outdoor < heat_on_limit
+        ):
+            want_heat = True
+            want_off = False
+            reason = f"actual outdoor {outdoor:.1f}°F < {heat_on_limit:.1f}°F"
+        elif (
+            self._orchestrator_active_mode == "heat"
+            and outdoor is not None
+            and outdoor < shutdown
+        ):
+            want_heat = True
+            reason = f"holding heat (actual outdoor {outdoor:.0f}°F < {shutdown:.0f}°F)"
+        elif (
+            not want_cool
+            and outdoor is not None
+            and outdoor < shutdown + 3
+            and now.hour >= oc.evening_cool_cutoff_hour - 2
+            and trend is not None
+            and trend < -0.02
+        ):
+            want_heat = True
+            want_off = False
+            reason = (
+                f"actual evening cool-down: outdoor {outdoor:.0f}°F "
+                f"(trend {trend:.2f}°F/min)"
+            )
+
+        # Plan-informed heat when forecast cold night and actual outdoor is dropping
+        if (
+            not want_cool
+            and not want_heat
+            and plan
+            and plan.cold_night_planned
+            and plan.planned_heat_at
+            and now >= plan.planned_heat_at
+            and outdoor is not None
+            and outdoor < shutdown + 5
+            and (trend is None or trend <= 0)
+        ):
+            want_heat = True
+            want_off = False
+            reason = (
+                f"plan + actual: cold night (forecast low {plan.forecast_low:.0f}°F, "
+                f"outdoor {outdoor:.0f}°F)"
+            )
+
+        if (
+            not want_heat
+            and not want_cool
+            and outdoor is not None
+            and outdoor >= cool_limit
+            and main is not None
+            and main > oc.cool_setpoint + oc.indoor_cool_margin
+        ):
+            want_cool = True
+            reason = (
+                f"actual indoor {main:.0f}°F warm with outdoor {outdoor:.0f}°F"
+            )
+
+        if want_cool and want_heat:
+            if outdoor is not None and outdoor >= cool_limit:
+                want_heat = False
+            else:
+                want_cool = False
+
+        if not want_cool and not want_heat:
+            if (
+                current_mode == "cool"
+                and outdoor is not None
+                and outdoor < cool_off_limit
+            ):
+                want_off = True
+                reason = (
+                    f"actual outdoor {outdoor:.0f}°F below cool release "
+                    f"{cool_off_limit:.0f}°F"
+                )
+            elif (
+                outdoor is not None
+                and shutdown <= outdoor < cool_off_limit
+                and (
+                    current_mode in ("cool", "heat")
+                    or self._orchestrator_active_mode in ("cool", "heat")
+                )
+            ):
+                want_off = True
+                reason = (
+                    f"mild actual outdoor {outdoor:.0f}°F "
+                    f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
+                )
+            elif (
+                now.hour >= oc.evening_cool_cutoff_hour
+                and self._orchestrator_active_mode == "cool"
+                and outdoor is not None
+                and outdoor < cool_limit
+            ):
+                want_off = True
+                reason = f"evening: actual outdoor {outdoor:.0f}°F below {cool_limit:.0f}°F"
+
+        # Cooling pause must NOT block heat/off — only suppress cool commands.
+        # Evening heat / cold outdoor clears the pause so recovery is automatic.
+        if cooling_paused and (want_heat or want_off):
+            _LOGGER.info(
+                "Clearing cooling pause for %s (was: %s)",
+                "heat" if want_heat else "off",
+                pause_reason,
+            )
+            await self._clear_cooling_pause()
+            cooling_paused = False
+        elif cooling_paused and want_cool:
+            self._orchestrator_mark_skip(
+                f"cool deferred — {pause_reason}",
+                decision="paused",
+            )
+            return
+        elif cooling_paused and not want_heat and not want_cool and not want_off:
+            self._orchestrator_mark_skip(
+                f"standby during {pause_reason}",
+                decision="paused",
+            )
+            return
+
+        if want_cool:
+            await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
+        elif want_heat:
+            await self._orchestrator_apply_heat(hvac_entity, oc, reason)
+        elif want_off:
+            await self._orchestrator_apply_off(hvac_entity, reason)
+        else:
+            self._orchestrator_last_decision = "planned" if plan and plan.hot_day_planned else "standby"
+            self._orchestrator_last_reason = (
+                f"plan: {self._plan_standby_note(plan, outdoor)} | "
+                f"actual outdoor={outdoor}, main={main}, "
+                f"day_high={self._orchestrator_day_high}, trigger={trigger}"
+            )
+
+        self._orchestrator_last_run = now
 
     async def _async_refresh_daily_plan(self, *, force: bool = False) -> None:
         """Build or refresh today's forecast plan (morning outlook + hourly update)."""
@@ -757,6 +1051,10 @@ class HvacOrchestratorMixin:
             "cool_setpoint": oc.cool_setpoint,
             "actual_day_high": self._orchestrator_day_high,
             "outdoor_trend_f_per_min": self._orchestrator_outdoor_trend(),
+            "cooling_paused": bool(self.is_cooling_paused),
+            "cooling_pause_reason": getattr(self, "_cooling_pause_reason", None),
+            "last_error": self._orchestrator_last_error,
+            "consecutive_failures": self._orchestrator_consecutive_failures,
             "last_run": (
                 self._orchestrator_last_run.isoformat()
                 if self._orchestrator_last_run
@@ -767,6 +1065,7 @@ class HvacOrchestratorMixin:
                 if self._orchestrator_last_run
                 else None
             ),
+            "watchdog_interval_min": ORCHESTRATOR_WATCHDOG_INTERVAL.total_seconds() / 60,
         }
         status.update(self.daily_plan_dict())
         return status

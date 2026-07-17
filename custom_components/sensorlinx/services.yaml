@@ -42,6 +42,18 @@ restore_day_setback:
     Return zones to daytime outdoor-reset targets. Runs at 6 AM or when motion
     is detected while night mode is active.
 
+run_hvac_orchestrator:
+  name: Run HVAC Orchestrator
+  description: >-
+    Force an immediate HVAC mode evaluation from actual outdoor/indoor temps
+    and today's forecast plan. Use after reloads or if status is stuck.
+
+clear_cooling_pause:
+  name: Clear Cooling Pause
+  description: >-
+    Resume cooling automations after a manual bedroom-fan pause, then re-run
+    the HVAC orchestrator (allows evening heat handoff).
+
 set_hydronic_sensors:
   name: Set Hydronic Loop Sensors
   description: Configure the supply/return water temperature sensors and flow rate sensor for the hydronic loop.
