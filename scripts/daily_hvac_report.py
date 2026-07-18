@@ -480,6 +480,30 @@ def compute_supply_adjustments(metrics):
             })
 
     outdoor = metrics.get("outdoor_now")
+    # Prefer cooler mild floor for efficiency when comfort is fine (don't leave min stuck high).
+    efficiency_min_target = 100.0
+    dt = metrics.get("avg_delta_t")
+    comfort_ok = not metrics["underheating_zones"]
+    mild_or_idle = (
+        (outdoor is not None and outdoor > 55)
+        or metrics.get("heating_sample_count", 0) == 0
+        or (dt is not None and dt >= IDEAL_DELTA_T[0])
+    )
+    if comfort_ok and mild_or_idle and supply_min > efficiency_min_target:
+        new_min = max(efficiency_min_target, supply_min - ADJUST_STEP)
+        if new_min < supply_min:
+            adjustments.append({
+                "entity": SUPPLY_ENTITIES["min_temp"],
+                "action": "set_value",
+                "value": new_min,
+                "reason": (
+                    f"Mild-weather supply floor {supply_min:.0f}F is higher than needed "
+                    f"for efficiency - step down toward {efficiency_min_target:.0f}F"
+                ),
+                "old": supply_min,
+                "new": new_min,
+            })
+
     if outdoor and outdoor > 58 and wh_target and wh_target > 115:
         new_max = max(110, supply_max - ADJUST_STEP)
         if new_max < supply_max:
