@@ -49,11 +49,10 @@ run_hvac_orchestrator:
     and today's forecast plan. Use after reloads or if status is stuck.
 
 clear_cooling_pause:
-  name: Clear Manual Fan Hold
+  name: Clear Legacy Fan Hold
   description: >-
-    Release bedroom fans held after manual use so automation may control them
-    again, then re-run the HVAC orchestrator. HVAC/cooling never stop for a
-    manual fan — only fan override is blocked.
+    Clears any leftover Hunter/Sidney fan-hold state from older versions, then
+    re-runs the HVAC orchestrator. Bedroom ceiling fans are no longer automated.
 
 set_hydronic_sensors:
   name: Set Hydronic Loop Sensors

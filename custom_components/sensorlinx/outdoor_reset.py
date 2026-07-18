@@ -49,14 +49,10 @@ from .hvac_orchestrator import (
 )
 from .const import (
     CONF_MAIN_FLOOR_TEMP_SENSOR,
-    CONF_HUNTER_FAN,
     CONF_MAIN_HVAC_CLIMATE,
-    CONF_SIDNEY_FAN,
     CONF_UPSTAIRS_TEMP_SENSOR,
-    DEFAULT_HUNTER_FAN,
     DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
     DEFAULT_MAIN_HVAC_CLIMATE,
-    DEFAULT_SIDNEY_FAN,
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
@@ -1415,12 +1411,10 @@ async def async_setup_outdoor_reset(
     params.cooling_control.main_floor_sensor = entry.options.get(
         CONF_MAIN_FLOOR_TEMP_SENSOR, DEFAULT_MAIN_FLOOR_TEMP_SENSOR
     )
-    params.cooling_control.hunter_fan = entry.options.get(
-        CONF_HUNTER_FAN, DEFAULT_HUNTER_FAN
-    )
-    params.cooling_control.sidney_fan = entry.options.get(
-        CONF_SIDNEY_FAN, DEFAULT_SIDNEY_FAN
-    )
+    # Hunter/Sidney bedroom fans are not automated.
+    params.cooling_control.hunter_fan = ""
+    params.cooling_control.sidney_fan = ""
+    params.cooling_control.bedroom_fans_enabled = False
 
     # Restore per-zone valve counts and floor mode from options
     for key, value in entry.options.items():

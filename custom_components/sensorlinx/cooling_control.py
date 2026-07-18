@@ -22,13 +22,9 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_COOLING_PAUSE_REASON,
     CONF_COOLING_PAUSED_UNTIL,
-    CONF_HUNTER_FAN,
     CONF_MAIN_FLOOR_TEMP_SENSOR,
-    CONF_SIDNEY_FAN,
     CONF_UPSTAIRS_TEMP_SENSOR,
-    DEFAULT_HUNTER_FAN,
     DEFAULT_MAIN_FLOOR_TEMP_SENSOR,
-    DEFAULT_SIDNEY_FAN,
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
@@ -53,8 +49,8 @@ DEFAULT_STRATIFICATION_THRESHOLD = 2.0  # °F gap before setpoint trim
 DEFAULT_MAX_COOL_ADJUSTMENT = 4.0
 DEFAULT_MIN_COOL_SETPOINT = 70.0
 DEFAULT_MAX_OUTDOOR_FOR_COOLING = 75.0  # no compressor cooling below this outdoor temp
-DEFAULT_BEDROOM_FANS_ENABLED = True
-DEFAULT_BEDROOM_FAN_SPEED = 66  # percentage (33/66/100 on these fans)
+DEFAULT_BEDROOM_FANS_ENABLED = False  # Hunter/Sidney removed from automations
+DEFAULT_BEDROOM_FAN_SPEED = 66
 DEFAULT_SMART_FAN_CIRCULATION = True
 DEFAULT_FURNACE_FAN_WATTS = 400.0
 DEFAULT_BEDROOM_FAN_WATTS = 55.0
@@ -80,8 +76,9 @@ class CoolingControlParams:
         self.max_outdoor_for_cooling: float = DEFAULT_MAX_OUTDOOR_FOR_COOLING
         self.upstairs_sensor: str = DEFAULT_UPSTAIRS_TEMP_SENSOR
         self.main_floor_sensor: str = DEFAULT_MAIN_FLOOR_TEMP_SENSOR
-        self.hunter_fan: str = DEFAULT_HUNTER_FAN
-        self.sidney_fan: str = DEFAULT_SIDNEY_FAN
+        # Bedroom ceiling fans (Hunter/Sidney) are intentionally not automated.
+        self.hunter_fan: str = ""
+        self.sidney_fan: str = ""
         self.bedroom_fans_enabled: bool = DEFAULT_BEDROOM_FANS_ENABLED
         self.bedroom_fan_speed: int = DEFAULT_BEDROOM_FAN_SPEED
         self.smart_fan_circulation_enabled: bool = DEFAULT_SMART_FAN_CIRCULATION
@@ -92,8 +89,8 @@ class CoolingControlParams:
 
     @property
     def upstairs_fan_entities(self) -> list[str]:
-        """Configured upstairs bedroom fan entity IDs."""
-        return [eid for eid in (self.hunter_fan, self.sidney_fan) if eid]
+        """Bedroom fans are not under SensorLinx control."""
+        return []
 
 
 class CoolingControlMixin:
@@ -125,6 +122,9 @@ class CoolingControlMixin:
     async def _setup_cooling_control(self) -> None:
         """Register periodic checks and sensor listeners."""
         cc = self._cooling_params()
+        cc.bedroom_fans_enabled = False
+        cc.hunter_fan = ""
+        cc.sidney_fan = ""
         self._user_cool_setpoint = None
         self._upstairs_bias_active = False
         self._precool_triggered_date = None
@@ -137,7 +137,8 @@ class CoolingControlMixin:
         self._furnace_fan_circulation_active = False
         self._last_fan_roi = {}
 
-        self._restore_cooling_pause_from_options()
+        # Clear any legacy Hunter/Sidney fan-hold pause from older versions.
+        self.hass.async_create_task(self._clear_cooling_pause())
 
         self._unsub_cool_interval = async_track_time_interval(
             self.hass, self._async_cooling_control_tick, COOL_CHECK_INTERVAL
@@ -158,11 +159,7 @@ class CoolingControlMixin:
             )
             self._capture_user_cool_setpoint()
 
-        fan_entities = cc.upstairs_fan_entities
-        if fan_entities:
-            self._unsub_cool_fans = async_track_state_change_event(
-                self.hass, fan_entities, self._async_on_bedroom_fan_change
-            )
+        # Hunter/Sidney bedroom fans are not listened to or controlled.
 
         await self._setup_hvac_orchestrator()
         await self._async_cooling_control_tick()
@@ -436,21 +433,14 @@ class CoolingControlMixin:
             pass
 
     def _available_bedroom_fan_count(self) -> int:
-        cc = self._cooling_params()
-        count = 0
-        for entity_id in cc.upstairs_fan_entities:
-            state = self.hass.states.get(entity_id)
-            if state and state.state not in ("unavailable", "unknown"):
-                count += 1
-        return count
+        return 0
 
     def _estimated_fan_watts(self, include_furnace: bool, include_bedrooms: bool) -> float:
         cc = self._cooling_params()
         watts = 0.0
         if include_furnace:
             watts += cc.furnace_fan_watts
-        if include_bedrooms:
-            watts += cc.bedroom_fan_watts * self._available_bedroom_fan_count()
+        # Bedroom ceiling fans are never included in automation ROI.
         return watts
 
     def _fan_hourly_cost_usd(self, include_furnace: bool, include_bedrooms: bool) -> float:
@@ -479,8 +469,7 @@ class CoolingControlMixin:
         # Floor heat: push warmth upstairs (gap negative = upstairs colder)
         if gap < -threshold and self._any_zone_heating() and self._tankless_is_heating():
             include_furnace = True
-            include_bedrooms = cc.bedroom_fans_enabled
-            cost = self._fan_hourly_cost_usd(include_furnace, include_bedrooms)
+            cost = self._fan_hourly_cost_usd(include_furnace, False)
             benefit_kwh = (
                 DEFAULT_TANKLESS_KW_WHEN_HEATING
                 * DEFAULT_HEAT_DISTRIBUTION_GAIN
@@ -496,8 +485,7 @@ class CoolingControlMixin:
             return False, "no_hvac", 0.0, 0.0
 
         include_furnace = True
-        include_bedrooms = cc.bedroom_fans_enabled
-        cost = self._fan_hourly_cost_usd(include_furnace, include_bedrooms)
+        cost = self._fan_hourly_cost_usd(include_furnace, False)
 
         # Compressor running: fans may reduce duty cycle
         if hvac.state == "cool" and hvac.attributes.get("hvac_action") == "cooling":
@@ -827,10 +815,9 @@ class CoolingControlMixin:
         )
 
     async def _sync_smart_fan_circulation(self) -> None:
-        """Run fans only when estimated energy benefit exceeds cost.
+        """Run furnace/Ecobee circulation when ROI is positive.
 
-        Manually held bedroom fans are never turned on/off by this path.
-        Furnace circulation and Ecobee fan mode still follow ROI.
+        Hunter/Sidney bedroom ceiling fans are never controlled here.
         """
         cc = self._cooling_params()
         if not cc.smart_fan_circulation_enabled:
@@ -844,11 +831,10 @@ class CoolingControlMixin:
             "cost_usd_per_hr": cost_hr,
             "benefit_usd_per_hr": benefit_hr,
             "gap": gap,
-            "manual_fans_held": sorted(self._manual_fan_entities),
+            "bedroom_fans": "disabled",
         }
 
         if not worth:
-            await self._async_turn_off_cooling_fans()
             await self._async_stop_furnace_circulation_fan()
             _LOGGER.debug(
                 "Fan circulation skipped (%s): cost $%.3f/hr benefit $%.3f/hr gap=%s",
@@ -871,10 +857,6 @@ class CoolingControlMixin:
             await self._async_start_furnace_circulation_fan(
                 f"ROI heat distribute (gap {gap:.1f}°F)",
             )
-            if cc.bedroom_fans_enabled:
-                await self._async_turn_on_cooling_fans(
-                    f"ROI heat distribute (gap {gap:.1f}°F)",
-                )
             return
 
         if scenario in ("cooling_compressor", "fan_only_mix"):
@@ -882,7 +864,7 @@ class CoolingControlMixin:
                 await self._async_start_furnace_circulation_fan(
                     f"ROI fan mix (gap {gap:.1f}°F)",
                 )
-            elif cc.bedroom_fans_enabled or scenario == "cooling_compressor":
+            elif scenario == "cooling_compressor":
                 hvac_entity = self.params.main_hvac_climate_entity_id
                 if hvac_entity:
                     state = self.hass.states.get(hvac_entity)
@@ -893,10 +875,6 @@ class CoolingControlMixin:
                             {"entity_id": hvac_entity, "fan_mode": "on"},
                             blocking=True,
                         )
-            if cc.bedroom_fans_enabled:
-                await self._async_turn_on_cooling_fans(
-                    f"ROI {scenario} (gap {gap:.1f}°F)",
-                )
 
     async def _async_start_furnace_circulation_fan(self, reason: str) -> None:
         """Blower only — no burner or compressor."""
@@ -946,59 +924,12 @@ class CoolingControlMixin:
         await self._sync_smart_fan_circulation()
 
     async def _async_turn_on_cooling_fans(self, reason: str) -> None:
-        cc = self._cooling_params()
-        speed = cc.bedroom_fan_speed
-        for entity_id in cc.upstairs_fan_entities:
-            if entity_id in self._manual_fan_entities:
-                _LOGGER.debug("Skipping manually held fan %s", entity_id)
-                continue
-            if entity_id in self._cooling_fans_active:
-                continue
-            state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown"):
-                _LOGGER.debug("Skipping unavailable fan %s", entity_id)
-                continue
-            if state.state == "on":
-                continue
-            _LOGGER.info("Cooling assist: %s → on @ %d%% (%s)", entity_id, speed, reason)
-            self._programmatic_fan_change = True
-            self._cooling_fans_active.add(entity_id)
-            try:
-                await self.hass.services.async_call(
-                    "fan",
-                    "turn_on",
-                    {"entity_id": entity_id, "percentage": speed},
-                    blocking=True,
-                )
-            except Exception:
-                self._cooling_fans_active.discard(entity_id)
-                raise
-            finally:
-                self._programmatic_fan_change = False
+        """No-op — Hunter/Sidney bedroom fans are not automated."""
+        return
 
     async def _async_turn_off_cooling_fans(self) -> None:
-        if not self._cooling_fans_active:
-            return
-        for entity_id in list(self._cooling_fans_active):
-            if entity_id in self._manual_fan_entities:
-                self._cooling_fans_active.discard(entity_id)
-                continue
-            state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown"):
-                self._cooling_fans_active.discard(entity_id)
-                continue
-            _LOGGER.info("Cooling assist: %s → off (stratification resolved)", entity_id)
-            self._programmatic_fan_change = True
-            try:
-                await self.hass.services.async_call(
-                    "fan",
-                    "turn_off",
-                    {"entity_id": entity_id},
-                    blocking=True,
-                )
-            finally:
-                self._programmatic_fan_change = False
-                self._cooling_fans_active.discard(entity_id)
+        """No-op — Hunter/Sidney bedroom fans are not automated."""
+        self._cooling_fans_active.clear()
 
 
 def get_cooling_control_number_entities(
@@ -1016,7 +947,6 @@ def get_cooling_control_number_entities(
         MaxOutdoorForCoolingNumberEntity(
             coordinator, controller, cc.max_outdoor_for_cooling
         ),
-        BedroomFanSpeedNumberEntity(coordinator, controller, cc.bedroom_fan_speed),
     ]
 
 
@@ -1026,7 +956,6 @@ def get_cooling_control_switch_entities(
     return [
         PrecoolEnableSwitch(coordinator, controller),
         UpstairsBiasEnableSwitch(coordinator, controller),
-        BedroomFansEnableSwitch(coordinator, controller),
         SmartFanCirculationSwitch(coordinator, controller),
     ]
 
@@ -1426,19 +1355,9 @@ class CoolingControlStatusSensor(SensorEntity):
 
     @property
     def native_value(self) -> str:
-        if self._controller._manual_fan_entities:
-            return "manual_fan_hold"
-        if self._controller.is_cooling_paused:
-            return "manual_fan_hold"
         cc = self._controller.params.cooling_control
-        if (
-            not cc.precool_enabled
-            and not cc.upstairs_bias_enabled
-            and not cc.bedroom_fans_enabled
-        ):
+        if not cc.precool_enabled and not cc.upstairs_bias_enabled:
             return "disabled"
-        if self._controller._cooling_fans_active:
-            return "bedroom_fans"
         if self._controller._furnace_fan_circulation_active:
             return "furnace_fan"
         roi = self._controller._last_fan_roi
@@ -1462,22 +1381,10 @@ class CoolingControlStatusSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         cc = self._controller.params.cooling_control
         return {
-            "cooling_paused": self._controller.is_cooling_paused,
-            "manual_fan_hold": bool(self._controller._manual_fan_entities),
-            "manual_fans_held": sorted(self._controller._manual_fan_entities),
-            "cooling_paused_until": (
-                self._controller._cooling_paused_until.isoformat()
-                if self._controller._cooling_paused_until
-                else None
-            ),
-            "cooling_pause_reason": self._controller._cooling_pause_reason,
             "precool_enabled": cc.precool_enabled,
             "upstairs_bias_enabled": cc.upstairs_bias_enabled,
-            "bedroom_fans_enabled": cc.bedroom_fans_enabled,
-            "bedroom_fan_speed": cc.bedroom_fan_speed,
-            "bedroom_fans_active": sorted(self._controller._cooling_fans_active),
-            "hunter_fan": cc.hunter_fan,
-            "sidney_fan": cc.sidney_fan,
+            "bedroom_fans_enabled": False,
+            "bedroom_fans_note": "Hunter/Sidney not automated",
             "upstairs_temp": self._controller.upstairs_temp,
             "main_floor_temp": self._controller.main_floor_temp,
             "stratification_gap": self._controller.stratification_gap,
