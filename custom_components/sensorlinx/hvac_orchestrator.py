@@ -38,7 +38,8 @@ PLAN_ACTUAL_DIVERGENCE = 6.0  # °F — cancel hot-day plan if actual peak lags 
 DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0
-DEFAULT_EVENING_COOL_CUTOFF_HOUR = 20
+DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # ~window-open time; coast AC unless still truly hot
+DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
 DEFAULT_PRECOOL_LEAD_MINUTES = 60
 DEFAULT_COOL_OFF_OUTDOOR_MARGIN = 3.0
 DEFAULT_HEAT_ON_OUTDOOR_MARGIN = 2.0
@@ -82,6 +83,7 @@ class HvacOrchestratorParams:
         self.heat_setpoint: float = DEFAULT_ORCHESTRATOR_HEAT_SETPOINT
         self.cool_setpoint: float = DEFAULT_ORCHESTRATOR_COOL_SETPOINT
         self.evening_cool_cutoff_hour: int = DEFAULT_EVENING_COOL_CUTOFF_HOUR
+        self.evening_coast_hot_override: float = DEFAULT_EVENING_COAST_HOT_OVERRIDE
         self.precool_lead_minutes: int = DEFAULT_PRECOOL_LEAD_MINUTES
         self.cool_off_outdoor_margin: float = DEFAULT_COOL_OFF_OUTDOOR_MARGIN
         self.heat_on_outdoor_margin: float = DEFAULT_HEAT_ON_OUTDOOR_MARGIN
@@ -443,6 +445,28 @@ class HvacOrchestratorMixin:
                 want_heat = False
             else:
                 want_cool = False
+
+        # Evening window coast: stop AC so windows can cool the house, unless
+        # outdoor is still truly hot (cool_limit + override, e.g. 80°F).
+        if (
+            now.hour >= oc.evening_cool_cutoff_hour
+            and outdoor is not None
+            and not want_heat
+            and outdoor < cool_limit + oc.evening_coast_hot_override
+            and (
+                want_cool
+                or self._orchestrator_active_mode == "cool"
+                or current_mode == "cool"
+            )
+        ):
+            want_cool = False
+            want_off = True
+            hot_keep = cool_limit + oc.evening_coast_hot_override
+            reason = (
+                f"evening window coast: outdoor {outdoor:.0f}°F "
+                f"(after {oc.evening_cool_cutoff_hour}:00; "
+                f"keep AC only if outdoor>={hot_keep:.0f}°F)"
+            )
 
         if not want_cool and not want_heat:
             if (
@@ -847,6 +871,8 @@ class HvacOrchestratorMixin:
             "decision_source": "plan+actual",
             "heat_setpoint": oc.heat_setpoint,
             "cool_setpoint": oc.cool_setpoint,
+            "evening_cool_cutoff_hour": oc.evening_cool_cutoff_hour,
+            "evening_coast_hot_override": oc.evening_coast_hot_override,
             "actual_day_high": self._orchestrator_day_high,
             "outdoor_trend_f_per_min": self._orchestrator_outdoor_trend(),
             "cooling_paused": bool(self.is_cooling_paused),
@@ -880,6 +906,9 @@ def get_orchestrator_number_entities(coordinator, controller: OutdoorResetContro
         OrchestratorHeatSetpointNumber(coordinator, controller, oc.heat_setpoint),
         OrchestratorCoolSetpointNumber(coordinator, controller, oc.cool_setpoint),
         OrchestratorPrecoolLeadNumber(coordinator, controller, oc.precool_lead_minutes),
+        OrchestratorEveningCutoffNumber(
+            coordinator, controller, oc.evening_cool_cutoff_hour
+        ),
     ]
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
@@ -1067,6 +1096,55 @@ class OrchestratorPrecoolLeadNumber(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.orchestrator.precool_lead_minutes = int(value)
         self.async_write_ha_state()
+
+
+class OrchestratorEveningCutoffNumber(RestoreNumber):
+    """Hour when AC coasts for open-window evening cooling (local time)."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Evening Cool Cutoff Hour"
+    _attr_mode = NumberMode.BOX
+    _attr_icon = "mdi:weather-sunset"
+
+    def __init__(self, coordinator, controller, initial: float) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_orchestrator_evening_cool_cutoff"
+        self._attr_native_min_value = 16
+        self._attr_native_max_value = 22
+        self._attr_native_step = 1
+        self._attr_native_value = initial
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "hvac_orchestrator")},
+            "name": "SensorLinx HVAC Orchestrator",
+            "manufacturer": "HBX Controls",
+            "model": "Actual-Temp Mode Control",
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_state()) and last.state not in (
+            "unknown",
+            "unavailable",
+        ):
+            try:
+                self._attr_native_value = float(last.state)
+                self._controller.params.orchestrator.evening_cool_cutoff_hour = int(
+                    float(last.state)
+                )
+            except (TypeError, ValueError):
+                pass
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.orchestrator.evening_cool_cutoff_hour = int(value)
+        self.async_write_ha_state()
+        await self._controller._async_orchestrate_hvac_mode(
+            force=True, trigger="evening_cutoff_change"
+        )
 
 
 class ZoneThermalLagNumberEntity(RestoreNumber):
