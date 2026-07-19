@@ -39,7 +39,7 @@ DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
-DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -90  # minutes relative to sunset (neg = before)
+DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
 SUN_ENTITY = "sun.sun"
 DEFAULT_PRECOOL_LEAD_MINUTES = 60
