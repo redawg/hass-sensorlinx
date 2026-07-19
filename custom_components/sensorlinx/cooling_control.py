@@ -551,7 +551,13 @@ class CoolingControlMixin:
         return outdoor >= self._cooling_params().max_outdoor_for_cooling
 
     async def _async_enforce_outdoor_cooling_limit(self) -> None:
-        """Turn off integration-driven cooling when outdoor is too mild."""
+        """Turn off integration-driven cooling when outdoor is too mild.
+
+        When the HVAC orchestrator is enabled it already owns cool/off with
+        hysteresis — do not fight it (that caused cool↔off fan short-cycling).
+        """
+        if getattr(self.params, "orchestrator", None) and self.params.orchestrator.enabled:
+            return
         if self._outdoor_allows_cooling():
             return
         outdoor = self.outdoor_temp

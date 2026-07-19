@@ -848,7 +848,13 @@ class HvacOrchestratorMixin:
         self._orchestrator_active_mode = "cool"
         self._orchestrator_last_decision = "cool"
         self._orchestrator_last_reason = reason
-        if target == cc.precool_target:
+        # Only mark pre-cool when we actually used the pre-cool window target,
+        # not whenever cool_setpoint happens to equal precool_target (that made
+        # outdoor-limit enforcement fight the orchestrator every few minutes).
+        if (
+            target == cc.precool_target
+            and cc.precool_start_hour <= now.hour < cc.precool_end_hour
+        ):
             self._precool_triggered_date = date.today()
         _LOGGER.info("Orchestrator → COOL @ %.0f°F: %s", target, reason)
 
