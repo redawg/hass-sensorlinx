@@ -188,6 +188,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         self._last_cool_adjustment: float = 0.0
         self._cooling_fans_active: set[str] = set()
         self._furnace_fan_circulation_active: bool = False
+        self._furnace_fan_circ_changed_at = None
         self._last_fan_roi: dict[str, Any] = {}
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
