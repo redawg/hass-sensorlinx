@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 COOL_CHECK_INTERVAL = timedelta(minutes=15)
+FAN_CIRC_MIN_ON = timedelta(minutes=30)
+FAN_CIRC_MIN_OFF = timedelta(minutes=20)
 MANUAL_FAN_HOLD_HOURS = 48  # keep fan ownership until manual off or timeout
 # Legacy alias
 MANUAL_FAN_PAUSE_HOURS = MANUAL_FAN_HOLD_HOURS
@@ -51,7 +53,7 @@ DEFAULT_MIN_COOL_SETPOINT = 70.0
 DEFAULT_MAX_OUTDOOR_FOR_COOLING = 75.0  # no compressor cooling below this outdoor temp
 DEFAULT_BEDROOM_FANS_ENABLED = False  # Hunter/Sidney removed from automations
 DEFAULT_BEDROOM_FAN_SPEED = 66
-DEFAULT_SMART_FAN_CIRCULATION = True
+DEFAULT_SMART_FAN_CIRCULATION = False  # opt-in; heat-mode fight caused furnace cycling
 DEFAULT_FURNACE_FAN_WATTS = 400.0
 DEFAULT_BEDROOM_FAN_WATTS = 55.0
 DEFAULT_COMPRESSOR_WATTS = 3500.0
@@ -114,6 +116,7 @@ class CoolingControlMixin:
     _unsub_cool_fans: Any
     _unsub_cooling_pause: Any
     _furnace_fan_circulation_active: bool
+    _furnace_fan_circ_changed_at: datetime | None
     _last_fan_roi: dict[str, Any]
 
     def _cooling_params(self) -> CoolingControlParams:
@@ -135,6 +138,7 @@ class CoolingControlMixin:
         self._cooling_pause_reason = None
         self._programmatic_fan_change = False
         self._furnace_fan_circulation_active = False
+        self._furnace_fan_circ_changed_at = None
         self._last_fan_roi = {}
 
         # Clear any legacy Hunter/Sidney fan-hold pause from older versions.
@@ -818,6 +822,7 @@ class CoolingControlMixin:
         """Run furnace/Ecobee circulation when ROI is positive.
 
         Hunter/Sidney bedroom ceiling fans are never controlled here.
+        Never steals HVAC heat mode from the orchestrator (that caused fan cycling).
         """
         cc = self._cooling_params()
         if not cc.smart_fan_circulation_enabled:
@@ -834,7 +839,15 @@ class CoolingControlMixin:
             "bedroom_fans": "disabled",
         }
 
+        now = datetime.now()
+        changed = self._furnace_fan_circ_changed_at
         if not worth:
+            if (
+                self._furnace_fan_circulation_active
+                and changed is not None
+                and now - changed < FAN_CIRC_MIN_ON
+            ):
+                return
             await self._async_stop_furnace_circulation_fan()
             _LOGGER.debug(
                 "Fan circulation skipped (%s): cost $%.3f/hr benefit $%.3f/hr gap=%s",
@@ -843,6 +856,22 @@ class CoolingControlMixin:
                 benefit_hr,
                 gap,
             )
+            return
+
+        if (
+            not self._furnace_fan_circulation_active
+            and changed is not None
+            and now - changed < FAN_CIRC_MIN_OFF
+        ):
+            return
+
+        orch_mode = getattr(self, "_orchestrator_active_mode", None)
+        # Heating distribute must not cancel orchestrator heat (off↔heat fight).
+        if scenario == "heating_distribute" and orch_mode == "heat":
+            _LOGGER.debug(
+                "Fan circulation skipped (heating_distribute): orchestrator in heat"
+            )
+            await self._async_stop_furnace_circulation_fan()
             return
 
         _LOGGER.info(
@@ -875,16 +904,38 @@ class CoolingControlMixin:
                             {"entity_id": hvac_entity, "fan_mode": "on"},
                             blocking=True,
                         )
+                    self._furnace_fan_circulation_active = True
+                    self._furnace_fan_circ_changed_at = now
 
     async def _async_start_furnace_circulation_fan(self, reason: str) -> None:
-        """Blower only — no burner or compressor."""
+        """Blower-only circulation — never cancel an active heat call."""
         hvac_entity = self.params.main_hvac_climate_entity_id
         if not hvac_entity:
             return
         state = self.hass.states.get(hvac_entity)
         if state is None:
             return
+
+        orch_mode = getattr(self, "_orchestrator_active_mode", None)
+        if orch_mode == "heat" or state.state == "heat":
+            _LOGGER.info(
+                "Furnace circulation skipped while heat active (%s)", reason
+            )
+            return
+
         if state.state not in ("off",):
+            # Only force off when coasting (not heating/cooling call).
+            if state.state == "cool":
+                if state.attributes.get("fan_mode") != "on":
+                    await self.hass.services.async_call(
+                        "climate",
+                        "set_fan_mode",
+                        {"entity_id": hvac_entity, "fan_mode": "on"},
+                        blocking=True,
+                    )
+                self._furnace_fan_circulation_active = True
+                self._furnace_fan_circ_changed_at = datetime.now()
+                return
             await self.hass.services.async_call(
                 "climate",
                 "set_hvac_mode",
@@ -900,6 +951,7 @@ class CoolingControlMixin:
                 blocking=True,
             )
         self._furnace_fan_circulation_active = True
+        self._furnace_fan_circ_changed_at = datetime.now()
 
     async def _async_stop_furnace_circulation_fan(self) -> None:
         if not self._furnace_fan_circulation_active:
@@ -918,6 +970,7 @@ class CoolingControlMixin:
             )
             _LOGGER.info("Furnace circulation fan OFF (ROI no longer positive)")
         self._furnace_fan_circulation_active = False
+        self._furnace_fan_circ_changed_at = datetime.now()
 
     async def _sync_upstairs_bedroom_fans(self) -> None:
         """Deprecated path — use _sync_smart_fan_circulation."""
