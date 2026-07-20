@@ -5,7 +5,10 @@ Method (furnace control board):
   2. Within ~3s: Auto → On ×3 (three toggles) to step to the next pre-programmed speed
   3. Typically ~6 discrete continuous-fan speeds (speed_1 lowest … speed_6 highest)
 
-Power draw on the furnace blower CT is the practical speed indicator.
+True fan watts on the shared Emporia breaker:
+  furnace_tankless_water (total)
+  − hot_water_heater_current_consumption
+  − radiant_floor_contoller_current_consumption
 """
 
 from __future__ import annotations
@@ -24,9 +27,11 @@ _LOGGER = logging.getLogger(__name__)
 CONF_BLOWER_FAN_POWER_SENSOR = "blower_fan_power_sensor"
 CONF_BLOWER_SPEED_CALIBRATION = "blower_fan_speed_calibration"
 DEFAULT_BLOWER_FAN_POWER_SENSOR = "sensor.furnace_tankless_water_power_minute_average"
-# Emporia circuit = furnace blower + tankless + radiant controller share.
-# True fan ≈ total − tankless − radiant controller.
-DEFAULT_TANKLESS_POWER_SENSOR = "sensor.main_water_heater_power_draw"  # kW
+# Same Emporia breaker also feeds these two variable loads (smart-plug meters).
+# True fan ≈ Emporia total − hot-water plug − radiant-controller plug.
+# Do NOT use sensor.main_water_heater_power_draw (tankless element kW) or
+# sensor.radiant_floor_heater_* (separate Emporia / plant CT).
+DEFAULT_HOT_WATER_ON_CIRCUIT_SENSOR = "sensor.hot_water_heater_current_consumption"  # W
 DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR = (
     "sensor.radiant_floor_contoller_current_consumption"  # W
 )
@@ -105,20 +110,17 @@ class BlowerFanSpeedProgrammer:
             return None
 
     def _read_fan_residual(self, total_sensor: str | None = None) -> float | None:
-        """Blower watts = Emporia total − on-circuit tankless − radiant controller.
+        """Blower watts = Emporia total − hot-water plug − radiant-controller plug.
 
-        Native tankless / radiant meters are only subtracted when their draw can
-        plausibly live on the Emporia CT (otherwise they are separate circuits
-        and subtracting them would invent large negative fan watts).
+        Those two devices share the Furnace/Tankless/Radiant Emporia breaker.
+        Always subtract their live W readings (they are already in watts).
         """
         total = self._read_power(total_sensor or self._power_sensor())
         if total is None:
             return None
-        tankless_raw = (self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0) * 1000.0
-        radiant_raw = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
-        tankless_w = tankless_raw if 0 < tankless_raw <= (total + 25) else 0.0
-        radiant_w = radiant_raw if 0 < radiant_raw <= (total + 25) else 0.0
-        return max(0.0, total - tankless_w - radiant_w)
+        hot_water_w = self._read_power(DEFAULT_HOT_WATER_ON_CIRCUIT_SENSOR) or 0.0
+        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
+        return total - hot_water_w - radiant_w
 
     async def _set_hvac_mode(self, entity_id: str, mode: str) -> None:
         await self.hass.services.async_call(
@@ -309,20 +311,16 @@ class BlowerFanSpeedProgrammer:
             )
         total = self._read_power(power)
         live = self._read_fan_residual(power)
-        tankless_raw = (self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0) * 1000.0
-        radiant_raw = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
-        tankless_w = tankless_raw if total is not None and 0 < tankless_raw <= (total + 25) else 0.0
-        radiant_w = radiant_raw if total is not None and 0 < radiant_raw <= (total + 25) else 0.0
+        hot_water_w = self._read_power(DEFAULT_HOT_WATER_ON_CIRCUIT_SENSOR) or 0.0
+        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
         return {
             "power_sensor": power,
             "hold_active": self.is_hold_active,
             "hold_until": self.hold_until.isoformat() if self.hold_until else None,
             "last_result": self._last_result or None,
             "circuit_total_w": total,
-            "tankless_w": tankless_w,
-            "tankless_raw_w": tankless_raw,
+            "hot_water_on_circuit_w": hot_water_w,
             "radiant_controller_w": radiant_w,
-            "radiant_controller_raw_w": radiant_raw,
             "live_watts": live,
             "estimated_speed": self._guess_speed(live),
             "calibration": self._calibration(),
