@@ -390,6 +390,13 @@ class HvacOrchestratorMixin:
             self._orchestrator_mark_skip("orchestrator disabled")
             return
 
+        blower = getattr(self, "blower_fan_speed", None)
+        if blower is not None and blower.is_hold_active:
+            self._orchestrator_mark_skip(
+                "blower fan-speed programming hold — orchestrator paused"
+            )
+            return
+
         await self._async_refresh_daily_plan(force=(trigger in ("hourly", "startup", "startup_retry") or trigger.startswith("watchdog") or force))
         plan = self._daily_plan
 
@@ -956,6 +963,11 @@ class HvacOrchestratorMixin:
             "cooling_paused": bool(self.is_cooling_paused),
             "cooling_pause_reason": getattr(self, "_cooling_pause_reason", None),
             "manual_fans_held": sorted(getattr(self, "_manual_fan_entities", set())),
+            "blower_fan_speed": (
+                self.blower_fan_speed.status_dict()
+                if getattr(self, "blower_fan_speed", None) is not None
+                else None
+            ),
             "last_error": self._orchestrator_last_error,
             "consecutive_failures": self._orchestrator_consecutive_failures,
             "last_run": (

@@ -54,6 +54,94 @@ clear_cooling_pause:
     Clears any leftover Hunter/Sidney fan-hold state from older versions, then
     re-runs the HVAC orchestrator. Bedroom ceiling fans are no longer automated.
 
+step_blower_fan_speed:
+  name: Step Bryant Blower Fan Speed
+  description: >-
+    Programs the next continuous fan speed on Bryant/Carrier variable-speed
+    blowers via the thermostat toggle method: HVAC OFF + fan ON, then
+    Auto→On→Auto→On within ~3 seconds per step. Leaves system OFF with fan ON
+    so you can check airflow / circuit watts. Orchestrator is held so it will
+    not fight the sequence. Point power_sensor at the blower circuit CT when ready.
+  fields:
+    steps:
+      name: Speed steps
+      description: How many next-speed steps to advance (1–6)
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 6
+          step: 1
+    climate_entity_id:
+      name: Thermostat
+      description: Defaults to the configured main HVAC climate entity
+      required: false
+      example: "climate.main_floor"
+      selector:
+        entity:
+          domain: climate
+    power_sensor:
+      name: Blower power circuit
+      description: >-
+        Optional power sensor (W) for this run. Overrides the saved monitor for
+        this call only — use set_blower_fan_power_monitor to persist it.
+      required: false
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+    settle_seconds:
+      name: Settle time after each step
+      description: Seconds to wait before reading power (default 8)
+      required: false
+      default: 8
+      selector:
+        number:
+          min: 3
+          max: 30
+          step: 1
+          unit_of_measurement: s
+    hold_minutes:
+      name: Orchestrator hold
+      description: Minutes to keep orchestrator from changing HVAC mode (default 10)
+      required: false
+      default: 10
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          unit_of_measurement: min
+    restore_previous:
+      name: Restore previous mode
+      description: If on, restore prior heat/cool/fan after programming (clears hold)
+      required: false
+      default: false
+      selector:
+        boolean:
+
+set_blower_fan_power_monitor:
+  name: Set Blower Fan Power Monitor
+  description: >-
+    Save which power/circuit sensor indicates continuous blower speed (watts).
+    Used by step_blower_fan_speed to log before/after readings.
+  fields:
+    power_sensor:
+      name: Power sensor
+      description: Emporia/CT (or similar) on the furnace blower circuit
+      required: true
+      selector:
+        entity:
+          domain: sensor
+          device_class: power
+
+clear_blower_fan_speed_hold:
+  name: Clear Blower Fan Speed Hold
+  description: >-
+    End the temporary orchestrator pause started by step_blower_fan_speed so
+    normal HVAC automation resumes.
+
 set_hydronic_sensors:
   name: Set Hydronic Loop Sensors
   description: Configure the supply/return water temperature sensors and flow rate sensor for the hydronic loop.

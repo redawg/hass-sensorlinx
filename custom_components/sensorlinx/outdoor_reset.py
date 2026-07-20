@@ -56,6 +56,7 @@ from .const import (
     DEFAULT_UPSTAIRS_TEMP_SENSOR,
     DOMAIN,
 )
+from .blower_fan_speed import async_register_blower_fan_speed_services
 from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
 from .heating_zones import (
     DEFAULT_EXTERNAL_ZONES,
@@ -158,6 +159,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         self.coordinator = coordinator
         self.params = params
         self._entry_id = entry_id
+        self._config_entry = None
+        self.blower_fan_speed = None
         self._unsub_interval = None
         self._unsub_state = None
         self._unsub_zone_boost = None
@@ -1454,6 +1457,7 @@ async def async_setup_outdoor_reset(
                 pass
 
     controller = OutdoorResetController(hass, coordinator, params, entry.entry_id)
+    controller._config_entry = entry
 
     for zone in params.external_zones:
         if hass.states.get(zone.climate_entity_id) is None:
@@ -1557,6 +1561,7 @@ async def async_setup_outdoor_reset(
     hass.services.async_register(
         DOMAIN, "clear_cooling_pause", handle_clear_cooling_pause
     )
+    async_register_blower_fan_speed_services(hass, controller)
 
     return controller
 

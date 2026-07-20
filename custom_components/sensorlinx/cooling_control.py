@@ -399,6 +399,9 @@ class CoolingControlMixin:
     async def _async_cooling_control_tick(self, _now=None) -> None:
         if not self.enabled:
             return
+        blower = getattr(self, "blower_fan_speed", None)
+        if blower is not None and blower.is_hold_active:
+            return
         if self._cooling_paused_until and not self.is_cooling_paused:
             await self._clear_cooling_pause()
         # Manual bedroom-fan hold does NOT skip HVAC/cooling — only fan ownership.
