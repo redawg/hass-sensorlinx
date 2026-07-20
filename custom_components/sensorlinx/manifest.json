@@ -8,5 +8,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/redawg/hass-sensorlinx/issues",
   "requirements": ["pysensorlinx>=0.5.5"],
-  "version": "0.1.36"
+  "version": "0.1.37"
 }

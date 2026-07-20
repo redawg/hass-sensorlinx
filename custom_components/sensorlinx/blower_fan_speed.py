@@ -22,6 +22,7 @@ from .const import DEFAULT_MAIN_HVAC_CLIMATE, DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 CONF_BLOWER_FAN_POWER_SENSOR = "blower_fan_power_sensor"
+DEFAULT_BLOWER_FAN_POWER_SENSOR = "sensor.furnace_tankless_water_power_minute_average"
 DEFAULT_TOGGLE_GAP_S = 0.45
 DEFAULT_FAN_ENGAGE_S = 4.0
 DEFAULT_SETTLE_S = 8.0
@@ -55,7 +56,10 @@ class BlowerFanSpeedProgrammer:
         entry = getattr(self._controller, "_config_entry", None)
         if entry is not None:
             options = dict(entry.options or {})
-        return options.get(CONF_BLOWER_FAN_POWER_SENSOR) or None
+        return (
+            options.get(CONF_BLOWER_FAN_POWER_SENSOR)
+            or DEFAULT_BLOWER_FAN_POWER_SENSOR
+        )
 
     def _read_power(self, entity_id: str | None) -> float | None:
         if not entity_id:
