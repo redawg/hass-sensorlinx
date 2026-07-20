@@ -3,9 +3,9 @@
 Method (furnace control board):
   1. HVAC mode OFF, fan ON — continuous fan runs
   2. Within ~3s: Auto → On → Auto → On to step to the next pre-programmed speed
-  3. Repeat to cycle Low / Medium / High (exact labels vary by board)
+  3. Typically ~6 discrete continuous-fan speeds (speed_1 lowest … speed_6 highest)
 
-Power draw on a dedicated CT/circuit is the practical speed indicator.
+Power draw on the furnace blower CT is the practical speed indicator.
 """
 
 from __future__ import annotations
@@ -29,7 +29,31 @@ DEFAULT_FAN_ENGAGE_S = 4.0
 DEFAULT_SETTLE_S = 8.0
 DEFAULT_HOLD_MINUTES = 10
 MAX_STEPS = 6
-SPEED_LABELS = ("low", "medium", "high")
+# speed_1 = lowest continuous fan … speed_6 = highest
+SPEED_LABELS = tuple(f"speed_{i}" for i in range(1, MAX_STEPS + 1))
+SPEED_ALIASES = {
+    "low": "speed_1",
+    "medium": "speed_3",
+    "med": "speed_3",
+    "high": "speed_6",
+    "highest": "speed_6",
+    "lowest": "speed_1",
+}
+
+
+def normalize_speed_label(raw: Any) -> str:
+    """Map 1–6, speed_N, or low/med/high aliases to speed_1..speed_6."""
+    s = str(raw).strip().lower()
+    if s in SPEED_ALIASES:
+        return SPEED_ALIASES[s]
+    if s.isdigit() and 1 <= int(s) <= MAX_STEPS:
+        return f"speed_{int(s)}"
+    if s in SPEED_LABELS:
+        return s
+    raise ValueError(
+        f"speed must be 1–{MAX_STEPS}, speed_1..speed_{MAX_STEPS}, "
+        f"or low/medium/high (got {raw!r})"
+    )
 
 
 class BlowerFanSpeedProgrammer:
@@ -225,10 +249,8 @@ class BlowerFanSpeedProgrammer:
         return best
 
     async def async_record_speed_calibration(self, call: ServiceCall) -> dict[str, Any]:
-        """Save current circuit watts as low/medium/high reference."""
-        speed = str(call.data.get("speed", "")).strip().lower()
-        if speed not in SPEED_LABELS:
-            raise ValueError(f"speed must be one of {SPEED_LABELS}")
+        """Save current circuit watts as speed_1..speed_6 reference (6=highest)."""
+        speed = normalize_speed_label(call.data.get("speed", ""))
         power_sensor = self._power_sensor(call)
         watts = self._read_power(power_sensor)
         if watts is None and call.data.get("watts") is not None:
@@ -240,8 +262,12 @@ class BlowerFanSpeedProgrammer:
         if entry is None:
             raise ValueError("No config entry available")
         cal = self._calibration()
+        # Drop legacy low/medium/high keys if present
+        for legacy in ("low", "medium", "high"):
+            cal.pop(legacy, None)
         cal[speed] = {
             "watts": round(watts, 1),
+            "step": int(speed.split("_")[1]),
             "recorded_at": datetime.now().isoformat(timespec="seconds"),
             "power_sensor": power_sensor,
         }
