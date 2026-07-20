@@ -2,7 +2,7 @@
 
 Method (furnace control board):
   1. HVAC mode OFF, fan ON — continuous fan runs
-  2. Within ~3s: Auto → On → Auto → On to step to the next pre-programmed speed
+  2. Within ~3s: Auto → On ×3 (three toggles) to step to the next pre-programmed speed
   3. Typically ~6 discrete continuous-fan speeds (speed_1 lowest … speed_6 highest)
 
 Power draw on the furnace blower CT is the practical speed indicator.
@@ -24,6 +24,12 @@ _LOGGER = logging.getLogger(__name__)
 CONF_BLOWER_FAN_POWER_SENSOR = "blower_fan_power_sensor"
 CONF_BLOWER_SPEED_CALIBRATION = "blower_fan_speed_calibration"
 DEFAULT_BLOWER_FAN_POWER_SENSOR = "sensor.furnace_tankless_water_power_minute_average"
+# Emporia circuit = furnace blower + tankless + radiant controller share.
+# True fan ≈ total − tankless − radiant controller.
+DEFAULT_TANKLESS_POWER_SENSOR = "sensor.main_water_heater_power_draw"  # kW
+DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR = (
+    "sensor.radiant_floor_contoller_current_consumption"  # W
+)
 DEFAULT_TOGGLE_GAP_S = 0.45
 DEFAULT_FAN_ENGAGE_S = 4.0
 DEFAULT_SETTLE_S = 8.0
@@ -98,6 +104,15 @@ class BlowerFanSpeedProgrammer:
         except (TypeError, ValueError):
             return None
 
+    def _read_fan_residual(self, total_sensor: str | None = None) -> float | None:
+        """Blower watts = Emporia total − tankless − radiant controller."""
+        total = self._read_power(total_sensor or self._power_sensor())
+        if total is None:
+            return None
+        tankless_kw = self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0
+        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
+        return total - (tankless_kw * 1000.0) - radiant_w
+
     async def _set_hvac_mode(self, entity_id: str, mode: str) -> None:
         await self.hass.services.async_call(
             "climate",
@@ -117,14 +132,12 @@ class BlowerFanSpeedProgrammer:
     async def _one_speed_step(
         self, entity_id: str, toggle_gap: float
     ) -> None:
-        """Auto→On→Auto→On inside a short window = one board speed step."""
-        await self._set_fan_mode(entity_id, "auto")
-        await asyncio.sleep(toggle_gap)
-        await self._set_fan_mode(entity_id, "on")
-        await asyncio.sleep(toggle_gap)
-        await self._set_fan_mode(entity_id, "auto")
-        await asyncio.sleep(toggle_gap)
-        await self._set_fan_mode(entity_id, "on")
+        """Auto→On ×3 inside a short window = one board speed step."""
+        for _ in range(3):
+            await self._set_fan_mode(entity_id, "auto")
+            await asyncio.sleep(toggle_gap)
+            await self._set_fan_mode(entity_id, "on")
+            await asyncio.sleep(toggle_gap)
 
     def begin_hold(self, minutes: float = DEFAULT_HOLD_MINUTES) -> None:
         self.hold_until = datetime.now() + timedelta(minutes=minutes)
@@ -158,7 +171,7 @@ class BlowerFanSpeedProgrammer:
         self.begin_hold(hold_min)
 
         readings: list[dict[str, Any]] = []
-        baseline = self._read_power(power_sensor)
+        baseline = self._read_fan_residual(power_sensor)
         readings.append({"label": "before", "watts": baseline})
 
         _LOGGER.info(
@@ -172,16 +185,16 @@ class BlowerFanSpeedProgrammer:
         await self._set_fan_mode(climate, "on")
         await asyncio.sleep(engage)
         readings.append(
-            {"label": "fan_engaged", "watts": self._read_power(power_sensor)}
+            {"label": "fan_engaged", "watts": self._read_fan_residual(power_sensor)}
         )
 
         for i in range(1, steps + 1):
             await self._one_speed_step(climate, toggle_gap)
             await asyncio.sleep(settle)
-            watts = self._read_power(power_sensor)
+            watts = self._read_fan_residual(power_sensor)
             readings.append({"label": f"after_step_{i}", "watts": watts})
             _LOGGER.info(
-                "Blower speed step %s/%s complete; power=%s W",
+                "Blower speed step %s/%s complete; fan residual=%s W",
                 i,
                 steps,
                 watts if watts is not None else "n/a",
@@ -252,9 +265,12 @@ class BlowerFanSpeedProgrammer:
         """Save current circuit watts as speed_1..speed_6 reference (6=highest)."""
         speed = normalize_speed_label(call.data.get("speed", ""))
         power_sensor = self._power_sensor(call)
-        watts = self._read_power(power_sensor)
-        if watts is None and call.data.get("watts") is not None:
+        # Prefer explicit watts from the caller when provided (Emporia lag).
+        if call.data.get("watts") is not None:
             watts = float(call.data["watts"])
+        else:
+            # Default to true fan residual, not raw circuit total.
+            watts = self._read_fan_residual(power_sensor)
         if watts is None:
             raise ValueError("No power reading available to calibrate")
 
@@ -284,12 +300,18 @@ class BlowerFanSpeedProgrammer:
             power = (entry.options or {}).get(
                 CONF_BLOWER_FAN_POWER_SENSOR, DEFAULT_BLOWER_FAN_POWER_SENSOR
             )
-        live = self._read_power(power)
+        total = self._read_power(power)
+        live = self._read_fan_residual(power)
+        tankless_kw = self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0
+        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
         return {
             "power_sensor": power,
             "hold_active": self.is_hold_active,
             "hold_until": self.hold_until.isoformat() if self.hold_until else None,
             "last_result": self._last_result or None,
+            "circuit_total_w": total,
+            "tankless_w": tankless_kw * 1000.0,
+            "radiant_controller_w": radiant_w,
             "live_watts": live,
             "estimated_speed": self._guess_speed(live),
             "calibration": self._calibration(),

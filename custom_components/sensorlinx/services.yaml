@@ -59,7 +59,7 @@ step_blower_fan_speed:
   description: >-
     Programs the next continuous fan speed on Bryant/Carrier variable-speed
     blowers via the thermostat toggle method: HVAC OFF + fan ON, then
-    Auto→On→Auto→On within ~3 seconds per step. Leaves system OFF with fan ON
+    Auto→On ×3 (three toggles) within ~3 seconds per step. Leaves system OFF with fan ON
     so you can check airflow / circuit watts. Orchestrator is held so it will
     not fight the sequence. Point power_sensor at the blower circuit CT when ready.
   fields:
