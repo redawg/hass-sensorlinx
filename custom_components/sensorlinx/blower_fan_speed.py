@@ -22,12 +22,14 @@ from .const import DEFAULT_MAIN_HVAC_CLIMATE, DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 CONF_BLOWER_FAN_POWER_SENSOR = "blower_fan_power_sensor"
+CONF_BLOWER_SPEED_CALIBRATION = "blower_fan_speed_calibration"
 DEFAULT_BLOWER_FAN_POWER_SENSOR = "sensor.furnace_tankless_water_power_minute_average"
 DEFAULT_TOGGLE_GAP_S = 0.45
 DEFAULT_FAN_ENGAGE_S = 4.0
 DEFAULT_SETTLE_S = 8.0
 DEFAULT_HOLD_MINUTES = 10
 MAX_STEPS = 6
+SPEED_LABELS = ("low", "medium", "high")
 
 
 class BlowerFanSpeedProgrammer:
@@ -195,17 +197,76 @@ class BlowerFanSpeedProgrammer:
         self.hass.config_entries.async_update_entry(entry, options=new_options)
         _LOGGER.info("Blower fan power monitor set to %s", entity_id)
 
+    def _calibration(self) -> dict[str, Any]:
+        entry = getattr(self._controller, "_config_entry", None)
+        if entry is None:
+            return {}
+        raw = (entry.options or {}).get(CONF_BLOWER_SPEED_CALIBRATION) or {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _guess_speed(self, watts: float | None) -> str | None:
+        """Nearest calibrated speed label from live watts."""
+        cal = self._calibration()
+        if watts is None or not cal:
+            return None
+        best = None
+        best_dist = None
+        for label in SPEED_LABELS:
+            ref = cal.get(label)
+            if not isinstance(ref, dict):
+                continue
+            ref_w = ref.get("watts")
+            if ref_w is None:
+                continue
+            dist = abs(float(ref_w) - watts)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best = label
+        return best
+
+    async def async_record_speed_calibration(self, call: ServiceCall) -> dict[str, Any]:
+        """Save current circuit watts as low/medium/high reference."""
+        speed = str(call.data.get("speed", "")).strip().lower()
+        if speed not in SPEED_LABELS:
+            raise ValueError(f"speed must be one of {SPEED_LABELS}")
+        power_sensor = self._power_sensor(call)
+        watts = self._read_power(power_sensor)
+        if watts is None and call.data.get("watts") is not None:
+            watts = float(call.data["watts"])
+        if watts is None:
+            raise ValueError("No power reading available to calibrate")
+
+        entry = getattr(self._controller, "_config_entry", None)
+        if entry is None:
+            raise ValueError("No config entry available")
+        cal = self._calibration()
+        cal[speed] = {
+            "watts": round(watts, 1),
+            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+            "power_sensor": power_sensor,
+        }
+        new_options = {**entry.options, CONF_BLOWER_SPEED_CALIBRATION: cal}
+        self.hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
+        _LOGGER.info("Blower speed calibration %s = %.0f W", speed, watts)
+        return cal[speed]
+
     def status_dict(self) -> dict[str, Any]:
         entry = getattr(self._controller, "_config_entry", None)
-        power = None
+        power = DEFAULT_BLOWER_FAN_POWER_SENSOR
         if entry is not None:
-            power = (entry.options or {}).get(CONF_BLOWER_FAN_POWER_SENSOR)
+            power = (entry.options or {}).get(
+                CONF_BLOWER_FAN_POWER_SENSOR, DEFAULT_BLOWER_FAN_POWER_SENSOR
+            )
+        live = self._read_power(power)
         return {
             "power_sensor": power,
             "hold_active": self.is_hold_active,
             "hold_until": self.hold_until.isoformat() if self.hold_until else None,
             "last_result": self._last_result or None,
-            "live_watts": self._read_power(power),
+            "live_watts": live,
+            "estimated_speed": self._guess_speed(live),
+            "calibration": self._calibration(),
         }
 
 
@@ -222,6 +283,9 @@ def async_register_blower_fan_speed_services(
     async def handle_set_monitor(call: ServiceCall) -> None:
         await programmer.async_set_power_monitor(call)
 
+    async def handle_record_cal(call: ServiceCall) -> None:
+        await programmer.async_record_speed_calibration(call)
+
     async def handle_clear_hold(_call: ServiceCall) -> None:
         programmer.clear_hold()
         _LOGGER.info("Blower fan-speed program hold cleared")
@@ -229,6 +293,9 @@ def async_register_blower_fan_speed_services(
     hass.services.async_register(DOMAIN, "step_blower_fan_speed", handle_step)
     hass.services.async_register(
         DOMAIN, "set_blower_fan_power_monitor", handle_set_monitor
+    )
+    hass.services.async_register(
+        DOMAIN, "record_blower_fan_speed_calibration", handle_record_cal
     )
     hass.services.async_register(
         DOMAIN, "clear_blower_fan_speed_hold", handle_clear_hold

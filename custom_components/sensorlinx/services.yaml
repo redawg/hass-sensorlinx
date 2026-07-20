@@ -136,6 +136,33 @@ set_blower_fan_power_monitor:
           domain: sensor
           device_class: power
 
+record_blower_fan_speed_calibration:
+  name: Record Blower Fan Speed Calibration
+  description: >-
+    Save the current circuit watt reading as the Low, Medium, or High continuous
+    fan speed reference (e.g. when you know the blower is on High).
+  fields:
+    speed:
+      name: Speed
+      description: Which programmed speed this reading represents
+      required: true
+      selector:
+        select:
+          options:
+            - low
+            - medium
+            - high
+    watts:
+      name: Watts override
+      description: Optional explicit watt value if the live sensor is lagging
+      required: false
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 1
+          unit_of_measurement: W
+
 clear_blower_fan_speed_hold:
   name: Clear Blower Fan Speed Hold
   description: >-
