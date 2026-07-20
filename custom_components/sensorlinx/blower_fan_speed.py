@@ -105,13 +105,20 @@ class BlowerFanSpeedProgrammer:
             return None
 
     def _read_fan_residual(self, total_sensor: str | None = None) -> float | None:
-        """Blower watts = Emporia total − tankless − radiant controller."""
+        """Blower watts = Emporia total − on-circuit tankless − radiant controller.
+
+        Native tankless / radiant meters are only subtracted when their draw can
+        plausibly live on the Emporia CT (otherwise they are separate circuits
+        and subtracting them would invent large negative fan watts).
+        """
         total = self._read_power(total_sensor or self._power_sensor())
         if total is None:
             return None
-        tankless_kw = self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0
-        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
-        return total - (tankless_kw * 1000.0) - radiant_w
+        tankless_raw = (self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0) * 1000.0
+        radiant_raw = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
+        tankless_w = tankless_raw if 0 < tankless_raw <= (total + 25) else 0.0
+        radiant_w = radiant_raw if 0 < radiant_raw <= (total + 25) else 0.0
+        return max(0.0, total - tankless_w - radiant_w)
 
     async def _set_hvac_mode(self, entity_id: str, mode: str) -> None:
         await self.hass.services.async_call(
@@ -302,16 +309,20 @@ class BlowerFanSpeedProgrammer:
             )
         total = self._read_power(power)
         live = self._read_fan_residual(power)
-        tankless_kw = self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0
-        radiant_w = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
+        tankless_raw = (self._read_power(DEFAULT_TANKLESS_POWER_SENSOR) or 0.0) * 1000.0
+        radiant_raw = self._read_power(DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR) or 0.0
+        tankless_w = tankless_raw if total is not None and 0 < tankless_raw <= (total + 25) else 0.0
+        radiant_w = radiant_raw if total is not None and 0 < radiant_raw <= (total + 25) else 0.0
         return {
             "power_sensor": power,
             "hold_active": self.is_hold_active,
             "hold_until": self.hold_until.isoformat() if self.hold_until else None,
             "last_result": self._last_result or None,
             "circuit_total_w": total,
-            "tankless_w": tankless_kw * 1000.0,
+            "tankless_w": tankless_w,
+            "tankless_raw_w": tankless_raw,
             "radiant_controller_w": radiant_w,
+            "radiant_controller_raw_w": radiant_raw,
             "live_watts": live,
             "estimated_speed": self._guess_speed(live),
             "calibration": self._calibration(),
