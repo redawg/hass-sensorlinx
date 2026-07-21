@@ -37,7 +37,7 @@ PLAN_ACTUAL_DIVERGENCE = 6.0  # °F — cancel hot-day plan if actual peak lags 
 
 DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
-DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0
+DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0  # hot-day whole-house average target (°F)
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -851,7 +851,7 @@ class HvacOrchestratorMixin:
             {"entity_id": hvac_entity, "temperature": target, "hvac_mode": "cool"},
             blocking=True,
         )
-        self._user_cool_setpoint = target
+        self._user_cool_setpoint = oc.cool_setpoint
         self._orchestrator_active_mode = "cool"
         self._orchestrator_last_decision = "cool"
         self._orchestrator_last_reason = reason
@@ -863,7 +863,12 @@ class HvacOrchestratorMixin:
             and cc.precool_start_hour <= now.hour < cc.precool_end_hour
         ):
             self._precool_triggered_date = date.today()
-        _LOGGER.info("Orchestrator → COOL @ %.0f°F: %s", target, reason)
+        _LOGGER.info(
+            "Orchestrator → COOL @ %.0f°F (house avg target %.0f°F): %s",
+            target,
+            oc.cool_setpoint,
+            reason,
+        )
 
     async def _orchestrator_apply_heat(
         self, hvac_entity: str, oc: HvacOrchestratorParams, reason: str

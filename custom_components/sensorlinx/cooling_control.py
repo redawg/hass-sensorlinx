@@ -542,6 +542,21 @@ class CoolingControlMixin:
         return round(upstairs - main, 1)
 
     @property
+    def house_average_temp(self) -> float | None:
+        """Simple whole-house average from main + upstairs sensors."""
+        upstairs = self.upstairs_temp
+        main = self.main_floor_temp
+        if upstairs is None or main is None:
+            return None
+        return round((upstairs + main) / 2.0, 1)
+
+    def _hot_day_house_cool_target(self) -> float:
+        """Desired whole-house average on hot / cooling days (°F)."""
+        if getattr(self.params, "orchestrator", None) and self.params.orchestrator.enabled:
+            return float(self.params.orchestrator.cool_setpoint)
+        return float(self._cooling_params().precool_target)
+
+    @property
     def precool_active_today(self) -> bool:
         today = date.today()
         return self._precool_triggered_date == today
@@ -709,7 +724,8 @@ class CoolingControlMixin:
         return []
 
     async def _apply_upstairs_cool_bias(self) -> None:
-        """Lower cool setpoint when upstairs runs warmer than main floor."""
+        """Trim main cool setpoint for upstairs stratification without overshooting
+        the hot-day whole-house average target (default 74°F)."""
         if not self._outdoor_allows_cooling():
             return
         cc = self._cooling_params()
@@ -727,18 +743,35 @@ class CoolingControlMixin:
         if gap is None:
             return
 
+        house_target = self._hot_day_house_cool_target()
+        house_avg = self.house_average_temp
+
+        # Prefer the hot-day house average target as bias baseline (not a stale
+        # manual 70° leftover). Keep a captured user setpoint only if warmer.
         if self._user_cool_setpoint is None:
             self._capture_user_cool_setpoint()
-        baseline = self._user_cool_setpoint
-        if baseline is None:
-            temp = state.attributes.get("temperature")
-            if temp is not None:
+        baseline = house_target
+        if self._user_cool_setpoint is not None:
+            baseline = max(float(self._user_cool_setpoint), house_target)
+
+        # Already at/under desired house average — hold target, don't dig colder.
+        if house_avg is not None and house_avg <= house_target:
+            current_sp = state.attributes.get("temperature")
+            needs_restore = self._upstairs_bias_active
+            if current_sp is not None:
                 try:
-                    baseline = float(temp)
+                    needs_restore = needs_restore or abs(float(current_sp) - house_target) >= 0.5
                 except (TypeError, ValueError):
-                    return
-            else:
-                return
+                    needs_restore = True
+            if needs_restore:
+                await self._async_set_hvac_cool(
+                    house_target,
+                    f"house avg {house_avg:.1f}°F <= target {house_target:.0f}°F",
+                )
+                self._upstairs_bias_active = False
+                self._last_cool_adjustment = 0.0
+                self._user_cool_setpoint = house_target
+            return
 
         if gap <= cc.stratification_threshold:
             if self._upstairs_bias_active:
@@ -751,11 +784,16 @@ class CoolingControlMixin:
 
         excess = gap - cc.stratification_threshold
         adjustment = min(cc.max_cool_adjustment, max(1.0, excess))
+        # Never trim more than needed to pull house average toward target.
+        if house_avg is not None:
+            avg_over = house_avg - house_target
+            adjustment = min(adjustment, max(1.0, avg_over + 1.0))
         target = max(DEFAULT_MIN_COOL_SETPOINT, round(baseline - adjustment, 0))
 
         reason = (
             f"upstairs bias: gap {gap:.1f}°F "
-            f"(upstairs {self.upstairs_temp:.1f}, main {self.main_floor_temp:.1f})"
+            f"(upstairs {self.upstairs_temp:.1f}, main {self.main_floor_temp:.1f}, "
+            f"avg {house_avg if house_avg is not None else '?'}→{house_target:.0f})"
         )
         self._upstairs_bias_active = True
         self._last_cool_adjustment = adjustment
@@ -1450,6 +1488,8 @@ class CoolingControlStatusSensor(SensorEntity):
             "upstairs_temp": self._controller.upstairs_temp,
             "main_floor_temp": self._controller.main_floor_temp,
             "stratification_gap": self._controller.stratification_gap,
+            "house_average_temp": self._controller.house_average_temp,
+            "house_cool_target": self._controller._hot_day_house_cool_target(),
             "user_cool_setpoint": self._controller._user_cool_setpoint,
             "upstairs_bias_active": self._controller._upstairs_bias_active,
             "last_cool_adjustment": self._controller._last_cool_adjustment,
