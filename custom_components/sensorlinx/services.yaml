@@ -58,10 +58,8 @@ step_blower_fan_speed:
   name: Step Bryant Blower Fan Speed
   description: >-
     Programs the next continuous fan speed on Bryant/Carrier variable-speed
-    blowers via the thermostat toggle method: HVAC OFF + fan ON, then
-    Auto→On ×3 (three toggles) within ~3 seconds per step. Leaves system OFF with fan ON
-    so you can check airflow / circuit watts. Orchestrator is held so it will
-    not fight the sequence. Point power_sensor at the blower circuit CT when ready.
+    blowers: HVAC OFF + fan ON, then Auto->On x3 (one burst). Retries bursts
+    until Emporia residual watts move (up >=25W or wrap drop). Leaves fan ON.
   fields:
     steps:
       name: Speed steps
@@ -92,16 +90,27 @@ step_blower_fan_speed:
           domain: sensor
           device_class: power
     settle_seconds:
-      name: Settle time after each step
-      description: Seconds to wait before reading power (default 8)
+      name: Settle time after each burst
+      description: Seconds to wait for Emporia before checking watts (default 60)
       required: false
-      default: 8
+      default: 60
       selector:
         number:
-          min: 3
-          max: 30
-          step: 1
+          min: 15
+          max: 180
+          step: 5
           unit_of_measurement: s
+    max_burst_retries:
+      name: Max Auto-On bursts per step
+      description: >-
+        How many Auto->On x3 bursts to try until residual watts change (default 7)
+      required: false
+      default: 7
+      selector:
+        number:
+          min: 1
+          max: 12
+          step: 1
     hold_minutes:
       name: Orchestrator hold
       description: Minutes to keep orchestrator from changing HVAC mode (default 10)

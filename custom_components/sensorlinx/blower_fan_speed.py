@@ -35,10 +35,15 @@ DEFAULT_HOT_WATER_ON_CIRCUIT_SENSOR = "sensor.hot_water_heater_current_consumpti
 DEFAULT_RADIANT_CONTROLLER_POWER_SENSOR = (
     "sensor.radiant_floor_contoller_current_consumption"  # W
 )
-DEFAULT_TOGGLE_GAP_S = 0.45
+DEFAULT_TOGGLE_GAP_S = 0.28
 DEFAULT_FAN_ENGAGE_S = 4.0
-DEFAULT_SETTLE_S = 8.0
+# Emporia minute-average needs a long settle; short settles caused false "done".
+DEFAULT_SETTLE_S = 60.0
 DEFAULT_HOLD_MINUTES = 10
+# Retry Auto->On x3 bursts until residual watts move (from cycle reliability tests).
+DEFAULT_MAX_BURST_RETRIES = 7
+DEFAULT_MIN_DELTA_W = 25.0
+DEFAULT_WRAP_DROP_W = 80.0
 MAX_STEPS = 6
 # speed_1 = lowest continuous fan … speed_6 = highest
 SPEED_LABELS = tuple(f"speed_{i}" for i in range(1, MAX_STEPS + 1))
@@ -141,12 +146,68 @@ class BlowerFanSpeedProgrammer:
     async def _one_speed_step(
         self, entity_id: str, toggle_gap: float
     ) -> None:
-        """Auto→On ×3 inside a short window = one board speed step."""
+        """Auto->On x3 inside a short window = one board speed step attempt."""
         for _ in range(3):
             await self._set_fan_mode(entity_id, "auto")
             await asyncio.sleep(toggle_gap)
             await self._set_fan_mode(entity_id, "on")
             await asyncio.sleep(toggle_gap)
+        # Always leave continuous fan ON after a burst.
+        await self._set_fan_mode(entity_id, "on")
+
+    def _delta_kind(
+        self, baseline: float | None, watts: float | None, min_up: float, wrap_drop: float
+    ) -> str | None:
+        if baseline is None or watts is None:
+            return None
+        delta = watts - baseline
+        if delta >= min_up:
+            return "up"
+        if delta <= -wrap_drop:
+            return "wrap"
+        return None
+
+    async def _step_until_power_moves(
+        self,
+        climate: str,
+        power_sensor: str | None,
+        baseline: float | None,
+        toggle_gap: float,
+        settle: float,
+        max_retries: int,
+        min_up: float,
+        wrap_drop: float,
+        step_index: int,
+        readings: list[dict[str, Any]],
+    ) -> float | None:
+        """Burst Auto->On x3, settle, retry until residual moves or retries exhausted."""
+        watts = baseline
+        for burst in range(1, max_retries + 1):
+            await self._one_speed_step(climate, toggle_gap)
+            await asyncio.sleep(settle)
+            watts = self._read_fan_residual(power_sensor)
+            kind = self._delta_kind(baseline, watts, min_up, wrap_drop)
+            readings.append(
+                {
+                    "label": f"after_step_{step_index}_burst_{burst}",
+                    "watts": watts,
+                    "kind": kind,
+                }
+            )
+            _LOGGER.info(
+                "Blower step %s burst %s/%s residual=%s W (baseline=%s) kind=%s",
+                step_index,
+                burst,
+                max_retries,
+                watts if watts is not None else "n/a",
+                baseline if baseline is not None else "n/a",
+                kind or "no_change",
+            )
+            if kind:
+                return watts
+            # Keep fan on between retries.
+            await self._set_fan_mode(climate, "on")
+        return watts
 
     def begin_hold(self, minutes: float = DEFAULT_HOLD_MINUTES) -> None:
         self.hold_until = datetime.now() + timedelta(minutes=minutes)
@@ -159,7 +220,7 @@ class BlowerFanSpeedProgrammer:
         self.hold_until = None
 
     async def async_step_speed(self, call: ServiceCall) -> dict[str, Any]:
-        """Run N continuous-fan speed steps; optionally sample power each step."""
+        """Run N continuous-fan speed steps; verify via residual watts + retry bursts."""
         climate = self._climate_entity(call)
         power_sensor = self._power_sensor(call)
         steps = int(call.data.get("steps", 1))
@@ -169,6 +230,12 @@ class BlowerFanSpeedProgrammer:
         settle = float(call.data.get("settle_seconds", DEFAULT_SETTLE_S))
         hold_min = float(call.data.get("hold_minutes", DEFAULT_HOLD_MINUTES))
         restore = bool(call.data.get("restore_previous", False))
+        max_retries = int(
+            call.data.get("max_burst_retries", DEFAULT_MAX_BURST_RETRIES)
+        )
+        max_retries = max(1, min(max_retries, 12))
+        min_up = float(call.data.get("min_delta_w", DEFAULT_MIN_DELTA_W))
+        wrap_drop = float(call.data.get("wrap_drop_w", DEFAULT_WRAP_DROP_W))
 
         state = self.hass.states.get(climate)
         if state is None or state.state in ("unavailable", "unknown"):
@@ -184,26 +251,38 @@ class BlowerFanSpeedProgrammer:
         readings.append({"label": "before", "watts": baseline})
 
         _LOGGER.info(
-            "Blower speed program: %s OFF + fan ON, then %s step(s); power=%s",
+            "Blower speed program: %s OFF + fan ON, then %s step(s) "
+            "(settle=%.0fs, max_bursts=%s); power=%s",
             climate,
             steps,
+            settle,
+            max_retries,
             power_sensor or "not configured",
         )
 
         await self._set_hvac_mode(climate, "off")
         await self._set_fan_mode(climate, "on")
         await asyncio.sleep(engage)
-        readings.append(
-            {"label": "fan_engaged", "watts": self._read_fan_residual(power_sensor)}
-        )
+        baseline = self._read_fan_residual(power_sensor)
+        readings.append({"label": "fan_engaged", "watts": baseline})
 
         for i in range(1, steps + 1):
-            await self._one_speed_step(climate, toggle_gap)
-            await asyncio.sleep(settle)
-            watts = self._read_fan_residual(power_sensor)
+            step_baseline = self._read_fan_residual(power_sensor)
+            watts = await self._step_until_power_moves(
+                climate,
+                power_sensor,
+                step_baseline,
+                toggle_gap,
+                settle,
+                max_retries,
+                min_up,
+                wrap_drop,
+                i,
+                readings,
+            )
             readings.append({"label": f"after_step_{i}", "watts": watts})
             _LOGGER.info(
-                "Blower speed step %s/%s complete; fan residual=%s W",
+                "Blower speed step %s/%s finished; fan residual=%s W",
                 i,
                 steps,
                 watts if watts is not None else "n/a",
@@ -222,6 +301,8 @@ class BlowerFanSpeedProgrammer:
             "climate_entity_id": climate,
             "power_sensor": power_sensor,
             "steps": steps,
+            "settle_seconds": settle,
+            "max_burst_retries": max_retries,
             "readings": readings,
             "restored": restore,
             "hold_until": self.hold_until.isoformat() if self.hold_until else None,
