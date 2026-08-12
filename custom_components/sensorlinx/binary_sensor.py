@@ -38,16 +38,26 @@ async def async_setup_entry(
             entities.append(
                 SensorlinxZoneRelayBinarySensor(coordinator, device_data, index)
             )
-        for entry in raw.get("demands") or []:
-            if isinstance(entry, dict) and entry.get("key"):
+        for demand_entry in raw.get("demands") or []:
+            if isinstance(demand_entry, dict) and demand_entry.get("key"):
                 entities.append(
-                    SensorlinxZonDemandBinarySensor(coordinator, device_data, entry)
+                    SensorlinxZonDemandBinarySensor(
+                        coordinator, device_data, demand_entry
+                    )
                 )
-        for entry in raw.get("pumps") or []:
-            if isinstance(entry, dict) and entry.get("key"):
+        for pump_entry in raw.get("pumps") or []:
+            if isinstance(pump_entry, dict) and pump_entry.get("key"):
                 entities.append(
-                    SensorlinxZonPumpBinarySensor(coordinator, device_data, entry)
+                    SensorlinxZonPumpBinarySensor(
+                        coordinator, device_data, pump_entry
+                    )
                 )
+
+    openings_guard = hass.data[DOMAIN].get(f"{entry.entry_id}_openings_guard")
+    if openings_guard is not None:
+        from .openings_guard import get_openings_binary_sensor_entities
+
+        entities.extend(get_openings_binary_sensor_entities(openings_guard))
 
     async_add_entities(entities)
 

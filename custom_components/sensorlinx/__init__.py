@@ -15,6 +15,8 @@ from .coordinator import SensorlinxCoordinator
 from .external_control import SensorlinxExternalControl
 from .outdoor_reset import async_setup_outdoor_reset
 from .daily_report_scheduler import async_setup_daily_report
+from .openings_guard import async_setup_openings_guard
+from .primary_bath_schedule import async_setup_primary_bath_schedule
 from .thermal_logger import async_setup_thermal_logger
 
 _LOGGER = logging.getLogger(__name__)
@@ -48,6 +50,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     outdoor_reset = await async_setup_outdoor_reset(hass, entry, coordinator)
     thermal_logger = await async_setup_thermal_logger(hass, coordinator, outdoor_reset)
+    openings_guard = await async_setup_openings_guard(hass, entry)
+    primary_bath_schedule = await async_setup_primary_bath_schedule(
+        hass, entry, outdoor_reset
+    )
     await async_setup_daily_report(hass)
 
     hass.data.setdefault(DOMAIN, {})
@@ -55,6 +61,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][f"{entry.entry_id}_external"] = external_control
     hass.data[DOMAIN][f"{entry.entry_id}_outdoor_reset"] = outdoor_reset
     hass.data[DOMAIN][f"{entry.entry_id}_thermal_logger"] = thermal_logger
+    hass.data[DOMAIN][f"{entry.entry_id}_openings_guard"] = openings_guard
+    hass.data[DOMAIN][f"{entry.entry_id}_primary_bath_schedule"] = primary_bath_schedule
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -78,6 +86,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        openings_guard = hass.data[DOMAIN].pop(f"{entry.entry_id}_openings_guard", None)
+        if openings_guard is not None:
+            openings_guard.async_unload()
+        primary_bath_schedule = hass.data[DOMAIN].pop(
+            f"{entry.entry_id}_primary_bath_schedule", None
+        )
+        if primary_bath_schedule is not None:
+            primary_bath_schedule.async_unload()
         thermal_logger = hass.data[DOMAIN].pop(f"{entry.entry_id}_thermal_logger", None)
         if thermal_logger is not None:
             thermal_logger.async_unload()

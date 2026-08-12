@@ -530,8 +530,30 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             entity_id = zone.climate_entity_id
             schedule_managed = self.is_schedule_managed_zone(zone_name)
 
-            # Schedule-managed zones (Watts Home): monitor only, don't override setpoints/WWSD
+            # Schedule-managed zones (Watts Home): WWSD off + safety cap only;
+            # day/night setpoints come from Watts or primary_bath_schedule.
             if schedule_managed:
+                zone_shutdown = (
+                    self.is_zone_shutdown(zone_name, outdoor)
+                    and not self._preheat_active
+                )
+                if zone_shutdown:
+                    zone_sd = self.zone_shutdown_temp(zone_name)
+                    _LOGGER.info(
+                        "WWSD: outdoor %.1f°F, schedule-managed %s shutdown at %.1f°F "
+                        "(restart below %.1f°F)",
+                        outdoor,
+                        zone_name,
+                        zone_sd,
+                        zone_sd - SHUTDOWN_DEADBAND,
+                    )
+                    await self.hass.services.async_call(
+                        "climate",
+                        "turn_off",
+                        {"entity_id": entity_id},
+                        blocking=True,
+                    )
+                    continue
                 raw_floor_temp = self._read_zone_floor_temp(zone_name)
                 floor_temp = self.effective_floor_temp(zone_name, raw_floor_temp)
                 zone_cap = self.zone_floor_max(zone_name)
@@ -1693,7 +1715,19 @@ def get_number_entities(
             ),
         ]
         if zone.schedule_managed:
-            entities.extend(common)
+            entities.extend(
+                common
+                + [
+                    ZoneShutdownTempEntity(
+                        coordinator,
+                        controller,
+                        zone_name,
+                        f"WWSD Shutdown: {zone.label}",
+                        None,
+                        entry_id,
+                    ),
+                ]
+            )
             continue
         entities.extend(common + [
             OutdoorResetFloorTargetEntity(

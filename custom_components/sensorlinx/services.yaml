@@ -42,6 +42,19 @@ restore_day_setback:
     Return zones to daytime outdoor-reset targets. Runs at 6 AM or when motion
     is detected while night mode is active.
 
+refresh_openings:
+  name: Refresh Openings
+  description: >-
+    Force a Home Assistant update of door/window contacts, cross-check paired
+    August/door sensors, and re-apply the radiant-floor openings interlock.
+
+apply_primary_bath_floor_schedule:
+  name: Apply Primary Bath Floor Schedule
+  description: >-
+    Set Primary Bath tile floor to the current period target (72F day, 76F night,
+    78F 11:30PM-1AM bedtime) when outdoor WWSD is inactive and Andrew or Becky
+    are home. Turns the floor off when both are away from Forest house.
+
 run_hvac_orchestrator:
   name: Run HVAC Orchestrator
   description: >-

@@ -46,6 +46,12 @@ async def async_setup_entry(
     if thermal_logger:
         entities.append(ThermalLogStatusSensor(thermal_logger))
 
+    openings_guard = hass.data[DOMAIN].get(f"{entry.entry_id}_openings_guard")
+    if openings_guard is not None:
+        from .openings_guard import get_openings_sensor_entities
+
+        entities.extend(get_openings_sensor_entities(openings_guard))
+
     async_add_entities(entities)
 
 
