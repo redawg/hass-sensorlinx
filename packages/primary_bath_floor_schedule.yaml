@@ -1,0 +1,252 @@
+# Primary Bath Watts floor heat — HA backup schedule
+#
+# Day   (7 AM–9 PM): 71 °F
+# Night (9 PM–11:30 PM, 1 AM–7 AM): 75 °F
+# Bedtime / shower (11:30 PM–1 AM): 77 °F
+#
+# Skipped when outdoor temp is at/above SensorLinx WWSD shutdown threshold.
+# Turned off when both Andrew and Becky are away from Forest house.
+
+template:
+  - sensor:
+      - name: sensorlinx_primary_bath_occupants_away
+        unique_id: sensorlinx_primary_bath_occupants_away
+        state: >-
+          {% set andrew_home = is_state('device_tracker.life360_andrew_schoenfeld', 'home')
+             or is_state('person.andrew_schoenfeld', 'home') %}
+          {% set becky_home = is_state('device_tracker.beckysi15promax', 'home')
+             or is_state('device_tracker.becky_laptop', 'home')
+             or is_state('device_tracker.beckys_asus_laptop', 'home') %}
+          {{ not andrew_home and not becky_home }}
+
+script:
+  primary_bath_floor_set_bedtime:
+    alias: "Primary Bath Floor: Bedtime 77F"
+    mode: single
+    sequence:
+      - condition: state
+        entity_id: sensor.sensorlinx_primary_bath_occupants_away
+        state: "false"
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.sensorlinx_outdoor_reset_heating_curve_target','outdoor_temp') | float(999)
+             < states('number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp') | float(65) }}
+      - action: climate.turn_on
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          temperature: 77
+          hvac_mode: heat
+
+  primary_bath_floor_set_night:
+    alias: "Primary Bath Floor: Night 75F"
+    mode: single
+    sequence:
+      - condition: state
+        entity_id: sensor.sensorlinx_primary_bath_occupants_away
+        state: "false"
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.sensorlinx_outdoor_reset_heating_curve_target','outdoor_temp') | float(999)
+             < states('number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp') | float(65) }}
+      - action: climate.turn_on
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          temperature: 75
+          hvac_mode: heat
+
+  primary_bath_floor_set_day:
+    alias: "Primary Bath Floor: Day 71F"
+    mode: single
+    sequence:
+      - condition: state
+        entity_id: sensor.sensorlinx_primary_bath_occupants_away
+        state: "false"
+      - condition: template
+        value_template: >-
+          {{ state_attr('sensor.sensorlinx_outdoor_reset_heating_curve_target','outdoor_temp') | float(999)
+             < states('number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp') | float(65) }}
+      - action: climate.turn_on
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+      - action: climate.set_hvac_mode
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          hvac_mode: heat
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+        data:
+          temperature: 71
+          hvac_mode: heat
+
+  primary_bath_floor_apply_current_period:
+    alias: "Primary Bath Floor: Apply current period"
+    mode: single
+    sequence:
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {% set h = now().hour %}{% set m = now().minute %}
+                  {{ (h == 23 and m >= 30) or h == 0 or (h == 1 and m == 0) }}
+            sequence:
+              - action: script.primary_bath_floor_set_bedtime
+          - conditions:
+              - condition: template
+                value_template: "{{ now().hour >= 21 or now().hour < 7 }}"
+            sequence:
+              - action: script.primary_bath_floor_set_night
+        default:
+          - action: script.primary_bath_floor_set_day
+
+automation:
+  - id: primary_bath_floor_away_off
+    alias: "Primary Bath Floor: Off when both away"
+    description: Turn off Primary Bath heated floor when Andrew and Becky leave Forest house.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - device_tracker.life360_andrew_schoenfeld
+          - person.andrew_schoenfeld
+          - device_tracker.beckysi15promax
+          - device_tracker.becky_laptop
+          - device_tracker.beckys_asus_laptop
+    condition:
+      - condition: state
+        entity_id: sensor.sensorlinx_primary_bath_occupants_away
+        state: "true"
+    action:
+      - action: climate.turn_off
+        target:
+          entity_id: climate.primary_bathroom_primary_bath_floor
+
+  - id: primary_bath_floor_return_on
+    alias: "Primary Bath Floor: Restore on return"
+    description: Re-apply day/night schedule when Andrew or Becky returns home.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - device_tracker.life360_andrew_schoenfeld
+          - person.andrew_schoenfeld
+          - device_tracker.beckysi15promax
+          - device_tracker.becky_laptop
+          - device_tracker.beckys_asus_laptop
+    condition:
+      - condition: state
+        entity_id: sensor.sensorlinx_primary_bath_occupants_away
+        state: "false"
+    action:
+      - action: script.primary_bath_floor_apply_current_period
+
+  - id: primary_bath_floor_bedtime_schedule
+    alias: "Primary Bath Floor: Bedtime schedule (77F)"
+    description: Warm Primary Bath tile floor to 77F at 11:30 PM for shower time.
+    mode: single
+    trigger:
+      - platform: time
+        at: "23:30:00"
+    action:
+      - action: script.primary_bath_floor_set_bedtime
+
+  - id: primary_bath_floor_night_resume_schedule
+    alias: "Primary Bath Floor: Night resume (75F)"
+    description: Drop Primary Bath floor back to 75F after bedtime window ends.
+    mode: single
+    trigger:
+      - platform: time
+        at: "01:00:00"
+    action:
+      - action: script.primary_bath_floor_set_night
+
+  - id: primary_bath_floor_night_schedule
+    alias: "Primary Bath Floor: Night schedule (75F)"
+    description: Set Primary Bath tile floor to 75F at 9 PM.
+    mode: single
+    trigger:
+      - platform: time
+        at: "21:00:00"
+    action:
+      - action: script.primary_bath_floor_set_night
+
+  - id: primary_bath_floor_day_schedule
+    alias: "Primary Bath Floor: Day schedule (71F)"
+    description: Set Primary Bath tile floor to 71F at 7 AM.
+    mode: single
+    trigger:
+      - platform: time
+        at: "07:00:00"
+    action:
+      - action: script.primary_bath_floor_set_day
+
+  - id: primary_bath_floor_schedule_on_startup
+    alias: "Primary Bath Floor: Apply schedule on HA start"
+    description: Re-apply day/night/bedtime setpoint after Home Assistant restarts.
+    mode: single
+    trigger:
+      - platform: homeassistant
+        event: start
+    action:
+      - delay: "00:02:00"
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: sensor.sensorlinx_primary_bath_occupants_away
+                state: "true"
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.primary_bathroom_primary_bath_floor
+        default:
+          - action: script.primary_bath_floor_apply_current_period
+
+  - id: primary_bath_floor_schedule_watchdog
+    alias: "Primary Bath Floor: Hourly schedule watchdog"
+    description: >-
+      Re-push setpoints if the Watts stat drifts, or turn off when outdoor WWSD
+      is active or both occupants are away.
+    mode: single
+    trigger:
+      - platform: time_pattern
+        minutes: "0"
+    action:
+      - choose:
+          - conditions:
+              - condition: state
+                entity_id: sensor.sensorlinx_primary_bath_occupants_away
+                state: "true"
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.primary_bathroom_primary_bath_floor
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ state_attr('sensor.sensorlinx_outdoor_reset_heating_curve_target','outdoor_temp') | float(0)
+                     >= states('number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp') | float(65) }}
+            sequence:
+              - action: climate.turn_off
+                target:
+                  entity_id: climate.primary_bathroom_primary_bath_floor
+        default:
+          - action: script.primary_bath_floor_apply_current_period

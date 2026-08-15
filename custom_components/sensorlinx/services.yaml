@@ -51,8 +51,8 @@ refresh_openings:
 apply_primary_bath_floor_schedule:
   name: Apply Primary Bath Floor Schedule
   description: >-
-    Set Primary Bath tile floor to the current period target (72F day, 76F night,
-    78F 11:30PM-1AM bedtime) when outdoor WWSD is inactive and Andrew or Becky
+    Set Primary Bath tile floor to the current period target (71F day, 75F night,
+    77F 11:30PM-1AM bedtime) when outdoor WWSD is inactive and Andrew or Becky
     are home. Turns the floor off when both are away from Forest house.
 
 run_hvac_orchestrator:
