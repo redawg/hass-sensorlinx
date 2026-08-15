@@ -1,9 +1,9 @@
-"""Night setback for radiant floor zones based on first-floor / basement motion."""
+"""Night setback for radiant floor zones on a fixed evening schedule."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components.number import NumberEntity, NumberMode, RestoreNumber
@@ -11,8 +11,7 @@ from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
-from homeassistant.helpers.event import async_track_state_change_event, async_track_time_change
-from homeassistant.util import dt as dt_util
+from homeassistant.helpers.event import async_track_time_change
 
 from .const import DOMAIN
 
@@ -22,20 +21,6 @@ if TYPE_CHECKING:
     from .outdoor_reset import OutdoorResetController
 
 _LOGGER = logging.getLogger(__name__)
-
-# First floor + downstairs motion (binary_sensor, device_class motion)
-DEFAULT_MOTION_SENSORS = [
-    "binary_sensor.family_room_motion",
-    "binary_sensor.living_room_motion",
-    "binary_sensor.main_floor_motion",
-    "binary_sensor.office_motion",
-    "binary_sensor.invisoutlet_7d18_motion",
-    "binary_sensor.invisoutlet_7f6c_motion",
-    "binary_sensor.invisoutlet_4348_motion",
-    "binary_sensor.front_door_motion_sensor",
-    "binary_sensor.basement_door_motion",
-    "binary_sensor.tp_link_tapo_c230_motion",
-]
 
 # Efficient starting points — tune per zone over time via HA number entities
 DEFAULT_NIGHT_ROOM_TARGETS = {
@@ -47,8 +32,8 @@ DEFAULT_NIGHT_FLOOR_TARGETS = {
     "laundry": 69.0,
 }
 
-DEFAULT_MOTION_IDLE_MINUTES = 45
-NIGHT_CHECK_START_HOUR = 0  # midnight
+NIGHT_SETBACK_HOUR = 23
+NIGHT_SETBACK_MINUTE = 45
 DAY_RESTORE_HOUR = 6
 
 
@@ -58,8 +43,6 @@ class NightSetbackParams:
     def __init__(self) -> None:
         self.enabled: bool = True
         self.active: bool = False
-        self.motion_idle_minutes: int = DEFAULT_MOTION_IDLE_MINUTES
-        self.motion_sensor_ids: list[str] = list(DEFAULT_MOTION_SENSORS)
         self.night_room_targets: dict[str, float] = dict(DEFAULT_NIGHT_ROOM_TARGETS)
         self.night_floor_targets: dict[str, float] = dict(DEFAULT_NIGHT_FLOOR_TARGETS)
 
@@ -70,26 +53,24 @@ class NightSetbackMixin:
     params: Any
     hass: HomeAssistant
     _unsub_night_schedule: Any
-    _unsub_night_motion: Any
     _unsub_day_restore: Any
 
     def _night_params(self) -> NightSetbackParams:
         return self.params.night_setback
 
     async def _setup_night_setback(self) -> None:
-        """Register schedules and motion listeners for night setback."""
-        ns = self._night_params()
-        if not ns.motion_sensor_ids:
-            ns.motion_sensor_ids = list(DEFAULT_MOTION_SENSORS)
-
+        """Register fixed evening setback and morning restore schedules."""
         @callback
-        def _on_schedule(now: datetime) -> None:
-            self.hass.async_create_task(self._async_night_schedule_tick(now))
+        def _on_night_setback(now: datetime) -> None:
+            self.hass.async_create_task(
+                self._async_apply_night_setback("11:45 PM schedule")
+            )
 
         self._unsub_night_schedule = async_track_time_change(
             self.hass,
-            _on_schedule,
-            minute=(0, 15, 30, 45),
+            _on_night_setback,
+            hour=NIGHT_SETBACK_HOUR,
+            minute=NIGHT_SETBACK_MINUTE,
             second=0,
         )
 
@@ -105,42 +86,12 @@ class NightSetbackMixin:
             second=0,
         )
 
-        @callback
-        def _on_motion(event) -> None:
-            if not self._night_params().active:
-                return
-            new_state = event.data.get("new_state")
-            if new_state is None or new_state.state != "on":
-                return
-            self.hass.async_create_task(
-                self._async_restore_day_setback(f"motion on {event.data.get('entity_id')}")
-            )
-
-        self._unsub_night_motion = async_track_state_change_event(
-            self.hass, ns.motion_sensor_ids, _on_motion
-        )
-
     def _unload_night_setback(self) -> None:
-        for attr in ("_unsub_night_schedule", "_unsub_night_motion", "_unsub_day_restore"):
+        for attr in ("_unsub_night_schedule", "_unsub_day_restore"):
             unsub = getattr(self, attr, None)
             if unsub:
                 unsub()
                 setattr(self, attr, None)
-
-    def _has_recent_first_floor_activity(self) -> bool:
-        """True if any monitored motion sensor is on or changed recently."""
-        ns = self._night_params()
-        idle = timedelta(minutes=ns.motion_idle_minutes)
-        now = dt_util.now()
-        for entity_id in ns.motion_sensor_ids:
-            state = self.hass.states.get(entity_id)
-            if state is None or state.state in ("unavailable", "unknown"):
-                continue
-            if state.state == "on":
-                return True
-            if state.last_changed and (now - state.last_changed) < idle:
-                return True
-        return False
 
     def _zone_night_target(
         self,
@@ -165,21 +116,9 @@ class NightSetbackMixin:
             zone_name, DEFAULT_NIGHT_ROOM_TARGETS.get(zone_name, 68.0)
         )
 
-    async def _async_night_schedule_tick(self, now: datetime) -> None:
-        """After midnight, apply night setback when first floor has been still."""
-        ns = self._night_params()
-        if not ns.enabled or ns.active:
-            return
-        if not (NIGHT_CHECK_START_HOUR <= now.hour < DAY_RESTORE_HOUR):
-            return
-        if self._has_recent_first_floor_activity():
-            _LOGGER.debug("Night setback skipped — recent first-floor activity")
-            return
-        await self._async_apply_night_setback("no motion after midnight")
-
     async def _async_apply_night_setback(self, reason: str) -> None:
         ns = self._night_params()
-        if ns.active:
+        if not ns.enabled or ns.active:
             return
         ns.active = True
         _LOGGER.info("Night setback activated (%s)", reason)
@@ -200,9 +139,8 @@ def get_night_setback_number_entities(
     coordinator,
     controller: OutdoorResetController,
 ) -> list[NumberEntity]:
-    """Night target and motion-idle number entities."""
+    """Night target number entities."""
     entities: list[NumberEntity] = [
-        NightMotionIdleNumberEntity(coordinator, controller),
         NightRoomTargetNumberEntity(
             coordinator, controller, "main_area", "Night Target: Main Area", 68.0,
         ),
@@ -230,7 +168,7 @@ def get_night_setback_switch_entities(
 
 
 class NightSetbackEnableSwitch(SwitchEntity):
-    """Enable automatic night setback after midnight when no motion."""
+    """Enable automatic night setback at 11:45 PM."""
 
     _attr_has_entity_name = True
     _attr_name = "Night Setback Enabled"
@@ -304,45 +242,6 @@ class NightModeActiveSwitch(SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         await self._controller._async_restore_day_setback("manual")
-
-
-class NightMotionIdleNumberEntity(RestoreNumber):
-    """Minutes without first-floor motion before night setback applies."""
-
-    _attr_has_entity_name = True
-    _attr_name = "Night Setback: Motion Idle (min)"
-    _attr_mode = NumberMode.BOX
-    _attr_icon = "mdi:motion-sensor"
-    _attr_native_min_value = 15
-    _attr_native_max_value = 120
-    _attr_native_step = 5
-    _attr_unique_id = "sensorlinx_outdoor_reset_night_motion_idle_minutes"
-
-    def __init__(self, coordinator, controller: OutdoorResetController) -> None:
-        self._coordinator = coordinator
-        self._controller = controller
-        self._attr_native_value = controller.params.night_setback.motion_idle_minutes
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        return {
-            "identifiers": {(DOMAIN, "outdoor_reset")},
-            "name": "SensorLinx Outdoor Reset",
-            "manufacturer": "HBX Controls",
-            "model": "Heating Curve Controller",
-        }
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        last = await self.async_get_last_number_data()
-        if last and last.native_value is not None:
-            self._attr_native_value = int(last.native_value)
-        self._controller.params.night_setback.motion_idle_minutes = int(self._attr_native_value)
-
-    async def async_set_native_value(self, value: float) -> None:
-        self._attr_native_value = int(value)
-        self._controller.params.night_setback.motion_idle_minutes = int(value)
-        self.async_write_ha_state()
 
 
 class NightRoomTargetNumberEntity(RestoreNumber):

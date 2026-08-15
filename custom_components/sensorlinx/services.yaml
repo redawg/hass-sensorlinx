@@ -33,14 +33,13 @@ set_forecast_entity:
 apply_night_setback:
   name: Apply Night Setback
   description: >-
-    Lower heated floor zones to night targets. Normally runs automatically after
-    midnight when no first-floor or basement motion is detected.
+    Lower heated floor zones to night targets. Normally runs automatically at
+    11:45 PM when night setback is enabled.
 
 restore_day_setback:
   name: Restore Day Setback
   description: >-
-    Return zones to daytime outdoor-reset targets. Runs at 6 AM or when motion
-    is detected while night mode is active.
+    Return zones to daytime outdoor-reset targets. Runs automatically at 6 AM.
 
 refresh_openings:
   name: Refresh Openings
