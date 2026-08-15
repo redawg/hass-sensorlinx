@@ -39,12 +39,12 @@ DEFAULT_MOTION_SENSORS = [
 
 # Efficient starting points — tune per zone over time via HA number entities
 DEFAULT_NIGHT_ROOM_TARGETS = {
-    "main_area": 69.0,
-    "living_room": 68.0,
-    "main_office": 66.0,
+    "main_area": 68.0,
+    "living_room": 67.0,
+    "main_office": 65.0,
 }
 DEFAULT_NIGHT_FLOOR_TARGETS = {
-    "laundry": 70.0,
+    "laundry": 69.0,
 }
 
 DEFAULT_MOTION_IDLE_MINUTES = 45
@@ -204,16 +204,16 @@ def get_night_setback_number_entities(
     entities: list[NumberEntity] = [
         NightMotionIdleNumberEntity(coordinator, controller),
         NightRoomTargetNumberEntity(
-            coordinator, controller, "main_area", "Night Target: Main Area", 69.0,
+            coordinator, controller, "main_area", "Night Target: Main Area", 68.0,
         ),
         NightRoomTargetNumberEntity(
-            coordinator, controller, "living_room", "Night Target: Living Room", 68.0,
+            coordinator, controller, "living_room", "Night Target: Living Room", 67.0,
         ),
         NightRoomTargetNumberEntity(
-            coordinator, controller, "main_office", "Night Target: Main Office", 66.0,
+            coordinator, controller, "main_office", "Night Target: Main Office", 65.0,
         ),
         NightFloorTargetNumberEntity(
-            coordinator, controller, "laundry", "Night Floor Target: Laundry", 70.0,
+            coordinator, controller, "laundry", "Night Floor Target: Laundry", 69.0,
         ),
     ]
     return entities

@@ -71,7 +71,7 @@ _LOGGER = logging.getLogger(__name__)
 OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
 UPDATE_INTERVAL = timedelta(minutes=15)
 
-DEFAULT_BASE = 70.0
+DEFAULT_BASE = 69.0
 DEFAULT_OVERSHOOT = 6.0
 DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
