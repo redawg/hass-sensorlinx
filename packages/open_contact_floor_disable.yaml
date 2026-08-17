@@ -1,0 +1,82 @@
+# Disable radiant floor heater when ecobee door/window contacts are open
+# or the Redmond thermostat is off.
+#
+# Live automation id (UI / REST): sensorlinx_disable_floor_on_openings
+# Deploy script: scripts/deploy_open_contact_floor_disable.py
+#
+# Rule:
+#   - Any listed contact open (on) → turn OFF switch.radiant_floor_contoller
+#   - climate.main_floor is off → turn OFF radiant floor controller
+#   - Restore ON when thermostat is active (heat/cool/heat_cool/auto)
+#     AND all contacts are closed (not on)
+#
+# Ecobee Smart Sensors (device_class: opening) — on = open, off = closed
+#
+# Contacts:
+#   kitchen window, office WPXP, nanowall, garage WK2N, basement door, front door
+
+automation:
+  - id: sensorlinx_disable_floor_on_openings
+    alias: "SensorLinx: Disable floor when openings open or thermostat off"
+    description: >-
+      Turns off the radiant floor controller (Tapo) when any ecobee door/window
+      contact is open, or when the Redmond thermostat is off. Restores power when
+      the thermostat is active again and all contacts are closed.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - binary_sensor.wldj_contact
+          - binary_sensor.wpxp_contact
+          - binary_sensor.s92n_contact
+          - binary_sensor.wk2n_contact
+          - binary_sensor.basement_door_contact
+          - binary_sensor.front_door_contact
+          - climate.main_floor
+    condition: []
+    action:
+      - choose:
+          - conditions:
+              - condition: or
+                conditions:
+                  - condition: state
+                    entity_id: climate.main_floor
+                    state: "off"
+                  - condition: template
+                    value_template: >-
+                      {{ [
+                        states('binary_sensor.wldj_contact'),
+                        states('binary_sensor.wpxp_contact'),
+                        states('binary_sensor.s92n_contact'),
+                        states('binary_sensor.wk2n_contact'),
+                        states('binary_sensor.basement_door_contact'),
+                        states('binary_sensor.front_door_contact'),
+                      ] | select('eq', 'on') | list | length > 0 }}
+              - condition: state
+                entity_id: switch.radiant_floor_contoller
+                state: "on"
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.radiant_floor_contoller
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {{ states('climate.main_floor') in ['heat','cool','heat_cool','auto'] }}
+              - condition: template
+                value_template: >-
+                  {{ [
+                    states('binary_sensor.wldj_contact'),
+                    states('binary_sensor.wpxp_contact'),
+                    states('binary_sensor.s92n_contact'),
+                    states('binary_sensor.wk2n_contact'),
+                    states('binary_sensor.basement_door_contact'),
+                    states('binary_sensor.front_door_contact'),
+                  ] | select('eq', 'on') | list | length == 0 }}
+              - condition: state
+                entity_id: switch.radiant_floor_contoller
+                state: "off"
+            sequence:
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.radiant_floor_contoller

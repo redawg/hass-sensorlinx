@@ -134,6 +134,12 @@ The HBX cloud API does not expose a single “system master off” for ZON-0600 
 
 Pump and zone relays follow THM demand — when thermostats are off/away and DHW is disabled, circulation pumps stop.
 
+### Open doors/windows → radiant floor off
+
+HA automation **`sensorlinx_disable_floor_on_openings`** turns off `switch.radiant_floor_contoller` when any configured ecobee door/window contact is **open**, or when `climate.main_floor` is **off**. Restores the Tapo when the thermostat is active again and all contacts are closed.
+
+Package: `packages/open_contact_floor_disable.yaml` · deploy: `scripts/deploy_open_contact_floor_disable.py`
+
 ## Automation examples
 
 ```yaml
