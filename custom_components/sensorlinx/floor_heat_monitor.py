@@ -93,6 +93,7 @@ class FloorHeatMonitor:
             )
         )
         await self._async_reset_pacific_day_if_needed(datetime.now(PACIFIC))
+        await self._async_backfill_integrated_today(datetime.now(PACIFIC).date())
         self._evaluate(reason="startup", integrate=False)
 
     def async_unload(self) -> None:
@@ -166,6 +167,52 @@ class FloorHeatMonitor:
             _LOGGER.warning("Floor heat history baseline failed: %s", err)
             return None
 
+    async def _async_backfill_integrated_today(self, day: date) -> None:
+        """Integrate guarded Ecoflow power history since Pacific midnight."""
+        midnight_pt = datetime.combine(day, time.min, tzinfo=PACIFIC)
+        start = midnight_pt.astimezone(timezone.utc)
+        end = datetime.now(timezone.utc)
+
+        def _integrate() -> float:
+            states_map = history.get_significant_states(
+                self.hass,
+                start,
+                end,
+                [ECOFLOW_HEAT_POWER],
+                include_start_time_state=True,
+            )
+            states = states_map.get(ECOFLOW_HEAT_POWER, [])
+            total_kwh = 0.0
+            prev_time = None
+            prev_power = None
+            for state in states:
+                if state.state in ("unavailable", "unknown"):
+                    continue
+                try:
+                    power_w = float(state.state)
+                except (TypeError, ValueError):
+                    continue
+                ts = state.last_changed
+                if (
+                    prev_time is not None
+                    and prev_power is not None
+                    and prev_power >= 1.0
+                ):
+                    gap_s = (ts - prev_time).total_seconds()
+                    if 0 < gap_s <= POWER_STALE_AFTER.total_seconds():
+                        total_kwh += prev_power * (gap_s / 3600.0) / 1000.0
+                prev_time = ts
+                prev_power = power_w
+            return round(total_kwh, 3)
+
+        try:
+            integrated = await self.hass.async_add_executor_job(_integrate)
+            self.snapshot.integrated_kwh_today = integrated
+            self._last_integrate_at = datetime.now(PACIFIC)
+            _LOGGER.info("Floor heat integrated backfill (%s Pacific): %.3f kWh", day, integrated)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Floor heat integration backfill failed: %s", err)
+
     def _read_float(self, entity_id: str) -> float | None:
         state = self.hass.states.get(entity_id)
         if state is None or state.state in ("unavailable", "unknown"):
@@ -212,7 +259,7 @@ class FloorHeatMonitor:
 
         ecoflow_counter = self._read_float(ECOFLOW_HEAT_ENERGY)
         baseline = self.snapshot.ecoflow_baseline_kwh
-        ecoflow_delta = None
+        ecoflow_delta = self.snapshot.ecoflow_delta_kwh
         if (
             not stale
             and ecoflow_counter is not None
