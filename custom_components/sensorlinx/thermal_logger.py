@@ -77,20 +77,13 @@ TANKLESS_BINARY = {
 }
 TANKLESS_WATER_HEATER = "water_heater.main_water_heater"
 
-# Ecoflow Forest panel — 240 V tankless floor heat source (Ch 1/3)
-ECOFLOW_FLOOR_HEAT_POWER = (
-    "sensor.ecoflow_power_ocean_forest_heater_floor_water_heater_ch_1_3_power"
+from .floor_heat_monitor import (
+    ECOFLOW_HEAT_POWER as ECOFLOW_FLOOR_HEAT_POWER,
+    ENTITY_FLOOR_HEAT_ENERGY_TODAY as SENSORLINX_FLOOR_HEAT_ENERGY_TODAY,
+    ENTITY_FLOOR_HEAT_POWER_GUARDED as SENSORLINX_FLOOR_HEAT_POWER_GUARDED,
+    ENTITY_FLOOR_HEAT_POWER_STALE as SENSORLINX_FLOOR_HEAT_POWER_STALE,
+    ENTITY_FLOOR_HEAT_PUMPS_POWER as SENSORLINX_FLOOR_HEAT_PUMPS_POWER,
 )
-SENSORLINX_FLOOR_HEAT_POWER_GUARDED = (
-    "sensor.sensorlinx_floor_heat_ecoflow_power_guarded"
-)
-SENSORLINX_FLOOR_HEAT_ENERGY_TODAY = (
-    "sensor.sensorlinx_floor_heat_source_energy_today"
-)
-SENSORLINX_FLOOR_HEAT_POWER_STALE = (
-    "binary_sensor.sensorlinx_floor_heat_ecoflow_power_stale"
-)
-SENSORLINX_FLOOR_HEAT_PUMPS_POWER = "sensor.sensorlinx_floor_heat_pumps_power"
 
 
 class ThermalDataLogger:
@@ -396,6 +389,14 @@ class ThermalDataLogger:
 
         return result
 
+    @staticmethod
+    def _first_state(hass: HomeAssistant, *entity_ids: str):
+        for entity_id in entity_ids:
+            state = hass.states.get(entity_id)
+            if state and state.state not in ("unavailable", "unknown"):
+                return state
+        return None
+
     def _get_tankless_state(self) -> dict[str, Any]:
         """Collect Optimal Tankless water heater state for thermal analysis."""
         result: dict[str, Any] = {}
@@ -447,7 +448,11 @@ class ThermalDataLogger:
             result["wh_btu_hr"] = None
 
         # Ecoflow Ch 1/3 (canonical heat-source power / daily kWh)
-        guarded = self.hass.states.get(SENSORLINX_FLOOR_HEAT_POWER_GUARDED)
+        guarded = self._first_state(
+            self.hass,
+            SENSORLINX_FLOOR_HEAT_POWER_GUARDED,
+            "sensor.sensorlinx_floor_heat_monitor_floor_heat_source_power",
+        )
         if guarded and guarded.state not in ("unavailable", "unknown"):
             try:
                 result["ecoflow_power_kw"] = float(guarded.state) / 1000.0
@@ -463,7 +468,13 @@ class ThermalDataLogger:
             else:
                 result["ecoflow_power_kw"] = None
 
-        energy_today = self.hass.states.get(SENSORLINX_FLOOR_HEAT_ENERGY_TODAY)
+        energy_today = self._first_state(
+            self.hass,
+            SENSORLINX_FLOOR_HEAT_ENERGY_TODAY,
+            "sensor.sensorlinx_floor_heat_monitor_floor_heat_source_energy_today",
+            "sensor.sensorlinx_floor_heat_ecoflow_energy_today",
+            "sensor.sensorlinx_floor_heat_monitor_floor_heat_ecoflow_energy_today",
+        )
         if energy_today and energy_today.state not in ("unavailable", "unknown"):
             try:
                 result["ecoflow_energy_today_kwh"] = float(energy_today.state)
@@ -472,7 +483,11 @@ class ThermalDataLogger:
         else:
             result["ecoflow_energy_today_kwh"] = None
 
-        stale = self.hass.states.get(SENSORLINX_FLOOR_HEAT_POWER_STALE)
+        stale = self._first_state(
+            self.hass,
+            SENSORLINX_FLOOR_HEAT_POWER_STALE,
+            "binary_sensor.sensorlinx_floor_heat_monitor_floor_heat_ecoflow_power_stale",
+        )
         result["ecoflow_power_stale"] = (
             stale is not None and stale.state == "on"
         )

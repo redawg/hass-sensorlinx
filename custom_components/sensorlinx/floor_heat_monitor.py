@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.recorder import history
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy, UnitOfPower
@@ -37,6 +38,13 @@ ECOFLOW_HEAT_ENERGY = (
 )
 TAPO_RADIANT_CURRENT = "sensor.radiant_floor_contoller_current"
 TAPO_RADIANT_VOLTAGE = "sensor.radiant_floor_contoller_voltage"
+
+# Canonical HA entity_id suffixes (has_entity_name=False → stable IDs for YAML/reports)
+ENTITY_FLOOR_HEAT_POWER_GUARDED = "sensor.sensorlinx_floor_heat_ecoflow_power_guarded"
+ENTITY_FLOOR_HEAT_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_source_energy_today"
+ENTITY_FLOOR_HEAT_ECOFLOW_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_ecoflow_energy_today"
+ENTITY_FLOOR_HEAT_PUMPS_POWER = "sensor.sensorlinx_floor_heat_pumps_power"
+ENTITY_FLOOR_HEAT_POWER_STALE = "binary_sensor.sensorlinx_floor_heat_ecoflow_power_stale"
 
 
 @dataclass
@@ -84,8 +92,8 @@ class FloorHeatMonitor:
                 self.hass, self._async_integrate_tick, INTEGRATE_INTERVAL
             )
         )
+        await self._async_reset_pacific_day_if_needed(datetime.now(PACIFIC))
         self._evaluate(reason="startup", integrate=False)
-        self._async_reset_pacific_day_if_needed(datetime.now().astimezone(PACIFIC))
 
     def async_unload(self) -> None:
         """Remove listeners."""
@@ -106,24 +114,57 @@ class FloorHeatMonitor:
     async def _async_integrate_tick(self, _now: datetime | None = None) -> None:
         """Integrate guarded power into today's kWh."""
         now = (_now or datetime.now()).astimezone(PACIFIC)
-        self._async_reset_pacific_day_if_needed(now)
+        await self._async_reset_pacific_day_if_needed(now)
         self._evaluate(reason="interval", integrate=True)
 
-    def _async_reset_pacific_day_if_needed(self, now_pacific: datetime) -> None:
+    async def _async_reset_pacific_day_if_needed(self, now_pacific: datetime) -> None:
         """Reset daily counters at Pacific midnight."""
         day = now_pacific.date().isoformat()
-        if self._pacific_day == day:
+        if self._pacific_day == day and self.snapshot.ecoflow_baseline_kwh is not None:
             return
         self._pacific_day = day
         self._last_integrate_at = None
         self.snapshot.integrated_kwh_today = 0.0
-        self.snapshot.ecoflow_baseline_kwh = self._read_float(ECOFLOW_HEAT_ENERGY)
+        baseline = await self._async_baseline_at_pacific_midnight(now_pacific.date())
+        if baseline is None:
+            baseline = self._read_float(ECOFLOW_HEAT_ENERGY)
+        self.snapshot.ecoflow_baseline_kwh = baseline
         self.snapshot.pacific_day = day
         _LOGGER.info(
             "Floor heat energy day reset (%s Pacific); Ecoflow baseline=%.3f kWh",
             day,
-            self.snapshot.ecoflow_baseline_kwh or 0.0,
+            baseline or 0.0,
         )
+
+    async def _async_baseline_at_pacific_midnight(self, day: date) -> float | None:
+        """Read Ecoflow counter near Pacific midnight from recorder history."""
+        midnight_pt = datetime.combine(day, time.min, tzinfo=PACIFIC)
+        start = midnight_pt.astimezone(timezone.utc)
+        end = start + timedelta(hours=1)
+
+        def _read_history() -> float | None:
+            states_map = history.get_significant_states(
+                self.hass,
+                start,
+                end,
+                [ECOFLOW_HEAT_ENERGY],
+                include_start_time_state=True,
+            )
+            states = states_map.get(ECOFLOW_HEAT_ENERGY, [])
+            for state in states:
+                if state.state in ("unavailable", "unknown"):
+                    continue
+                try:
+                    return float(state.state)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        try:
+            return await self.hass.async_add_executor_job(_read_history)
+        except Exception as err:  # noqa: BLE001 — history may be unavailable briefly
+            _LOGGER.warning("Floor heat history baseline failed: %s", err)
+            return None
 
     def _read_float(self, entity_id: str) -> float | None:
         state = self.hass.states.get(entity_id)
@@ -231,8 +272,8 @@ def _device_info() -> dict[str, Any]:
 class FloorHeatEcoflowPowerStaleBinarySensor(BinarySensorEntity):
     """True when Ecoflow Ch 1/3 power has not updated recently."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Floor heat Ecoflow power stale"
+    _attr_has_entity_name = False
+    _attr_name = "Sensorlinx floor heat ecoflow power stale"
     _attr_icon = "mdi:power-plug-off-outline"
 
     def __init__(self, monitor: FloorHeatMonitor) -> None:
@@ -261,8 +302,8 @@ class FloorHeatEcoflowPowerStaleBinarySensor(BinarySensorEntity):
 class FloorHeatEcoflowPowerGuardedSensor(SensorEntity):
     """Ecoflow Ch 1/3 power (W) — unavailable when stale."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Floor heat source power"
+    _attr_has_entity_name = False
+    _attr_name = "Sensorlinx floor heat ecoflow power guarded"
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT
@@ -294,8 +335,8 @@ class FloorHeatEcoflowPowerGuardedSensor(SensorEntity):
 class FloorHeatSourceEnergyTodaySensor(SensorEntity):
     """Pacific-day kWh from guarded Ecoflow power integration."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Floor heat source energy today"
+    _attr_has_entity_name = False
+    _attr_name = "Sensorlinx floor heat source energy today"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL
@@ -325,8 +366,8 @@ class FloorHeatSourceEnergyTodaySensor(SensorEntity):
 class FloorHeatEcoflowEnergyTodaySensor(SensorEntity):
     """Pacific-day kWh delta from Ecoflow energy counter (cross-check)."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Floor heat Ecoflow energy today"
+    _attr_has_entity_name = False
+    _attr_name = "Sensorlinx floor heat ecoflow energy today"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL
@@ -359,8 +400,8 @@ class FloorHeatEcoflowEnergyTodaySensor(SensorEntity):
 class FloorHeatPumpsPowerSensor(SensorEntity):
     """Tapo radiant controller + pumps power (W)."""
 
-    _attr_has_entity_name = True
-    _attr_name = "Floor heat pumps power"
+    _attr_has_entity_name = False
+    _attr_name = "Sensorlinx floor heat pumps power"
     _attr_native_unit_of_measurement = UnitOfPower.WATT
     _attr_device_class = SensorDeviceClass.POWER
     _attr_state_class = SensorStateClass.MEASUREMENT

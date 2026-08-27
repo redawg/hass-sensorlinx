@@ -45,12 +45,10 @@ IDEAL_DELTA_T = (10.0, 20.0)
 TANKLESS_MAX_TEMP = 140.0
 ZONE_FLOOR_TYPE = {
     "laundry": "tile",
-    "primary_bath": "tile",
     "living_room": "wood",
     "main_area": "wood",
     "main_office": "wood",
 }
-SCHEDULE_MANAGED_ZONES = frozenset({"primary_bath"})
 DEFAULT_WOOD_FLOOR_MAX = 80.0
 DEFAULT_TILE_FLOOR_MAX = 88.0
 DEFAULT_ZONE_FLOOR_SENSOR_BIAS = {"living_room": -5.0}
@@ -58,9 +56,21 @@ DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 COST_ENTITY = "number.sensorlinx_outdoor_reset_electricity_cost_per_kwh"
 POWER_DRAW_ENTITY = "sensor.main_water_heater_power_draw"
 FLOOR_HEAT_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_source_energy_today"
+FLOOR_HEAT_ENERGY_TODAY_ALIASES = (
+    FLOOR_HEAT_ENERGY_TODAY,
+    "sensor.sensorlinx_floor_heat_monitor_floor_heat_source_energy_today",
+)
 FLOOR_HEAT_ECOFLOW_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_ecoflow_energy_today"
+FLOOR_HEAT_ECOFLOW_ENERGY_TODAY_ALIASES = (
+    FLOOR_HEAT_ECOFLOW_ENERGY_TODAY,
+    "sensor.sensorlinx_floor_heat_monitor_floor_heat_ecoflow_energy_today",
+)
 FLOOR_HEAT_POWER_GUARDED = "sensor.sensorlinx_floor_heat_ecoflow_power_guarded"
 FLOOR_HEAT_POWER_STALE = "binary_sensor.sensorlinx_floor_heat_ecoflow_power_stale"
+FLOOR_HEAT_POWER_STALE_ALIASES = (
+    FLOOR_HEAT_POWER_STALE,
+    "binary_sensor.sensorlinx_floor_heat_monitor_floor_heat_ecoflow_power_stale",
+)
 FLOOR_HEAT_PUMPS_POWER = "sensor.sensorlinx_floor_heat_pumps_power"
 ECOFLOW_CH13_RAW_ENERGY = (
     "sensor.ecoflow_power_ocean_forest_heater_floor_water_heater_ch_1_3_energy"
@@ -220,19 +230,21 @@ def get_electricity_cost_per_kwh(states):
 
 def get_floor_heat_energy_today(states):
     """Prefer SensorLinx Pacific-day Ecoflow integration; fallback to thermal log."""
-    for entity_id in (FLOOR_HEAT_ENERGY_TODAY, FLOOR_HEAT_ECOFLOW_ENERGY_TODAY):
+    stale = any(
+        states.get(eid, {}).get("state") == "on" for eid in FLOOR_HEAT_POWER_STALE_ALIASES
+    )
+    for entity_id in FLOOR_HEAT_ENERGY_TODAY_ALIASES + FLOOR_HEAT_ECOFLOW_ENERGY_TODAY_ALIASES:
         entity = states.get(entity_id, {})
         state = entity.get("state")
         try:
             kwh = float(state)
         except (TypeError, ValueError):
             continue
-        stale = states.get(FLOOR_HEAT_POWER_STALE, {}).get("state") == "on"
         return {
             "energy_kwh": kwh,
             "source_entity": entity_id,
             "power_stale": stale,
-            "from_integration": entity_id == FLOOR_HEAT_ENERGY_TODAY,
+            "from_integration": entity_id in FLOOR_HEAT_ENERGY_TODAY_ALIASES,
         }
     return None
 
@@ -682,265 +694,6 @@ def print_hydronic_sections(metrics, adjustments, applied=None):
         print()
 
 
-ORCHESTRATOR_ENTITIES = {
-    "precool_threshold": "number.sensorlinx_cooling_control_pre_cool_forecast_high_threshold",
-    "precool_target": "number.sensorlinx_cooling_control_pre_cool_target_setpoint",
-    "max_outdoor_cooling": "number.sensorlinx_cooling_control_cooling_max_outdoor_temp",
-    "stratification_threshold": "number.sensorlinx_cooling_control_upstairs_bias_gap_threshold",
-    "thermal_lag": "number.sensorlinx_outdoor_reset_preheat_thermal_lag_min_degf",
-    "precool_lead": "number.sensorlinx_orchestrator_precool_lead_min",
-}
-ORCHESTRATOR_FINETUNE_STEP = 1.0
-ORCHESTRATOR_LAG_STEP = 5.0
-
-
-def analyze_orchestrator_performance(recent, states):
-    """Score yesterday's HVAC mode timing vs outdoor temps and stratification."""
-    ecobee_samples = []
-    by_ts = {}
-    for s in recent:
-        ts = s.get("ts")
-        if ts and s.get("ecobee_mode"):
-            by_ts[ts] = s
-    ecobee_samples = list(by_ts.values())
-
-    metrics = {
-        "cool_samples_outdoor_below_75": 0,
-        "cool_samples_total": 0,
-        "heat_samples_outdoor_above_65": 0,
-        "heat_samples_total": 0,
-        "avg_stratification_when_cooling": None,
-        "max_stratification_when_cooling": None,
-        "zone_lag_estimates": {},
-        "outdoor_high": None,
-        "outdoor_low": None,
-    }
-
-    outdoor = [
-        float(s["outdoor_temp"]) for s in recent if s.get("outdoor_temp") is not None
-    ]
-    if outdoor:
-        metrics["outdoor_high"] = max(outdoor)
-        metrics["outdoor_low"] = min(outdoor)
-
-    max_outdoor = float(
-        states.get(ORCHESTRATOR_ENTITIES["max_outdoor_cooling"], {}).get("state", 75)
-    )
-    shutdown = float(
-        states.get("number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp", {}).get(
-            "state", 65
-        )
-    )
-
-    strat_gaps = []
-    for s in ecobee_samples:
-        mode = s.get("ecobee_mode")
-        out = s.get("outdoor_temp")
-        if out is None:
-            continue
-        out = float(out)
-        if mode == "cool":
-            metrics["cool_samples_total"] += 1
-            if out < max_outdoor:
-                metrics["cool_samples_outdoor_below_75"] += 1
-            gap = s.get("stratification_gap")
-            if gap is not None:
-                strat_gaps.append(float(gap))
-        elif mode == "heat":
-            metrics["heat_samples_total"] += 1
-            if out >= shutdown:
-                metrics["heat_samples_outdoor_above_65"] += 1
-
-    if strat_gaps:
-        metrics["avg_stratification_when_cooling"] = sum(strat_gaps) / len(strat_gaps)
-        metrics["max_stratification_when_cooling"] = max(strat_gaps)
-
-    for z in ZONES:
-        data = [s for s in recent if s.get("zone") == z]
-        cycles = analyze_zone_cycles(data)
-        if cycles:
-            avg_dur = sum(c["duration_min"] for c in cycles) / len(cycles)
-            avg_gain = sum(c["gain"] for c in cycles if c["gain"] > 0) / max(
-                1, sum(1 for c in cycles if c["gain"] > 0)
-            )
-            if avg_gain > 0.1:
-                metrics["zone_lag_estimates"][z] = round(avg_dur / avg_gain, 0)
-
-    return metrics
-
-
-def compute_orchestrator_adjustments(metrics, states):
-    """Suggest tuning for orchestrator, pre-cool, and per-zone preheat timing."""
-    adjustments = []
-
-    max_outdoor = float(
-        states.get(ORCHESTRATOR_ENTITIES["max_outdoor_cooling"], {}).get("state", 75)
-    )
-    precool_threshold = float(
-        states.get(ORCHESTRATOR_ENTITIES["precool_threshold"], {}).get("state", 78)
-    )
-    gap_threshold = float(
-        states.get(ORCHESTRATOR_ENTITIES["stratification_threshold"], {}).get(
-            "state", 2
-        )
-    )
-
-    cool_total = metrics.get("cool_samples_total", 0)
-    cool_waste = metrics.get("cool_samples_outdoor_below_75", 0)
-    if cool_total > 20 and cool_waste / cool_total > 0.15:
-        new_max = max(70, max_outdoor - ORCHESTRATOR_FINETUNE_STEP)
-        if new_max < max_outdoor:
-            adjustments.append({
-                "entity": ORCHESTRATOR_ENTITIES["max_outdoor_cooling"],
-                "action": "set_value",
-                "value": new_max,
-                "reason": (
-                    f"Compressor ran {cool_waste}/{cool_total} samples when outdoor "
-                    f"< {max_outdoor:.0f}F — tighten cooling cutoff"
-                ),
-                "old": max_outdoor,
-                "new": new_max,
-            })
-
-    outdoor_high = metrics.get("outdoor_high")
-    if outdoor_high and outdoor_high < precool_threshold - 3 and cool_total > 10:
-        new_thresh = max(74, precool_threshold - ORCHESTRATOR_FINETUNE_STEP)
-        if new_thresh < precool_threshold:
-            adjustments.append({
-                "entity": ORCHESTRATOR_ENTITIES["precool_threshold"],
-                "action": "set_value",
-                "value": new_thresh,
-                "reason": (
-                    f"24h outdoor high only {outdoor_high:.0f}F — "
-                    f"lower pre-cool forecast threshold"
-                ),
-                "old": precool_threshold,
-                "new": new_thresh,
-            })
-
-    avg_gap = metrics.get("avg_stratification_when_cooling")
-    max_gap = metrics.get("max_stratification_when_cooling")
-    if avg_gap is not None and max_gap is not None:
-        if max_gap > gap_threshold + 2 and avg_gap > gap_threshold:
-            new_gap = min(4.0, gap_threshold + ORCHESTRATOR_FINETUNE_STEP)
-            if new_gap > gap_threshold:
-                adjustments.append({
-                    "entity": ORCHESTRATOR_ENTITIES["stratification_threshold"],
-                    "action": "set_value",
-                    "value": new_gap,
-                    "reason": (
-                        f"Upstairs stratification avg {avg_gap:.1f}F max {max_gap:.1f}F "
-                        f"during cooling — raise bias trigger"
-                    ),
-                    "old": gap_threshold,
-                    "new": new_gap,
-                })
-        elif max_gap < gap_threshold and avg_gap < gap_threshold - 0.5:
-            new_gap = max(1.0, gap_threshold - ORCHESTRATOR_FINETUNE_STEP)
-            if new_gap < gap_threshold:
-                adjustments.append({
-                    "entity": ORCHESTRATOR_ENTITIES["stratification_threshold"],
-                    "action": "set_value",
-                    "value": new_gap,
-                    "reason": (
-                        f"Low stratification during cooling (max {max_gap:.1f}F) — "
-                        f"sensitivity can increase"
-                    ),
-                    "old": gap_threshold,
-                    "new": new_gap,
-                })
-
-    global_lag = float(
-        states.get(ORCHESTRATOR_ENTITIES["thermal_lag"], {}).get("state", 20)
-    )
-    zone_lags = metrics.get("zone_lag_estimates", {})
-    if zone_lags:
-        worst_zone = max(zone_lags, key=zone_lags.get)
-        est = zone_lags[worst_zone]
-        entity = f"number.sensorlinx_zone_thermal_lag_{worst_zone}"
-        current = float(states.get(entity, {}).get("state", global_lag))
-        if est > current + ORCHESTRATOR_LAG_STEP:
-            new_lag = min(60, current + ORCHESTRATOR_LAG_STEP)
-            adjustments.append({
-                "entity": entity,
-                "action": "set_value",
-                "value": new_lag,
-                "reason": (
-                    f"{ZONE_LABELS[worst_zone]} thermal response ~{est:.0f} min/°F — "
-                    f"extend preheat lead"
-                ),
-                "old": current,
-                "new": new_lag,
-            })
-        elif est < current - ORCHESTRATOR_LAG_STEP and est >= 5:
-            new_lag = max(5, current - ORCHESTRATOR_LAG_STEP)
-            adjustments.append({
-                "entity": entity,
-                "action": "set_value",
-                "value": new_lag,
-                "reason": (
-                    f"{ZONE_LABELS[worst_zone]} responds faster ({est:.0f} min/°F) — "
-                    f"shorten preheat lead"
-                ),
-                "old": current,
-                "new": new_lag,
-            })
-
-    seen = {}
-    for adj in adjustments:
-        seen[adj["entity"]] = adj
-    return list(seen.values())
-
-
-def print_orchestrator_sections(metrics, adjustments, applied=None):
-    """Print HVAC orchestrator analysis and finetune actions."""
-    print("-" * 78)
-    print("  11. HVAC ORCHESTRATOR & PRE-COOL/PRE-HEAT TIMING")
-    print("-" * 78)
-    print()
-    if metrics.get("outdoor_high") is not None:
-        print(
-            f"  Outdoor 24h: {metrics['outdoor_low']:.0f}F – {metrics['outdoor_high']:.0f}F"
-        )
-    if metrics.get("cool_samples_total"):
-        pct = (
-            metrics["cool_samples_outdoor_below_75"]
-            / metrics["cool_samples_total"]
-            * 100
-        )
-        print(
-            f"  Cooling samples below outdoor cutoff: "
-            f"{metrics['cool_samples_outdoor_below_75']}/{metrics['cool_samples_total']} "
-            f"({pct:.0f}%)"
-        )
-    if metrics.get("avg_stratification_when_cooling") is not None:
-        print(
-            f"  Stratification during cooling: avg {metrics['avg_stratification_when_cooling']:.1f}F, "
-            f"max {metrics['max_stratification_when_cooling']:.1f}F"
-        )
-    if metrics.get("zone_lag_estimates"):
-        print("  Per-zone preheat lag estimates (min/°F from cycles):")
-        for z, est in sorted(metrics["zone_lag_estimates"].items()):
-            print(f"    {ZONE_LABELS[z]}: {est:.0f}")
-    print()
-
-    print("-" * 78)
-    print("  12. ORCHESTRATOR FINETUNE ACTIONS")
-    print("-" * 78)
-    print()
-    if not adjustments:
-        print("  No orchestrator adjustments needed.")
-        print()
-        return
-    for i, adj in enumerate(adjustments, 1):
-        status = "APPLIED" if applied and any(
-            a.get("entity") == adj["entity"] and a.get("applied") for a in applied
-        ) else "SUGGESTED"
-        print(f"  {i}. {adj['entity'].split('.')[-1]}: {adj.get('old')} -> {adj.get('new')} [{status}]")
-        print(f"     {adj['reason']}")
-        print()
-
-
 def main(apply_supply=False):
     print("=" * 78)
     print("  DAILY RADIANT FLOOR SYSTEM REPORT")
@@ -1025,8 +778,7 @@ def main(apply_supply=False):
         else:
             grade = "Needs attention"
 
-        schedule_note = " (Watts schedule)" if z in SCHEDULE_MANAGED_ZONES else ""
-        print(f"  {ZONE_LABELS[z]:<14} {score:<8} {current_room:<10} {target_str:<9} {heat_pct:<8} {grade} - {reason}{schedule_note}")
+        print(f"  {ZONE_LABELS[z]:<14} {score:<8} {current_room:<10} {target_str:<9} {heat_pct:<8} {grade} - {reason}")
 
     overall = sum(zone_scores.values()) / len(zone_scores) if zone_scores else 0
     print()
@@ -1393,13 +1145,6 @@ def main(apply_supply=False):
     applied = apply_adjustments(supply_adjustments) if apply_supply and supply_adjustments else None
     print_hydronic_sections(hydronic_metrics, supply_adjustments, applied)
 
-    orch_metrics = analyze_orchestrator_performance(recent, states)
-    orch_adjustments = compute_orchestrator_adjustments(orch_metrics, states)
-    orch_applied = (
-        apply_adjustments(orch_adjustments) if apply_supply and orch_adjustments else None
-    )
-    print_orchestrator_sections(orch_metrics, orch_adjustments, orch_applied)
-
     print("=" * 78)
     print("  END OF REPORT")
     print("=" * 78)
@@ -1409,8 +1154,6 @@ def main(apply_supply=False):
         "hydronic_score": compute_hydronic_efficiency_score(hydronic_metrics)[0],
         "adjustments": supply_adjustments,
         "applied": applied,
-        "orchestrator_adjustments": orch_adjustments,
-        "orchestrator_applied": orch_applied,
     }
 
 
