@@ -55,6 +55,14 @@ DEFAULT_ZONE_FLOOR_SENSOR_BIAS = {"living_room": -5.0}
 DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 COST_ENTITY = "number.sensorlinx_outdoor_reset_electricity_cost_per_kwh"
 POWER_DRAW_ENTITY = "sensor.main_water_heater_power_draw"
+FLOOR_HEAT_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_source_energy_today"
+FLOOR_HEAT_ECOFLOW_ENERGY_TODAY = "sensor.sensorlinx_floor_heat_ecoflow_energy_today"
+FLOOR_HEAT_POWER_GUARDED = "sensor.sensorlinx_floor_heat_ecoflow_power_guarded"
+FLOOR_HEAT_POWER_STALE = "binary_sensor.sensorlinx_floor_heat_ecoflow_power_stale"
+FLOOR_HEAT_PUMPS_POWER = "sensor.sensorlinx_floor_heat_pumps_power"
+ECOFLOW_CH13_RAW_ENERGY = (
+    "sensor.ecoflow_power_ocean_forest_heater_floor_water_heater_ch_1_3_energy"
+)
 MAX_POWER_GAP_MINUTES = 15
 
 
@@ -208,6 +216,25 @@ def get_electricity_cost_per_kwh(states):
         return DEFAULT_ELECTRICITY_COST
 
 
+def get_floor_heat_energy_today(states):
+    """Prefer SensorLinx Pacific-day Ecoflow integration; fallback to thermal log."""
+    for entity_id in (FLOOR_HEAT_ENERGY_TODAY, FLOOR_HEAT_ECOFLOW_ENERGY_TODAY):
+        entity = states.get(entity_id, {})
+        state = entity.get("state")
+        try:
+            kwh = float(state)
+        except (TypeError, ValueError):
+            continue
+        stale = states.get(FLOOR_HEAT_POWER_STALE, {}).get("state") == "on"
+        return {
+            "energy_kwh": kwh,
+            "source_entity": entity_id,
+            "power_stale": stale,
+            "from_integration": entity_id == FLOOR_HEAT_ENERGY_TODAY,
+        }
+    return None
+
+
 def compute_tankless_energy(recent, max_gap_minutes=MAX_POWER_GAP_MINUTES):
     """Integrate tankless power draw from thermal log samples (dedupe by timestamp)."""
     by_ts = {}
@@ -308,7 +335,21 @@ def analyze_hydronic_performance(recent, zone_data, states):
     wh_actual = wh.get("attributes", {}).get("current_temperature")
 
     cost_per_kwh = get_electricity_cost_per_kwh(states)
-    energy = compute_tankless_energy(recent)
+    floor_energy = get_floor_heat_energy_today(states)
+    if floor_energy:
+        energy = {
+            "energy_kwh": floor_energy["energy_kwh"],
+            "avg_power_kw": None,
+            "peak_power_kw": None,
+            "active_hours": None,
+            "sample_points": 0,
+            "energy_source": floor_energy["source_entity"],
+            "power_stale": floor_energy["power_stale"],
+        }
+    else:
+        energy = compute_tankless_energy(recent)
+        energy["energy_source"] = "thermal_log_integration"
+        energy["power_stale"] = None
     daily_cost = energy["energy_kwh"] * cost_per_kwh
     cost_per_1000_btu = None
     if avg_btu and energy["energy_kwh"] > 0.01:
@@ -346,6 +387,8 @@ def analyze_hydronic_performance(recent, zone_data, states):
         "wh_actual": wh_actual,
         "cost_per_kwh": cost_per_kwh,
         "energy_kwh": energy["energy_kwh"],
+        "energy_source": energy.get("energy_source"),
+        "power_stale": energy.get("power_stale"),
         "daily_cost": daily_cost,
         "peak_power_kw": energy["peak_power_kw"],
         "tankless_active_hours": energy["active_hours"],
@@ -590,7 +633,11 @@ def print_hydronic_sections(metrics, adjustments, applied=None):
         if metrics.get("live_power_kw") is not None:
             print(f"  Current power draw: {metrics['live_power_kw']:.2f} kW")
         if metrics.get("energy_kwh", 0) > 0:
-            print(f"  Tankless energy (24h): {metrics['energy_kwh']:.2f} kWh")
+            src = metrics.get("energy_source") or "unknown"
+            stale = metrics.get("power_stale")
+            stale_note = " (Ecoflow power stale — integrated value frozen)" if stale else ""
+            print(f"  Floor heat source energy (Pacific today): {metrics['energy_kwh']:.2f} kWh{stale_note}")
+            print(f"  Energy source: {src}")
             print(f"  Electricity rate: ${metrics['cost_per_kwh']:.3f}/kWh")
             print(f"  Estimated daily cost: ${metrics['daily_cost']:.2f}")
             if metrics.get("tankless_active_hours", 0) > 0:

@@ -16,6 +16,7 @@ from .external_control import SensorlinxExternalControl
 from .outdoor_reset import async_setup_outdoor_reset
 from .daily_report_scheduler import async_setup_daily_report
 from .openings_guard import async_setup_openings_guard
+from .floor_heat_monitor import async_setup_floor_heat_monitor
 from .primary_bath_schedule import async_setup_primary_bath_schedule
 from .thermal_logger import async_setup_thermal_logger
 
@@ -51,6 +52,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     outdoor_reset = await async_setup_outdoor_reset(hass, entry, coordinator)
     thermal_logger = await async_setup_thermal_logger(hass, coordinator, outdoor_reset)
     openings_guard = await async_setup_openings_guard(hass, entry)
+    floor_heat_monitor = await async_setup_floor_heat_monitor(hass, entry)
     primary_bath_schedule = await async_setup_primary_bath_schedule(
         hass, entry, outdoor_reset
     )
@@ -62,6 +64,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][f"{entry.entry_id}_outdoor_reset"] = outdoor_reset
     hass.data[DOMAIN][f"{entry.entry_id}_thermal_logger"] = thermal_logger
     hass.data[DOMAIN][f"{entry.entry_id}_openings_guard"] = openings_guard
+    hass.data[DOMAIN][f"{entry.entry_id}_floor_heat_monitor"] = floor_heat_monitor
     hass.data[DOMAIN][f"{entry.entry_id}_primary_bath_schedule"] = primary_bath_schedule
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -89,6 +92,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         openings_guard = hass.data[DOMAIN].pop(f"{entry.entry_id}_openings_guard", None)
         if openings_guard is not None:
             openings_guard.async_unload()
+        floor_heat_monitor = hass.data[DOMAIN].pop(
+            f"{entry.entry_id}_floor_heat_monitor", None
+        )
+        if floor_heat_monitor is not None:
+            floor_heat_monitor.async_unload()
         primary_bath_schedule = hass.data[DOMAIN].pop(
             f"{entry.entry_id}_primary_bath_schedule", None
         )

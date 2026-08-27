@@ -52,6 +52,12 @@ async def async_setup_entry(
 
         entities.extend(get_openings_sensor_entities(openings_guard))
 
+    floor_heat_monitor = hass.data[DOMAIN].get(f"{entry.entry_id}_floor_heat_monitor")
+    if floor_heat_monitor is not None:
+        from .floor_heat_monitor import get_floor_heat_sensor_entities
+
+        entities.extend(get_floor_heat_sensor_entities(floor_heat_monitor))
+
     async_add_entities(entities)
 
 

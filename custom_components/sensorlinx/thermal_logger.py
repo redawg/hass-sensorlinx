@@ -77,6 +77,21 @@ TANKLESS_BINARY = {
 }
 TANKLESS_WATER_HEATER = "water_heater.main_water_heater"
 
+# Ecoflow Forest panel — 240 V tankless floor heat source (Ch 1/3)
+ECOFLOW_FLOOR_HEAT_POWER = (
+    "sensor.ecoflow_power_ocean_forest_heater_floor_water_heater_ch_1_3_power"
+)
+SENSORLINX_FLOOR_HEAT_POWER_GUARDED = (
+    "sensor.sensorlinx_floor_heat_ecoflow_power_guarded"
+)
+SENSORLINX_FLOOR_HEAT_ENERGY_TODAY = (
+    "sensor.sensorlinx_floor_heat_source_energy_today"
+)
+SENSORLINX_FLOOR_HEAT_POWER_STALE = (
+    "binary_sensor.sensorlinx_floor_heat_ecoflow_power_stale"
+)
+SENSORLINX_FLOOR_HEAT_PUMPS_POWER = "sensor.sensorlinx_floor_heat_pumps_power"
+
 
 class ThermalDataLogger:
     """Periodically logs thermal state for ML training.
@@ -430,6 +445,50 @@ class ThermalDataLogger:
             result["wh_btu_hr"] = round(500 * flow * dt, 0)
         else:
             result["wh_btu_hr"] = None
+
+        # Ecoflow Ch 1/3 (canonical heat-source power / daily kWh)
+        guarded = self.hass.states.get(SENSORLINX_FLOOR_HEAT_POWER_GUARDED)
+        if guarded and guarded.state not in ("unavailable", "unknown"):
+            try:
+                result["ecoflow_power_kw"] = float(guarded.state) / 1000.0
+            except (TypeError, ValueError):
+                result["ecoflow_power_kw"] = None
+        else:
+            raw_pw = self.hass.states.get(ECOFLOW_FLOOR_HEAT_POWER)
+            if raw_pw and raw_pw.state not in ("unavailable", "unknown"):
+                try:
+                    result["ecoflow_power_kw"] = float(raw_pw.state) / 1000.0
+                except (TypeError, ValueError):
+                    result["ecoflow_power_kw"] = None
+            else:
+                result["ecoflow_power_kw"] = None
+
+        energy_today = self.hass.states.get(SENSORLINX_FLOOR_HEAT_ENERGY_TODAY)
+        if energy_today and energy_today.state not in ("unavailable", "unknown"):
+            try:
+                result["ecoflow_energy_today_kwh"] = float(energy_today.state)
+            except (TypeError, ValueError):
+                result["ecoflow_energy_today_kwh"] = None
+        else:
+            result["ecoflow_energy_today_kwh"] = None
+
+        stale = self.hass.states.get(SENSORLINX_FLOOR_HEAT_POWER_STALE)
+        result["ecoflow_power_stale"] = (
+            stale is not None and stale.state == "on"
+        )
+
+        pumps = self.hass.states.get(SENSORLINX_FLOOR_HEAT_PUMPS_POWER)
+        if pumps and pumps.state not in ("unavailable", "unknown"):
+            try:
+                result["pumps_power_w"] = float(pumps.state)
+            except (TypeError, ValueError):
+                result["pumps_power_w"] = None
+        else:
+            result["pumps_power_w"] = None
+
+        # Prefer Ecoflow Ch 1/3 for wh_power_kw when available (canonical heat source)
+        if result.get("ecoflow_power_kw") is not None:
+            result["wh_power_kw"] = result["ecoflow_power_kw"]
 
         return result
 
