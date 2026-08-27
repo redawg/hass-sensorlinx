@@ -1,12 +1,14 @@
-"""Validate door/window openings and refresh stale HomeKit contacts.
+"""Validate door/window openings and refresh stale contact sensors.
 
-HomeKit contact sensors can stick open while a paired August (or other)
-door sensor reports closed. This guard:
+Ecobee contact sensors can stick open while a paired August door sensor
+reports closed (or vice versa). For paired openings this guard:
 
 1. Periodically calls ``homeassistant.update_entity`` on watched contacts
 2. Cross-checks authority sensors when available
-3. Exposes a validated ``any open`` binary sensor + status sensor
-4. Optionally mirrors the radiant-floor interlock (HVAC off or opening open)
+3. Treats the opening as **closed when any paired sensor says closed**
+   (open only when every available sensor says open)
+4. Exposes a validated ``any open`` binary sensor + status sensor
+5. Optionally mirrors the radiant-floor interlock (HVAC off or opening open)
 """
 
 from __future__ import annotations
@@ -39,7 +41,6 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 REFRESH_INTERVAL = timedelta(minutes=5)
-CONFLICT_GRACE = timedelta(minutes=2)
 
 DEFAULT_OPENING_CONTACTS = (
     "binary_sensor.wldj_contact",  # Kitchen Window
@@ -47,12 +48,14 @@ DEFAULT_OPENING_CONTACTS = (
     "binary_sensor.s92n_contact",  # Nanowall
     "binary_sensor.wk2n_contact",  # Garage Door contact
     "binary_sensor.basement_door_contact",
-    "binary_sensor.front_door_contact",
+    "binary_sensor.tb56_contact",  # Ecobee front door contact
 )
 
-# Prefer these when a HomeKit contact disagrees after refresh.
+# Front door: Ecobee ``tb56_contact`` + August ``front_door_door`` only (no legacy contact).
+# Garage: Ecobee ``wk2n_contact`` + August ``garage_door_door``.
+# Closed if *either* paired sensor reports closed; open only when all available say open.
 DEFAULT_AUTHORITY_PAIRS = {
-    "binary_sensor.front_door_contact": "binary_sensor.front_door_door",
+    "binary_sensor.tb56_contact": "binary_sensor.front_door_door",
     "binary_sensor.wk2n_contact": "binary_sensor.garage_door_door",
 }
 
@@ -114,7 +117,6 @@ class OpeningsGuard:
         self._unsub: list[Callable[[], None]] = []
         self._entities: list[Any] = []
         self._refreshing = False
-        self._pending_conflicts: dict[str, datetime] = {}
 
     async def async_setup(self) -> None:
         """Start listeners, refresh contacts, and take over floor interlock."""
@@ -224,6 +226,39 @@ class OpeningsGuard:
             return entity_id
         return state.attributes.get("friendly_name") or entity_id
 
+    def _effective_opening(
+        self,
+        *,
+        raw_open: bool | None,
+        authority_open: bool | None,
+        has_authority: bool,
+    ) -> tuple[bool, bool, str]:
+        """Combine contact + authority with OR-closed semantics."""
+        if not has_authority:
+            if raw_open is None:
+                return False, False, "unavailable"
+            return bool(raw_open), False, "contact"
+
+        readings: list[bool] = []
+        if raw_open is not None:
+            readings.append(raw_open)
+        if authority_open is not None:
+            readings.append(authority_open)
+
+        if not readings:
+            return False, False, "unavailable"
+
+        if any(not is_open for is_open in readings):
+            conflict = (
+                raw_open is not None
+                and authority_open is not None
+                and raw_open != authority_open
+            )
+            note = "any_closed_or" if conflict else "any_closed"
+            return False, conflict, note
+
+        return True, False, "all_open" if len(readings) > 1 else "contact"
+
     def _evaluate(self, *, reason: str) -> None:
         """Build validated readings from raw contacts + authority pairs."""
         now = datetime.now().astimezone()
@@ -238,43 +273,13 @@ class OpeningsGuard:
             authority_open = (
                 self._entity_open(authority_id) if authority_id else None
             )
-            conflict = False
-            note = "contact"
-            effective = bool(raw_open)
-
-            if authority_id and authority_open is not None:
-                if raw_open is None:
-                    effective = authority_open
-                    note = "authority_only"
-                elif raw_open != authority_open:
-                    first_seen = self._pending_conflicts.get(contact_id)
-                    if first_seen is None:
-                        self._pending_conflicts[contact_id] = now
-                        first_seen = now
-                    # Prefer authority once the conflict has persisted a bit,
-                    # or immediately when contact claims open and door claims closed
-                    # (the stuck HomeKit failure mode we hit).
-                    sticky_open_false_positive = raw_open and not authority_open
-                    aged = (now - first_seen) >= CONFLICT_GRACE
-                    if sticky_open_false_positive or aged:
-                        effective = authority_open
-                        conflict = True
-                        note = (
-                            "authority_override"
-                            if sticky_open_false_positive
-                            else "authority_override_aged"
-                        )
-                        conflict_names.append(name)
-                    else:
-                        effective = raw_open
-                        note = "conflict_grace"
-                else:
-                    self._pending_conflicts.pop(contact_id, None)
-                    effective = raw_open
-                    note = "agree"
-            elif raw_open is None:
-                effective = False
-                note = "unavailable"
+            effective, conflict, note = self._effective_opening(
+                raw_open=raw_open,
+                authority_open=authority_open,
+                has_authority=authority_id is not None,
+            )
+            if conflict:
+                conflict_names.append(name)
 
             reading = OpeningReading(
                 entity_id=contact_id,
@@ -474,7 +479,7 @@ class OpeningsStatusSensor(SensorEntity):
         if snap.conflict_names and snap.any_open:
             return "open_with_conflicts"
         if snap.conflict_names:
-            return "closed_authority_override"
+            return "closed_cross_ref"
         if snap.any_open:
             return "open"
         return "all_closed"
