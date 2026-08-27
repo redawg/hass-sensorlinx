@@ -3,6 +3,7 @@
   "name": "HBX SensorLinx",
   "codeowners": ["@redawg"],
   "config_flow": true,
+  "dependencies": ["recorder"],
   "documentation": "https://github.com/redawg/hass-sensorlinx",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
