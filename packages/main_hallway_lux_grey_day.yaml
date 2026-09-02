@@ -1,0 +1,52 @@
+# Main hallway lights — grey-day outdoor lux auto-brightness
+#
+# Deploy: scripts/deploy_main_hallway_lux_grey_day.py
+#
+# - Adjusts light.main_hallway_lights from outdoor lux when grey/dark (lux < 7500).
+# - Physical/manual off during grey day sets sensor.main_hallway_manual_off_date →
+#   blocks auto-on until next sunrise reset.
+
+template:
+  - sensor:
+      - name: Main Hallway Lux Target Pct
+        unique_id: main_hallway_lux_target_pct
+        unit_of_measurement: "%"
+        state: >-
+          {% set lux = states('sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance') | float(99999) %}
+          {% if lux >= 7500 and is_state('sun.sun', 'above_horizon') %}
+            0
+          {% elif is_state('sun.sun', 'below_horizon') and lux >= 500 %}
+            20
+          {% elif lux >= 5000 %}
+            25
+          {% elif lux >= 3000 %}
+            40
+          {% elif lux >= 1500 %}
+            55
+          {% elif lux >= 500 %}
+            70
+          {% else %}
+            85
+          {% endif %}
+
+input_boolean:
+  main_hallway_manual_off_today:
+    name: Main Hallway manual off (grey day)
+    icon: mdi:lightbulb-off-outline
+
+automation:
+  - id: main_hallway_manual_off_reset
+    alias: "Main Hallway: reset manual off at sunrise"
+    description: Clear grey-day manual-off flag each morning.
+    mode: single
+    trigger:
+      - platform: sun
+        event: sunrise
+    action:
+      - action: homeassistant.set_state
+        data:
+          entity_id: sensor.main_hallway_manual_off_date
+          state: none
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.main_hallway_manual_off_today

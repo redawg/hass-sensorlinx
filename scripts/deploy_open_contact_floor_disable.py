@@ -21,7 +21,7 @@ CONTACTS = [
     "binary_sensor.s92n_contact",
     "binary_sensor.wk2n_contact",
     "binary_sensor.basement_door_contact",
-    "binary_sensor.front_door_contact",
+    "binary_sensor.tb56_contact",  # Ecobee front door
 ]
 
 

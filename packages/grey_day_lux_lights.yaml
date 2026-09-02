@@ -1,0 +1,21 @@
+# Grey-day lux auto-brightness — Forest Home
+#
+# Deploy all zones: scripts/deploy_grey_day_lux_lights.py
+#
+# Interior zones (indoor hallway lux):
+#   sensor.invisoutlet_7f6c_illuminance — Main Hallway Outlets 2
+#   Dark if < 150 lx or after sunset · bright enough if >= 250 lx
+#   Applies to: main hallway, family wall, kitchen floor LEDs
+#
+# Exterior (outdoor weather station lux):
+#   sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance
+#   Dark if < 7500 lx or after sunset
+#   Applies to: soffit lights
+#
+# Manual / physical switch on or off during auto hours → paused until 5:30 AM
+# Main hallway: low idle when no motion · motion brighten for walk-through
+# Shared reset: automation.grey_day_lux_reset_manual_override_530am
+#
+# Indoor brightness curve (lower lux → higher %):
+#   >= 300 lx day: off · night: 20% (floor strips 1%)
+#   150–300: 25% (floor 10%) · 80–150: 40% · 40–80: 55% · 15–40: 70% · <15: 85%

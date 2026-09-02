@@ -1,0 +1,37 @@
+# Living Room Tapo S505D — keep smooth on/off at 3 seconds.
+#
+# The bulb firmware sometimes reports 30s back to HA after bulk Tapo writes.
+# Live automation id: living_room_smooth_transition_enforce
+# Deploy: scripts/deploy_living_room_smooth_enforce.py
+
+automation:
+  - id: living_room_smooth_transition_enforce
+    alias: "Living Room: enforce 3s smooth on/off"
+    description: >-
+      Re-applies 3 second smooth on/off when the Tapo S505D bulb reports
+      a different fade duration (commonly 30s from firmware or Tapo app sync).
+    mode: single
+    trigger:
+      - platform: state
+        entity_id:
+          - number.living_room_smooth_on
+          - number.living_room_smooth_off
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: template
+        value_template: >-
+          {{ states('number.living_room_smooth_on') not in ['unavailable', 'unknown', 'none']
+             and states('number.living_room_smooth_off') not in ['unavailable', 'unknown', 'none']
+             and (
+               states('number.living_room_smooth_on') | float(0) != 3
+               or states('number.living_room_smooth_off') | float(0) != 3
+             ) }}
+    action:
+      - action: number.set_value
+        target:
+          entity_id:
+            - number.living_room_smooth_on
+            - number.living_room_smooth_off
+        data:
+          value: 3

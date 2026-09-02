@@ -31,7 +31,7 @@ automation:
           - binary_sensor.s92n_contact
           - binary_sensor.wk2n_contact
           - binary_sensor.basement_door_contact
-          - binary_sensor.front_door_contact
+          - binary_sensor.tb56_contact
           - climate.main_floor
     condition: []
     action:
@@ -50,7 +50,7 @@ automation:
                         states('binary_sensor.s92n_contact'),
                         states('binary_sensor.wk2n_contact'),
                         states('binary_sensor.basement_door_contact'),
-                        states('binary_sensor.front_door_contact'),
+                        states('binary_sensor.tb56_contact'),
                       ] | select('eq', 'on') | list | length > 0 }}
               - condition: state
                 entity_id: switch.radiant_floor_contoller
@@ -71,7 +71,7 @@ automation:
                     states('binary_sensor.s92n_contact'),
                     states('binary_sensor.wk2n_contact'),
                     states('binary_sensor.basement_door_contact'),
-                    states('binary_sensor.front_door_contact'),
+                    states('binary_sensor.tb56_contact'),
                   ] | select('eq', 'on') | list | length == 0 }}
               - condition: state
                 entity_id: switch.radiant_floor_contoller

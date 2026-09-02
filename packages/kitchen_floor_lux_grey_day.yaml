@@ -1,0 +1,86 @@
+# Kitchen floor LED strips — grey-day outdoor lux supplement
+#
+# Deploy: scripts/deploy_kitchen_floor_lux_grey_day.py
+#
+# Night mode when after sunset OR outdoor lux < 7500 lx.
+# Brightness scales with lux (template sensor below).
+
+template:
+  - sensor:
+      - name: Kitchen Floor Lux Target Pct
+        unique_id: kitchen_floor_lux_target_pct
+        unit_of_measurement: "%"
+        state: >-
+          {% set lux = states('sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance') | float(99999) %}
+          {% if lux >= 7500 and is_state('sun.sun', 'above_horizon') %}
+            0
+          {% elif is_state('sun.sun', 'below_horizon') and lux >= 500 %}
+            1
+          {% elif lux >= 5000 %}
+            10
+          {% elif lux >= 3000 %}
+            18
+          {% elif lux >= 1500 %}
+            28
+          {% elif lux >= 500 %}
+            40
+          {% else %}
+            50
+          {% endif %}
+        attributes:
+          motion_pct: >-
+            {% set base = states('sensor.kitchen_floor_lux_target_pct') | int(18) %}
+            {{ [base + 35, 85] | min }}
+          ambient_dark: >-
+            {{ is_state('sun.sun', 'below_horizon')
+               or (states('sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance') | float(99999) < 7500) }}
+
+  - binary_sensor:
+      - name: Kitchen Floor Ambient Dark
+        unique_id: kitchen_floor_ambient_dark
+        device_class: light
+        state: >-
+          {{ is_state('sun.sun', 'below_horizon')
+             or (states('sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance') | float(99999) < 7500) }}
+
+automation:
+  - id: kitchen_floor_lux_ambient_on
+    alias: "Kitchen Floor: ambient lux brightness"
+    description: >-
+      Set kitchen floor LED strip brightness from outdoor lux when grey/dark
+      (lux < 7500 or after sunset). Updates on lux changes — not motion-only.
+    mode: single
+    trigger:
+      - platform: state
+        entity_id: sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance
+      - platform: numeric_state
+        entity_id: sensor.outside_front_quail_creek_ames_lake_279th_ct_ne_illuminance
+        below: 7500
+      - platform: sun
+        event: sunset
+      - platform: homeassistant
+        event: start
+    condition:
+      - condition: state
+        entity_id: binary_sensor.kitchen_floor_ambient_dark
+        state: "on"
+    action:
+      - variables:
+          pct: "{{ states('sensor.kitchen_floor_lux_target_pct') | int(18) }}"
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ pct | int(0) == 0 }}"
+            sequence:
+              - action: light.turn_off
+                target:
+                  label_id: kitchen_floor_led_stirps
+                data:
+                  transition: 5
+        default:
+          - action: light.turn_on
+            target:
+              label_id: kitchen_floor_led_stirps
+            data:
+              brightness_pct: "{{ pct }}"
+              transition: 5
