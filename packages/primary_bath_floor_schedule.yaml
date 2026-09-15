@@ -1,8 +1,8 @@
 # Primary Bath Watts floor heat — HA backup schedule
 #
-# Day   (7 AM–9 PM): 71 °F
-# Night (9 PM–11:30 PM, 1 AM–7 AM): 75 °F
-# Bedtime / shower (11:30 PM–1 AM): 77 °F
+# Day   (7 AM–9 PM): 74 °F
+# Night (9 PM–11:30 PM, 1 AM–7 AM): 78 °F
+# Bedtime / shower (11:30 PM–1 AM): 80 °F
 #
 # Skipped when outdoor temp is at/above SensorLinx WWSD shutdown threshold.
 # Turned off when both Andrew and Becky are away from Forest house.
@@ -21,7 +21,7 @@ template:
 
 script:
   primary_bath_floor_set_bedtime:
-    alias: "Primary Bath Floor: Bedtime 77F"
+    alias: "Primary Bath Floor: Bedtime 80F"
     mode: single
     sequence:
       - condition: state
@@ -43,11 +43,11 @@ script:
         target:
           entity_id: climate.primary_bathroom_primary_bath_floor
         data:
-          temperature: 77
+          temperature: 80
           hvac_mode: heat
 
   primary_bath_floor_set_night:
-    alias: "Primary Bath Floor: Night 75F"
+    alias: "Primary Bath Floor: Night 78F"
     mode: single
     sequence:
       - condition: state
@@ -69,11 +69,11 @@ script:
         target:
           entity_id: climate.primary_bathroom_primary_bath_floor
         data:
-          temperature: 75
+          temperature: 78
           hvac_mode: heat
 
   primary_bath_floor_set_day:
-    alias: "Primary Bath Floor: Day 71F"
+    alias: "Primary Bath Floor: Day 74F"
     mode: single
     sequence:
       - condition: state
@@ -95,7 +95,7 @@ script:
         target:
           entity_id: climate.primary_bathroom_primary_bath_floor
         data:
-          temperature: 71
+          temperature: 74
           hvac_mode: heat
 
   primary_bath_floor_apply_current_period:
@@ -160,7 +160,7 @@ automation:
       - action: script.primary_bath_floor_apply_current_period
 
   - id: primary_bath_floor_bedtime_schedule
-    alias: "Primary Bath Floor: Bedtime schedule (77F)"
+    alias: "Primary Bath Floor: Bedtime schedule (80F)"
     description: Warm Primary Bath tile floor to 77F at 11:30 PM for shower time.
     mode: single
     trigger:
@@ -170,7 +170,7 @@ automation:
       - action: script.primary_bath_floor_set_bedtime
 
   - id: primary_bath_floor_night_resume_schedule
-    alias: "Primary Bath Floor: Night resume (75F)"
+    alias: "Primary Bath Floor: Night resume (78F)"
     description: Drop Primary Bath floor back to 75F after bedtime window ends.
     mode: single
     trigger:
@@ -180,8 +180,8 @@ automation:
       - action: script.primary_bath_floor_set_night
 
   - id: primary_bath_floor_night_schedule
-    alias: "Primary Bath Floor: Night schedule (75F)"
-    description: Set Primary Bath tile floor to 75F at 9 PM.
+    alias: "Primary Bath Floor: Night schedule (78F)"
+    description: Set Primary Bath tile floor to 78F at 9 PM.
     mode: single
     trigger:
       - platform: time
@@ -190,8 +190,8 @@ automation:
       - action: script.primary_bath_floor_set_night
 
   - id: primary_bath_floor_day_schedule
-    alias: "Primary Bath Floor: Day schedule (71F)"
-    description: Set Primary Bath tile floor to 71F at 7 AM.
+    alias: "Primary Bath Floor: Day schedule (74F)"
+    description: Set Primary Bath tile floor to 74F at 7 AM.
     mode: single
     trigger:
       - platform: time

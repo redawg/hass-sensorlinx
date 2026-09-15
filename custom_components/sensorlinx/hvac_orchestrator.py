@@ -38,6 +38,8 @@ PLAN_ACTUAL_DIVERGENCE = 6.0  # °F — cancel hot-day plan if actual peak lags 
 DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0  # hot-day whole-house average target (°F)
+DEFAULT_RADIANT_FIRST_ENABLED = True
+DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 1.0  # supplement forced air when main is this far below target
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -84,6 +86,8 @@ class HvacOrchestratorParams:
         self.enabled: bool = DEFAULT_ORCHESTRATOR_ENABLED
         self.heat_setpoint: float = DEFAULT_ORCHESTRATOR_HEAT_SETPOINT
         self.cool_setpoint: float = DEFAULT_ORCHESTRATOR_COOL_SETPOINT
+        self.radiant_first_enabled: bool = DEFAULT_RADIANT_FIRST_ENABLED
+        self.heat_supplement_indoor_margin: float = DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN
         self.evening_cool_cutoff_hour: int = DEFAULT_EVENING_COOL_CUTOFF_HOUR
         self.evening_cool_cutoff_offset_min: int = DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN
         self.evening_coast_hot_override: float = DEFAULT_EVENING_COAST_HOT_OVERRIDE
@@ -429,11 +433,19 @@ class HvacOrchestratorMixin:
 
         want_cool = False
         want_heat = False
+        want_circulate = False
         want_off = False
         reason = ""
         evening = self._evening_cool_cutoff_reached(now)
         cutoff_at = self._evening_cool_cutoff_at(now)
         evening_heat_window = now >= (cutoff_at - timedelta(hours=2))
+        comfort_target = oc.heat_setpoint
+        supplement_below = comfort_target - oc.heat_supplement_indoor_margin
+        need_heat_supplement = (
+            oc.radiant_first_enabled
+            and main is not None
+            and main < supplement_below
+        )
 
         # --- Actual-temp execution (always wins over plan) ---
         if outdoor is not None and outdoor >= cool_limit and not evening:
@@ -449,20 +461,49 @@ class HvacOrchestratorMixin:
             reason = f"holding cool (actual outdoor {outdoor:.0f}°F)"
 
         if (
-            not want_heat
+            not want_cool
             and outdoor is not None
             and outdoor < heat_on_limit
         ):
-            want_heat = True
-            want_off = False
-            reason = f"actual outdoor {outdoor:.1f}°F < {heat_on_limit:.1f}°F"
+            if oc.radiant_first_enabled:
+                if need_heat_supplement:
+                    want_heat = True
+                    reason = (
+                        f"forced-air supplement: main {main:.0f}°F "
+                        f"< {supplement_below:.0f}°F (outdoor {outdoor:.1f}°F)"
+                    )
+                else:
+                    want_circulate = True
+                    main_note = f"{main:.0f}°F" if main is not None else "n/a"
+                    reason = (
+                        f"radiant-first: circulate air "
+                        f"(main {main_note}, outdoor {outdoor:.0f}°F)"
+                    )
+            else:
+                want_heat = True
+                want_off = False
+                reason = f"actual outdoor {outdoor:.1f}°F < {heat_on_limit:.1f}°F"
         elif (
             self._orchestrator_active_mode == "heat"
             and outdoor is not None
             and outdoor < shutdown
         ):
-            want_heat = True
-            reason = f"holding heat (actual outdoor {outdoor:.0f}°F < {shutdown:.0f}°F)"
+            if oc.radiant_first_enabled:
+                if need_heat_supplement:
+                    want_heat = True
+                    reason = (
+                        f"holding forced-air supplement "
+                        f"(main {main:.0f}°F, outdoor {outdoor:.0f}°F)"
+                    )
+                elif main is not None and main >= comfort_target:
+                    want_circulate = True
+                    reason = (
+                        f"radiant holding main {main:.0f}°F — "
+                        f"returning to fan circulation"
+                    )
+            else:
+                want_heat = True
+                reason = f"holding heat (actual outdoor {outdoor:.0f}°F < {shutdown:.0f}°F)"
         elif (
             not want_cool
             and outdoor is not None
@@ -471,17 +512,32 @@ class HvacOrchestratorMixin:
             and trend is not None
             and trend < -0.02
         ):
-            want_heat = True
-            want_off = False
-            reason = (
-                f"actual evening cool-down: outdoor {outdoor:.0f}°F "
-                f"(trend {trend:.2f}°F/min)"
-            )
+            if oc.radiant_first_enabled:
+                if need_heat_supplement:
+                    want_heat = True
+                    reason = (
+                        f"evening supplement: main {main:.0f}°F, outdoor {outdoor:.0f}°F "
+                        f"(trend {trend:.2f}°F/min)"
+                    )
+                else:
+                    want_circulate = True
+                    reason = (
+                        f"evening circulate: outdoor {outdoor:.0f}°F "
+                        f"(trend {trend:.2f}°F/min)"
+                    )
+            else:
+                want_heat = True
+                want_off = False
+                reason = (
+                    f"actual evening cool-down: outdoor {outdoor:.0f}°F "
+                    f"(trend {trend:.2f}°F/min)"
+                )
 
-        # Plan-informed heat when forecast cold night and actual outdoor is dropping
+        # Plan-informed supplement when forecast cold night and main is still cold
         if (
             not want_cool
             and not want_heat
+            and not want_circulate
             and plan
             and plan.cold_night_planned
             and plan.planned_heat_at
@@ -490,12 +546,26 @@ class HvacOrchestratorMixin:
             and outdoor < shutdown + 5
             and (trend is None or trend <= 0)
         ):
-            want_heat = True
-            want_off = False
-            reason = (
-                f"plan + actual: cold night (forecast low {plan.forecast_low:.0f}°F, "
-                f"outdoor {outdoor:.0f}°F)"
-            )
+            if oc.radiant_first_enabled:
+                if need_heat_supplement:
+                    want_heat = True
+                    reason = (
+                        f"plan + actual supplement: main {main:.0f}°F, "
+                        f"forecast low {plan.forecast_low:.0f}°F, outdoor {outdoor:.0f}°F"
+                    )
+                else:
+                    want_circulate = True
+                    reason = (
+                        f"plan cold night — radiant holding main "
+                        f"({main:.0f}°F if known), circulating air"
+                    )
+            else:
+                want_heat = True
+                want_off = False
+                reason = (
+                    f"plan + actual: cold night (forecast low {plan.forecast_low:.0f}°F, "
+                    f"outdoor {outdoor:.0f}°F)"
+                )
 
         if (
             not want_heat
@@ -557,11 +627,18 @@ class HvacOrchestratorMixin:
                     or self._orchestrator_active_mode in ("cool", "heat")
                 )
             ):
-                want_off = True
-                reason = (
-                    f"mild actual outdoor {outdoor:.0f}°F "
-                    f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
-                )
+                if oc.radiant_first_enabled:
+                    want_circulate = True
+                    reason = (
+                        f"mild outdoor {outdoor:.0f}°F — radiant-first fan circulation "
+                        f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
+                    )
+                else:
+                    want_off = True
+                    reason = (
+                        f"mild actual outdoor {outdoor:.0f}°F "
+                        f"({shutdown:.0f}–{cool_off_limit:.0f}°F band)"
+                    )
             elif (
                 evening
                 and self._orchestrator_active_mode == "cool"
@@ -575,6 +652,8 @@ class HvacOrchestratorMixin:
             await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
         elif want_heat:
             await self._orchestrator_apply_heat(hvac_entity, oc, reason)
+        elif want_circulate:
+            await self._orchestrator_apply_circulate(hvac_entity, reason)
         elif want_off:
             await self._orchestrator_apply_off(hvac_entity, reason)
         else:
@@ -908,8 +987,46 @@ class HvacOrchestratorMixin:
         self._orchestrator_active_mode = "heat"
         self._orchestrator_last_decision = "heat"
         self._orchestrator_last_reason = reason
-        _LOGGER.info("Orchestrator → HEAT @ %.0f°F: %s", target, reason)
+        _LOGGER.info("Orchestrator → HEAT SUPPLEMENT @ %.0f°F: %s", target, reason)
         await self._apply_setpoints()
+
+    async def _orchestrator_apply_circulate(self, hvac_entity: str, reason: str) -> None:
+        """Move air with the blower; radiant floors own heat."""
+        cc = self._cooling_params()
+        cc.precool_enabled = False
+        cc.upstairs_bias_enabled = False
+        self._upstairs_bias_active = False
+        self._precool_triggered_date = None
+        self._last_cool_adjustment = 0.0
+        await self._async_turn_off_cooling_fans()
+
+        state = self.hass.states.get(hvac_entity)
+        current = state.state if state else None
+        fan_mode = state.attributes.get("fan_mode") if state else None
+
+        if self._orchestrator_active_mode not in ("circulate",):
+            self._orchestrator_save_hvac_state(state)
+
+        if current in ("heat", "cool"):
+            await self.hass.services.async_call(
+                "climate",
+                "set_hvac_mode",
+                {"entity_id": hvac_entity, "hvac_mode": "off"},
+                blocking=True,
+            )
+        if fan_mode != "on":
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": hvac_entity, "fan_mode": "on"},
+                blocking=True,
+            )
+        self._furnace_fan_circulation_active = True
+        self._furnace_fan_circ_changed_at = datetime.now()
+        self._orchestrator_active_mode = "circulate"
+        self._orchestrator_last_decision = "circulate"
+        self._orchestrator_last_reason = reason
+        _LOGGER.info("Orchestrator → CIRCULATE: %s", reason)
 
     async def _orchestrator_apply_off(self, hvac_entity: str, reason: str) -> None:
         cc = self._cooling_params()
@@ -954,6 +1071,10 @@ class HvacOrchestratorMixin:
             "decision_source": "plan+actual",
             "heat_setpoint": oc.heat_setpoint,
             "cool_setpoint": oc.cool_setpoint,
+            "radiant_first_enabled": oc.radiant_first_enabled,
+            "heat_supplement_indoor_margin": oc.heat_supplement_indoor_margin,
+            "main_floor_temp": self.main_floor_temp,
+            "comfort_target": oc.heat_setpoint,
             "evening_cool_cutoff_hour_fallback": oc.evening_cool_cutoff_hour,
             "evening_cool_cutoff_offset_min": oc.evening_cool_cutoff_offset_min,
             "evening_cool_cutoff_at": self._evening_cool_cutoff_at().isoformat(),

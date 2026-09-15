@@ -78,7 +78,15 @@ DEFAULT_DESIGN_OUTDOOR = 25.0
 DEFAULT_FLOOR_MAX = 80.0  # wood floor safety cap
 DEFAULT_TILE_FLOOR_MAX = 88.0  # tile zones (e.g. laundry) may run hotter
 TILE_FLOOR_ZONES = frozenset({"laundry", "primary_bath"})
-DEFAULT_FLOOR_TARGET = 70.0
+DEFAULT_FLOOR_TARGET = 72.0
+DEFAULT_ZONE_FLOOR_TARGETS: dict[str, float] = {
+    "laundry": 74.0,
+}
+
+
+def default_floor_target(zone_key: str) -> float:
+    """Per-zone default floor target (72F wood zones, 74F tile)."""
+    return DEFAULT_ZONE_FLOOR_TARGETS.get(zone_key, DEFAULT_FLOOR_TARGET)
 
 
 def default_zone_floor_max(zone_key: str, wood_default: float = DEFAULT_FLOOR_MAX) -> float:
@@ -651,7 +659,9 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             return self._zone_night_target(zone_name, floor_mode, floor_temp, outdoor, zone)
 
         if floor_mode:
-            base_floor_target = self.params.floor_targets.get(zone_name, DEFAULT_FLOOR_TARGET)
+            base_floor_target = self.params.floor_targets.get(
+                zone_name, default_floor_target(zone_name)
+            )
             floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
             if zone.direct_floor_thermostat:
                 return self._compute_direct_floor_setpoint(
@@ -1489,7 +1499,9 @@ async def async_setup_outdoor_reset(
         elif zone.direct_floor_thermostat:
             params.floor_control_enabled.setdefault(zone.zone_key, True)
         if not zone.schedule_managed:
-            params.floor_targets.setdefault(zone.zone_key, DEFAULT_FLOOR_TARGET)
+            params.floor_targets.setdefault(
+                zone.zone_key, default_floor_target(zone.zone_key)
+            )
         if zone.zone_key in TILE_FLOOR_ZONES:
             params.zone_floor_max.setdefault(
                 zone.zone_key, default_zone_floor_max(zone.zone_key, params.floor_max)
@@ -1685,7 +1697,7 @@ def get_number_entities(
         entities.append(
             OutdoorResetFloorTargetEntity(
                 coordinator, controller, zone_name,
-                f"Floor Target: {thm.name}", DEFAULT_FLOOR_TARGET, 65, zone_cap, 0.5,
+                f"Floor Target: {thm.name}", default_floor_target(zone_name), 65, zone_cap, 0.5,
                 thm, entry_id,
             )
         )
@@ -1732,7 +1744,7 @@ def get_number_entities(
         entities.extend(common + [
             OutdoorResetFloorTargetEntity(
                 coordinator, controller, zone_name,
-                f"Floor Target: {zone.label}", DEFAULT_FLOOR_TARGET, 65, zone_cap, 0.5,
+                f"Floor Target: {zone.label}", default_floor_target(zone_name), 65, zone_cap, 0.5,
                 None, entry_id,
             ),
             ZoneShutdownTempEntity(
@@ -2232,7 +2244,7 @@ class OutdoorResetZoneTargetSensor(SensorEntity):
     def native_value(self) -> float:
         if self._controller._is_floor_mode_zone(self._zone_key):
             base = self._controller.params.floor_targets.get(
-                self._zone_key, DEFAULT_FLOOR_TARGET
+                self._zone_key, default_floor_target(self._zone_key)
             )
             outdoor = self._controller.outdoor_temp
             if outdoor is not None:
@@ -2354,12 +2366,14 @@ class OutdoorResetFloorModeSwitch(SwitchEntity, RestoreEntity):
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
         self._persist_to_options(True)
+        await self._controller._apply_setpoints()
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self._controller.params.floor_control_enabled[self._zone_key] = False
         self.async_write_ha_state()
         async_dispatcher_send(self.hass, SIGNAL_FLOOR_MODE_CHANGED, self._zone_key)
         self._persist_to_options(False)
+        await self._controller._apply_setpoints()
 
     @callback
     def _persist_to_options(self, enabled: bool) -> None:
@@ -2458,6 +2472,7 @@ class OutdoorResetFloorTargetEntity(RestoreNumber):
         self._controller.params.floor_targets[self._zone_key] = value
         self.async_write_ha_state()
         self._persist_to_options(value)
+        await self._controller._apply_setpoints()
 
     @callback
     def _persist_to_options(self, value: float) -> None:

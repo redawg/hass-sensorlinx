@@ -913,12 +913,12 @@ class CoolingControlMixin:
             return
 
         orch_mode = getattr(self, "_orchestrator_active_mode", None)
-        # Heating distribute must not cancel orchestrator heat (off↔heat fight).
-        if scenario == "heating_distribute" and orch_mode == "heat":
+        # Heating distribute must not cancel orchestrator heat or circulation.
+        if scenario == "heating_distribute" and orch_mode in ("heat", "circulate"):
             _LOGGER.debug(
-                "Fan circulation skipped (heating_distribute): orchestrator in heat"
+                "Fan circulation skipped (heating_distribute): orchestrator in %s",
+                orch_mode,
             )
-            await self._async_stop_furnace_circulation_fan()
             return
 
         _LOGGER.info(
@@ -964,9 +964,9 @@ class CoolingControlMixin:
             return
 
         orch_mode = getattr(self, "_orchestrator_active_mode", None)
-        if orch_mode == "heat" or state.state == "heat":
+        if orch_mode in ("heat", "circulate") or state.state == "heat":
             _LOGGER.info(
-                "Furnace circulation skipped while heat active (%s)", reason
+                "Furnace circulation skipped while heat/circulate active (%s)", reason
             )
             return
 
