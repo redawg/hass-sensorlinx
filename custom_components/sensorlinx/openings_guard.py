@@ -8,7 +8,8 @@ reports closed (or vice versa). For paired openings this guard:
 3. Treats the opening as **closed when any paired sensor says closed**
    (open only when every available sensor says open)
 4. Exposes a validated ``any open`` binary sensor + status sensor
-5. Optionally mirrors the radiant-floor interlock (HVAC off or opening open)
+5. Optionally mirrors the radiant-floor interlock (validated opening open only;
+   Ecobee mode does not gate the pump — radiant heat is independent)
 """
 
 from __future__ import annotations
@@ -63,7 +64,6 @@ DEFAULT_FLOOR_SWITCH = "switch.radiant_floor_contoller"
 LEGACY_FLOOR_AUTOMATION = (
     "automation.sensorlinx_disable_floor_when_openings_open_or_thermostat_off"
 )
-ACTIVE_HVAC_MODES = frozenset({"heat", "cool", "heat_cool", "auto"})
 
 
 @dataclass
@@ -318,18 +318,22 @@ class OpeningsGuard:
                 conflict_names or "none",
             )
 
+    def _floor_blocked_reason(self) -> str | None:
+        """Return why the radiant pump must stay off, or None when allowed."""
+        if self.snapshot.any_open:
+            return f"open:{','.join(self.snapshot.open_names)}"
+        return None
+
     async def _async_enforce_floor(self) -> None:
-        """Turn radiant floor off when HVAC is off or a validated opening is open."""
+        """Turn radiant floor off only when a validated opening is open."""
+        if not self.control_floor:
+            return
         floor_state = self.hass.states.get(self.floor_switch)
         if floor_state is None:
             return
-        hvac_mode = self.snapshot.hvac_mode
-        should_disable = hvac_mode == "off" or self.snapshot.any_open
-        should_enable = (
-            hvac_mode in ACTIVE_HVAC_MODES
-            and not self.snapshot.any_open
-            and floor_state.state == STATE_OFF
-        )
+        block_reason = self._floor_blocked_reason()
+        should_disable = block_reason is not None
+        should_enable = block_reason is None and floor_state.state == STATE_OFF
 
         if should_disable and floor_state.state == STATE_ON:
             await self.hass.services.async_call(
@@ -338,13 +342,8 @@ class OpeningsGuard:
                 {"entity_id": self.floor_switch},
                 blocking=True,
             )
-            reason = (
-                "hvac_off"
-                if hvac_mode == "off"
-                else f"open:{','.join(self.snapshot.open_names)}"
-            )
-            self.snapshot.last_floor_action = f"turn_off ({reason})"
-            _LOGGER.info("Openings guard disabled floor: %s", reason)
+            self.snapshot.last_floor_action = f"turn_off ({block_reason})"
+            _LOGGER.info("Openings guard disabled floor: %s", block_reason)
         elif should_enable:
             await self.hass.services.async_call(
                 "switch",
@@ -394,6 +393,10 @@ class OpeningsGuard:
                 snap.refreshed_at.isoformat() if snap.refreshed_at else None
             ),
             "hvac_mode": snap.hvac_mode,
+            "floor_allowed": not snap.any_open,
+            "floor_block_reason": (
+                f"open:{','.join(snap.open_names)}" if snap.any_open else None
+            ),
             "floor_switch": snap.floor_switch,
             "floor_state": snap.floor_state,
             "last_floor_action": snap.last_floor_action,
