@@ -1,4 +1,4 @@
-"""Heating zone registry — SensorLinx THM zones plus external climate entities."""
+"""Heating zone registry — SensorLinx THM zones plus optional external climates."""
 
 from __future__ import annotations
 
@@ -6,11 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from homeassistant.core import HomeAssistant
-
-from .const import (
-    DEFAULT_PRIMARY_BATH_CLIMATE,
-    DEFAULT_PRIMARY_BATH_ROOM_SENSOR,
-)
 
 if TYPE_CHECKING:
     from .coordinator import SensorlinxCoordinator, SensorlinxDeviceData
@@ -38,16 +33,9 @@ class HeatingZone:
         )
 
 
-DEFAULT_EXTERNAL_ZONES: tuple[HeatingZone, ...] = (
-    HeatingZone(
-        zone_key="primary_bath",
-        label="Primary Bath",
-        climate_entity_id=DEFAULT_PRIMARY_BATH_CLIMATE,
-        direct_floor_thermostat=True,
-        schedule_managed=True,
-        room_temp_sensor=DEFAULT_PRIMARY_BATH_ROOM_SENSOR,
-    ),
-)
+# External (non-THM) zones managed by SensorLinx. Primary Bath / Watts is
+# intentionally omitted — controlled independently of this integration.
+DEFAULT_EXTERNAL_ZONES: tuple[HeatingZone, ...] = ()
 
 
 def get_heating_zones(

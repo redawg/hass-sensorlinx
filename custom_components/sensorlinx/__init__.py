@@ -17,7 +17,6 @@ from .outdoor_reset import async_setup_outdoor_reset
 from .daily_report_scheduler import async_setup_daily_report
 from .openings_guard import async_setup_openings_guard
 from .floor_heat_monitor import async_setup_floor_heat_monitor
-from .primary_bath_schedule import async_setup_primary_bath_schedule
 from .thermal_logger import async_setup_thermal_logger
 
 _LOGGER = logging.getLogger(__name__)
@@ -53,9 +52,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     thermal_logger = await async_setup_thermal_logger(hass, coordinator, outdoor_reset)
     openings_guard = await async_setup_openings_guard(hass, entry)
     floor_heat_monitor = await async_setup_floor_heat_monitor(hass, entry)
-    primary_bath_schedule = await async_setup_primary_bath_schedule(
-        hass, entry, outdoor_reset
-    )
     await async_setup_daily_report(hass)
 
     hass.data.setdefault(DOMAIN, {})
@@ -65,7 +61,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][f"{entry.entry_id}_thermal_logger"] = thermal_logger
     hass.data[DOMAIN][f"{entry.entry_id}_openings_guard"] = openings_guard
     hass.data[DOMAIN][f"{entry.entry_id}_floor_heat_monitor"] = floor_heat_monitor
-    hass.data[DOMAIN][f"{entry.entry_id}_primary_bath_schedule"] = primary_bath_schedule
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -97,11 +92,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         if floor_heat_monitor is not None:
             floor_heat_monitor.async_unload()
-        primary_bath_schedule = hass.data[DOMAIN].pop(
-            f"{entry.entry_id}_primary_bath_schedule", None
-        )
-        if primary_bath_schedule is not None:
-            primary_bath_schedule.async_unload()
         thermal_logger = hass.data[DOMAIN].pop(f"{entry.entry_id}_thermal_logger", None)
         if thermal_logger is not None:
             thermal_logger.async_unload()

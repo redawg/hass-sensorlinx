@@ -11,7 +11,6 @@ TOKEN = (
     "Kh_2jOBqDJnevRqvrEGnZ1E849jrRK0_-SOdr6lr2Fs"
 )
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
-PRIMARY_BATH = "climate.primary_bathroom_primary_bath_floor"
 
 
 def call(service, entity_id=None, **data):
@@ -52,15 +51,6 @@ print("\n=== Reset room-mode offsets (floor control owns setpoints) ===")
 for zone in wood_zones:
     set_number(f"number.sensorlinx_outdoor_reset_zone_offset_{zone}", 0.0)
 
-print("\n=== Primary Bath day setpoint 74F ===")
-call(
-    "climate/set_temperature",
-    entity_id=PRIMARY_BATH,
-    temperature=74,
-    hvac_mode="heat",
-)
-call("sensorlinx/apply_primary_bath_floor_schedule")
-
 print("\n=== Re-run HVAC orchestrator (radiant-first after deploy) ===")
 call("sensorlinx/run_hvac_orchestrator")
 
@@ -72,7 +62,6 @@ checks = [
     "climate.living_room_living_room",
     "climate.main_office_main_office",
     "climate.laundry_laundry",
-    PRIMARY_BATH,
     "climate.main_floor",
     "sensor.sensorlinx_hvac_orchestrator_hvac_orchestrator_status",
 ]

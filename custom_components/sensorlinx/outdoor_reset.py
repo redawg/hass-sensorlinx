@@ -77,7 +77,7 @@ DEFAULT_SHUTDOWN = 65.0
 DEFAULT_DESIGN_OUTDOOR = 25.0
 DEFAULT_FLOOR_MAX = 80.0  # wood floor safety cap
 DEFAULT_TILE_FLOOR_MAX = 88.0  # tile zones (e.g. laundry) may run hotter
-TILE_FLOOR_ZONES = frozenset({"laundry", "primary_bath"})
+TILE_FLOOR_ZONES = frozenset({"laundry"})
 DEFAULT_FLOOR_TARGET = 72.0
 DEFAULT_ZONE_FLOOR_TARGETS: dict[str, float] = {
     "laundry": 74.0,
@@ -538,8 +538,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             entity_id = zone.climate_entity_id
             schedule_managed = self.is_schedule_managed_zone(zone_name)
 
-            # Schedule-managed zones (Watts Home): WWSD off + safety cap only;
-            # day/night setpoints come from Watts or primary_bath_schedule.
+            # Schedule-managed zones: WWSD off + safety cap only;
+            # day/night setpoints come from the device schedule.
             if schedule_managed:
                 zone_shutdown = (
                     self.is_zone_shutdown(zone_name, outdoor)

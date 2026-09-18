@@ -20,21 +20,6 @@ DEFAULT_MAIN_FLOOR_TEMP_SENSOR = "sensor.main_floor_current_temperature"
 DEFAULT_HUNTER_FAN = ""
 DEFAULT_SIDNEY_FAN = ""
 
-# Watts Home / external floor thermostats (not on SensorLinx THM API)
-DEFAULT_PRIMARY_BATH_CLIMATE = "climate.primary_bathroom_primary_bath_floor"
-DEFAULT_PRIMARY_BATH_ROOM_SENSOR = "sensor.ba_temperature"
-
-# Forest house occupancy — Primary Bath floor off when both are away
-DEFAULT_ANDREW_PRESENCE_ENTITIES = (
-    "device_tracker.life360_andrew_schoenfeld",
-    "person.andrew_schoenfeld",
-)
-DEFAULT_BECKY_PRESENCE_ENTITIES = (
-    "device_tracker.beckysi15promax",
-    "device_tracker.becky_laptop",
-    "device_tracker.beckys_asus_laptop",
-)
-
 CONF_COOLING_PAUSED_UNTIL = "cooling_paused_until"
 CONF_COOLING_PAUSE_REASON = "cooling_pause_reason"
 DEFAULT_SCAN_INTERVAL = 60
