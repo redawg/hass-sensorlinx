@@ -64,6 +64,9 @@ DEFAULT_FLOOR_SWITCH = "switch.radiant_floor_contoller"
 LEGACY_FLOOR_AUTOMATION = (
     "automation.sensorlinx_disable_floor_when_openings_open_or_thermostat_off"
 )
+OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
+WWSD_SHUTDOWN_ENTITY = "number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp"
+DEFAULT_WWSD_SHUTDOWN = 65.0
 
 
 @dataclass
@@ -318,14 +321,36 @@ class OpeningsGuard:
                 conflict_names or "none",
             )
 
+    def _outdoor_temp(self) -> float | None:
+        state = self.hass.states.get(OUTDOOR_TEMP_ENTITY)
+        if state is None or state.state in ("unavailable", "unknown"):
+            return None
+        try:
+            return float(state.state)
+        except (TypeError, ValueError):
+            return None
+
+    def _wwsd_shutdown_temp(self) -> float:
+        state = self.hass.states.get(WWSD_SHUTDOWN_ENTITY)
+        if state is not None and state.state not in ("unavailable", "unknown"):
+            try:
+                return float(state.state)
+            except (TypeError, ValueError):
+                pass
+        return DEFAULT_WWSD_SHUTDOWN
+
     def _floor_blocked_reason(self) -> str | None:
         """Return why the radiant pump must stay off, or None when allowed."""
         if self.snapshot.any_open:
             return f"open:{','.join(self.snapshot.open_names)}"
+        outdoor = self._outdoor_temp()
+        shutdown = self._wwsd_shutdown_temp()
+        if outdoor is not None and outdoor >= shutdown:
+            return f"wwsd:outdoor {outdoor:.0f}F >= {shutdown:.0f}F"
         return None
 
     async def _async_enforce_floor(self) -> None:
-        """Turn radiant floor off only when a validated opening is open."""
+        """Turn radiant floor off for open openings or warm-weather shutdown."""
         if not self.control_floor:
             return
         floor_state = self.hass.states.get(self.floor_switch)
@@ -351,8 +376,8 @@ class OpeningsGuard:
                 {"entity_id": self.floor_switch},
                 blocking=True,
             )
-            self.snapshot.last_floor_action = "turn_on (all closed)"
-            _LOGGER.info("Openings guard enabled floor: all validated openings closed")
+            self.snapshot.last_floor_action = "turn_on (all closed, heating season)"
+            _LOGGER.info("Openings guard enabled floor: openings closed, below WWSD")
 
     async def _async_disable_legacy_automation(self) -> None:
         """Disable the UI automation that trusted raw stuck contacts."""
@@ -393,10 +418,8 @@ class OpeningsGuard:
                 snap.refreshed_at.isoformat() if snap.refreshed_at else None
             ),
             "hvac_mode": snap.hvac_mode,
-            "floor_allowed": not snap.any_open,
-            "floor_block_reason": (
-                f"open:{','.join(snap.open_names)}" if snap.any_open else None
-            ),
+            "floor_allowed": self._floor_blocked_reason() is None,
+            "floor_block_reason": self._floor_blocked_reason(),
             "floor_switch": snap.floor_switch,
             "floor_state": snap.floor_state,
             "last_floor_action": snap.last_floor_action,
