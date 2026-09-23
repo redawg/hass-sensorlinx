@@ -1503,6 +1503,9 @@ async def async_setup_outdoor_reset(
     controller = OutdoorResetController(hass, coordinator, params, entry.entry_id)
     controller._config_entry = entry
 
+    # Blower services must exist before async_setup — night air mix programs speed_3 on start.
+    async_register_blower_fan_speed_services(hass, controller)
+
     for zone in params.external_zones:
         if hass.states.get(zone.climate_entity_id) is None:
             continue
@@ -1607,7 +1610,6 @@ async def async_setup_outdoor_reset(
     hass.services.async_register(
         DOMAIN, "clear_cooling_pause", handle_clear_cooling_pause
     )
-    async_register_blower_fan_speed_services(hass, controller)
 
     return controller
 
