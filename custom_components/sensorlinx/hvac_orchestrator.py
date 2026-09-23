@@ -29,6 +29,8 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 ORCHESTRATOR_INTERVAL = timedelta(hours=1)
+# Once heat / cool / circulate starts, do not stop or switch for this long.
+ORCHESTRATOR_MIN_RUN = timedelta(minutes=5)
 ORCHESTRATOR_WATCHDOG_INTERVAL = timedelta(minutes=15)
 ORCHESTRATOR_STALE_AFTER = timedelta(minutes=75)
 ORCHESTRATOR_STARTUP_RETRY = timedelta(seconds=60)
@@ -128,6 +130,7 @@ class HvacOrchestratorMixin:
 
     def _init_orchestrator_state(self) -> None:
         self._orchestrator_active_mode = None
+        self._orchestrator_mode_started_at: datetime | None = None
         self._orchestrator_last_reason = "startup"
         self._orchestrator_last_decision = "none"
         self._orchestrator_saved_hvac = None
@@ -143,6 +146,24 @@ class HvacOrchestratorMixin:
         self._unsub_orch_watchdog = None
         self._unsub_orch_startup_retry = None
         self._unsub_orch_sun = None
+
+    def _orchestrator_note_mode_start(self, mode: str) -> None:
+        """Stamp min-run timer only when entering a new equipment mode."""
+        if self._orchestrator_active_mode != mode:
+            self._orchestrator_mode_started_at = datetime.now()
+
+    def _orchestrator_min_run_remaining(self) -> timedelta | None:
+        """Time left on min-run for heat/cool/circulate, or None if free to switch."""
+        active = self._orchestrator_active_mode
+        if active not in ("heat", "cool", "circulate"):
+            return None
+        started = self._orchestrator_mode_started_at
+        if started is None:
+            return None
+        elapsed = datetime.now() - started
+        if elapsed >= ORCHESTRATOR_MIN_RUN:
+            return None
+        return ORCHESTRATOR_MIN_RUN - elapsed
 
     def _orchestrator_today_sunset(self, now: datetime | None = None) -> datetime | None:
         """Return today's sunset as naive local datetime (HA sun.sun next_setting)."""
@@ -649,6 +670,38 @@ class HvacOrchestratorMixin:
                 reason = f"evening: actual outdoor {outdoor:.0f}°F below {cool_limit:.0f}°F"
 
         if want_cool:
+            desired = "cool"
+        elif want_heat:
+            desired = "heat"
+        elif want_circulate:
+            desired = "circulate"
+        elif want_off:
+            desired = "off"
+        else:
+            desired = "standby"
+
+        remaining = self._orchestrator_min_run_remaining()
+        if (
+            remaining is not None
+            and self._orchestrator_active_mode in ("heat", "cool", "circulate")
+            and desired != self._orchestrator_active_mode
+        ):
+            hold_mode = self._orchestrator_active_mode
+            hold_reason = (
+                f"min-run hold {hold_mode} "
+                f"({int(remaining.total_seconds())}s left); wanted {desired}: {reason}"
+            )
+            _LOGGER.info("Orchestrator %s", hold_reason)
+            if hold_mode == "cool":
+                await self._orchestrator_apply_cool(hvac_entity, oc, cc, hold_reason)
+            elif hold_mode == "heat":
+                await self._orchestrator_apply_heat(hvac_entity, oc, hold_reason)
+            else:
+                await self._orchestrator_apply_circulate(hvac_entity, hold_reason)
+            self._orchestrator_last_run = now
+            return
+
+        if want_cool:
             await self._orchestrator_apply_cool(hvac_entity, oc, cc, reason)
         elif want_heat:
             await self._orchestrator_apply_heat(hvac_entity, oc, reason)
@@ -931,6 +984,7 @@ class HvacOrchestratorMixin:
             blocking=True,
         )
         self._user_cool_setpoint = oc.cool_setpoint
+        self._orchestrator_note_mode_start("cool")
         self._orchestrator_active_mode = "cool"
         self._orchestrator_last_decision = "cool"
         self._orchestrator_last_reason = reason
@@ -984,6 +1038,7 @@ class HvacOrchestratorMixin:
             {"entity_id": hvac_entity, "temperature": target, "hvac_mode": "heat"},
             blocking=True,
         )
+        self._orchestrator_note_mode_start("heat")
         self._orchestrator_active_mode = "heat"
         self._orchestrator_last_decision = "heat"
         self._orchestrator_last_reason = reason
@@ -1003,8 +1058,9 @@ class HvacOrchestratorMixin:
         state = self.hass.states.get(hvac_entity)
         current = state.state if state else None
         fan_mode = state.attributes.get("fan_mode") if state else None
+        entering = self._orchestrator_active_mode != "circulate"
 
-        if self._orchestrator_active_mode not in ("circulate",):
+        if entering:
             self._orchestrator_save_hvac_state(state)
 
         if current in ("heat", "cool"):
@@ -1022,11 +1078,16 @@ class HvacOrchestratorMixin:
                 blocking=True,
             )
         self._furnace_fan_circulation_active = True
-        self._furnace_fan_circ_changed_at = datetime.now()
+        if entering or self._furnace_fan_circ_changed_at is None:
+            self._furnace_fan_circ_changed_at = datetime.now()
+        self._orchestrator_note_mode_start("circulate")
         self._orchestrator_active_mode = "circulate"
         self._orchestrator_last_decision = "circulate"
         self._orchestrator_last_reason = reason
-        _LOGGER.info("Orchestrator → CIRCULATE: %s", reason)
+        if entering:
+            _LOGGER.info("Orchestrator → CIRCULATE: %s", reason)
+        else:
+            _LOGGER.debug("Orchestrator hold CIRCULATE: %s", reason)
 
     async def _orchestrator_apply_off(self, hvac_entity: str, reason: str) -> None:
         cc = self._cooling_params()
@@ -1035,6 +1096,8 @@ class HvacOrchestratorMixin:
         self._upstairs_bias_active = False
         self._precool_triggered_date = None
         await self._async_turn_off_cooling_fans()
+        # Min-run already enforced by the decision gate; allow fan stop now.
+        self._orchestrator_mode_started_at = None
         await self._async_stop_furnace_circulation_fan()
 
         state = self.hass.states.get(hvac_entity)
@@ -1046,6 +1109,7 @@ class HvacOrchestratorMixin:
                 blocking=True,
             )
         self._user_cool_setpoint = None
+        self._orchestrator_note_mode_start("off")
         self._orchestrator_active_mode = "off"
         self._orchestrator_last_decision = "off"
         self._orchestrator_last_reason = reason
@@ -1068,6 +1132,17 @@ class HvacOrchestratorMixin:
             "active_mode": self._orchestrator_active_mode,
             "last_decision": self._orchestrator_last_decision,
             "last_reason": self._orchestrator_last_reason,
+            "min_run_minutes": ORCHESTRATOR_MIN_RUN.total_seconds() / 60,
+            "min_run_remaining_sec": (
+                int(remaining.total_seconds())
+                if (remaining := self._orchestrator_min_run_remaining()) is not None
+                else 0
+            ),
+            "mode_started_at": (
+                self._orchestrator_mode_started_at.isoformat()
+                if self._orchestrator_mode_started_at
+                else None
+            ),
             "decision_source": "plan+actual",
             "heat_setpoint": oc.heat_setpoint,
             "cool_setpoint": oc.cool_setpoint,

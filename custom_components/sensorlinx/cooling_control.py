@@ -1003,6 +1003,14 @@ class CoolingControlMixin:
     async def _async_stop_furnace_circulation_fan(self) -> None:
         if not self._furnace_fan_circulation_active:
             return
+        # Never yank the blower during orchestrator min-run (heat/cool/circulate).
+        remaining = getattr(self, "_orchestrator_min_run_remaining", lambda: None)()
+        if remaining is not None:
+            _LOGGER.debug(
+                "Furnace circulation stop deferred (%ss min-run left)",
+                int(remaining.total_seconds()),
+            )
+            return
         hvac_entity = self.params.main_hvac_climate_entity_id
         if not hvac_entity:
             self._furnace_fan_circulation_active = False
