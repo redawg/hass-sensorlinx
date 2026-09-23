@@ -582,15 +582,18 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                     )
                 continue
 
-            # Per-zone shutdown with deadband hysteresis to prevent cycling
+            # Per-zone shutdown with deadband hysteresis to prevent cycling.
+            # Floor-mode zones honor WWSD too — holding a warm slab above the
+            # outdoor shutdown temp overheats the house in shoulder season.
             zone_shutdown = self.is_zone_shutdown(zone_name, outdoor) and not self._preheat_active
 
-            if zone_shutdown and not self._is_floor_mode_zone(zone_name):
+            if zone_shutdown:
                 zone_sd = self.zone_shutdown_temp(zone_name)
+                mode = "floor" if self._is_floor_mode_zone(zone_name) else "room"
                 _LOGGER.info(
-                    "WWSD: outdoor %.1f°F, zone %s shutdown at %.1f°F "
+                    "WWSD: outdoor %.1f°F, zone %s (%s mode) shutdown at %.1f°F "
                     "(restart below %.1f°F)",
-                    outdoor, zone_name, zone_sd, zone_sd - SHUTDOWN_DEADBAND,
+                    outdoor, zone_name, mode, zone_sd, zone_sd - SHUTDOWN_DEADBAND,
                 )
                 await self.hass.services.async_call(
                     "climate", "turn_off",
