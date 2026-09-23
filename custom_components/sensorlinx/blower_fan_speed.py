@@ -27,6 +27,10 @@ _LOGGER = logging.getLogger(__name__)
 CONF_BLOWER_FAN_POWER_SENSOR = "blower_fan_power_sensor"
 CONF_BLOWER_SPEED_CALIBRATION = "blower_fan_speed_calibration"
 DEFAULT_BLOWER_FAN_POWER_SENSOR = "sensor.furnace_tankless_water_power_minute_average"
+# Fallback when Emporia minute-average is unavailable (common after HA restart).
+FALLBACK_BLOWER_FAN_POWER_SENSOR = (
+    "sensor.ecoflow_power_ocean_forest_furnace_wh_bidet_ch_33_power"
+)
 # Same Emporia breaker also feeds these two variable loads (smart-plug meters).
 # True fan ≈ Emporia total − hot-water plug − radiant-controller plug.
 # Do NOT use sensor.main_water_heater_power_draw (tankless element kW) or
@@ -121,6 +125,8 @@ class BlowerFanSpeedProgrammer:
         Always subtract their live W readings (they are already in watts).
         """
         total = self._read_power(total_sensor or self._power_sensor())
+        if total is None:
+            total = self._read_power(FALLBACK_BLOWER_FAN_POWER_SENSOR)
         if total is None:
             return None
         hot_water_w = self._read_power(DEFAULT_HOT_WATER_ON_CIRCUIT_SENSOR) or 0.0
@@ -218,6 +224,83 @@ class BlowerFanSpeedProgrammer:
 
     def clear_hold(self) -> None:
         self.hold_until = None
+
+    async def async_goto_speed(
+        self,
+        speed: str | int,
+        *,
+        hold_minutes: float = 60,
+        settle_seconds: float = 45,
+        tolerance_w: float = 35.0,
+        max_steps: int = 8,
+    ) -> dict[str, Any]:
+        """Step continuous fan until residual watts match a calibrated speed."""
+        label = normalize_speed_label(speed)
+        cal = self._calibration().get(label) or {}
+        target_w = cal.get("watts")
+        if target_w is None:
+            # Fallbacks from prior house calibration if options empty after reload.
+            defaults = {
+                "speed_1": 44.0,
+                "speed_2": 78.0,
+                "speed_3": 131.0,
+                "speed_4": 196.0,
+                "speed_5": 423.0,
+                "speed_6": 687.0,
+            }
+            target_w = defaults.get(label)
+        if target_w is None:
+            raise ValueError(f"No calibration watts for {label}")
+
+        climate = self._climate_entity()
+        power_sensor = self._power_sensor()
+        self.begin_hold(hold_minutes)
+
+        await self._set_hvac_mode(climate, "off")
+        await self._set_fan_mode(climate, "on")
+        await asyncio.sleep(DEFAULT_FAN_ENGAGE_S)
+
+        readings: list[dict[str, Any]] = []
+        status = "unknown"
+        for i in range(max_steps + 1):
+            watts = self._read_fan_residual(power_sensor)
+            readings.append({"step": i, "watts": watts})
+            if watts is not None and abs(watts - float(target_w)) <= tolerance_w:
+                status = "at_target"
+                _LOGGER.info(
+                    "Blower at %s: residual %.0fW (target %.0fW ±%.0f)",
+                    label,
+                    watts,
+                    float(target_w),
+                    tolerance_w,
+                )
+                break
+            if i >= max_steps:
+                status = "max_steps"
+                break
+            baseline = watts
+            await self._one_speed_step(climate, DEFAULT_TOGGLE_GAP_S)
+            await asyncio.sleep(settle_seconds)
+            after = self._read_fan_residual(power_sensor)
+            kind = self._delta_kind(
+                baseline, after, DEFAULT_MIN_DELTA_W, DEFAULT_WRAP_DROP_W
+            )
+            readings.append(
+                {"step": i, "after_burst": after, "kind": kind or "no_change"}
+            )
+            await self._set_fan_mode(climate, "on")
+
+        await self._set_fan_mode(climate, "on")
+        result = {
+            "status": status,
+            "target_speed": label,
+            "target_watts": float(target_w),
+            "readings": readings,
+            "hold_until": self.hold_until.isoformat() if self.hold_until else None,
+            "finished_at": datetime.now().isoformat(),
+        }
+        self._last_result = result
+        return result
 
     async def async_step_speed(self, call: ServiceCall) -> dict[str, Any]:
         """Run N continuous-fan speed steps; verify via residual watts + retry bursts."""
@@ -418,6 +501,14 @@ def async_register_blower_fan_speed_services(
     async def handle_step(call: ServiceCall) -> None:
         await programmer.async_step_speed(call)
 
+    async def handle_goto(call: ServiceCall) -> None:
+        speed = call.data.get("speed", "speed_3")
+        hold = float(call.data.get("hold_minutes", 60))
+        settle = float(call.data.get("settle_seconds", 45))
+        await programmer.async_goto_speed(
+            speed, hold_minutes=hold, settle_seconds=settle
+        )
+
     async def handle_set_monitor(call: ServiceCall) -> None:
         await programmer.async_set_power_monitor(call)
 
@@ -429,6 +520,7 @@ def async_register_blower_fan_speed_services(
         _LOGGER.info("Blower fan-speed program hold cleared")
 
     hass.services.async_register(DOMAIN, "step_blower_fan_speed", handle_step)
+    hass.services.async_register(DOMAIN, "set_blower_fan_speed", handle_goto)
     hass.services.async_register(
         DOMAIN, "set_blower_fan_power_monitor", handle_set_monitor
     )

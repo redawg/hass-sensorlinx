@@ -421,6 +421,9 @@ class HvacOrchestratorMixin:
                 "blower fan-speed programming hold — orchestrator paused"
             )
             return
+        if getattr(self, "night_air_mix_blocks_orchestrator", lambda: False)():
+            self._orchestrator_mark_skip("night air mix active — orchestrator paused")
+            return
 
         await self._async_refresh_daily_plan(force=(trigger in ("hourly", "startup", "startup_retry") or trigger.startswith("watchdog") or force))
         plan = self._daily_plan
@@ -1167,6 +1170,11 @@ class HvacOrchestratorMixin:
             "blower_fan_speed": (
                 self.blower_fan_speed.status_dict()
                 if getattr(self, "blower_fan_speed", None) is not None
+                else None
+            ),
+            "night_air_mix": (
+                self.night_air_mix_status()
+                if hasattr(self, "night_air_mix_status")
                 else None
             ),
             "last_error": self._orchestrator_last_error,

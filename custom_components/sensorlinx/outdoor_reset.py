@@ -65,6 +65,7 @@ from .heating_zones import (
     zone_for_key,
 )
 from .helpers import thm_device_info, zon_device_info
+from .night_air_mix import NightAirMixEnableSwitch, NightAirMixMixin, NightAirMixParams
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ def compute_target(outdoor: float, base: float, overshoot: float,
     return round(base + overshoot * ((shutdown - outdoor) / temp_range), 1)
 
 
-class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSetbackMixin):
+class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSetbackMixin, NightAirMixMixin):
     """Manages the outdoor reset logic and periodically updates zone setpoints."""
 
     def __init__(
@@ -204,6 +205,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         self._cooling_paused_until = None
         self._cooling_pause_reason = None
         self._init_orchestrator_state()
+        self._init_night_air_mix_state()
         self._programmatic_fan_change = False
         self._unsub_cool_fans = None
         self._unsub_cooling_pause = None
@@ -431,6 +433,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             )
         await self._setup_night_setback()
         await self._setup_cooling_control()
+        await self._setup_night_air_mix()
         if self._main_hvac_cooling():
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC already in cool mode"
@@ -445,6 +448,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         """Remove listeners."""
         self._unload_night_setback()
         self._unload_cooling_control()
+        self._unload_night_air_mix()
         if self._unsub_interval:
             self._unsub_interval()
         if self._unsub_state:
@@ -1407,6 +1411,7 @@ class OutdoorResetParams:
         self.night_setback: NightSetbackParams = NightSetbackParams()
         self.cooling_control: CoolingControlParams = CoolingControlParams()
         self.orchestrator: HvacOrchestratorParams = HvacOrchestratorParams()
+        self.night_air_mix: NightAirMixParams = NightAirMixParams()
         self.external_zones: tuple[HeatingZone, ...] = DEFAULT_EXTERNAL_ZONES
         self.schedule_managed_zones: dict[str, bool] = {}
 
@@ -1814,6 +1819,7 @@ def get_switch_entities(
     entities.extend(get_night_setback_switch_entities(coordinator, controller))
     entities.extend(get_cooling_control_switch_entities(coordinator, controller))
     entities.extend(get_orchestrator_switch_entities(coordinator, controller))
+    entities.append(NightAirMixEnableSwitch(coordinator, controller))
     for thm in coordinator.get_thm_devices():
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(

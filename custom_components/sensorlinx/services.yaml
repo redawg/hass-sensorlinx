@@ -189,6 +189,55 @@ record_blower_fan_speed_calibration:
           step: 1
           unit_of_measurement: W
 
+set_blower_fan_speed:
+  name: Set Bryant Blower Fan Speed
+  description: >-
+    Steps the continuous fan until residual watts match a calibrated speed
+    (speed_1 lowest … speed_6 highest). speed_3 is the quiet house-mix default.
+  fields:
+    speed:
+      name: Speed
+      required: true
+      default: speed_3
+      selector:
+        select:
+          options:
+            - "1"
+            - "2"
+            - "3"
+            - "4"
+            - "5"
+            - "6"
+            - speed_1
+            - speed_2
+            - speed_3
+            - speed_4
+            - speed_5
+            - speed_6
+            - low
+            - medium
+            - high
+    hold_minutes:
+      name: Orchestrator hold
+      required: false
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 720
+          step: 1
+          unit_of_measurement: min
+    settle_seconds:
+      name: Settle after each step
+      required: false
+      default: 45
+      selector:
+        number:
+          min: 15
+          max: 120
+          step: 5
+          unit_of_measurement: s
+
 clear_blower_fan_speed_hold:
   name: Clear Blower Fan Speed Hold
   description: >-
