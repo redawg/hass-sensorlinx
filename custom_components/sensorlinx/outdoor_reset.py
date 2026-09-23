@@ -435,6 +435,10 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC already in cool mode"
             )
+        # Apply immediately so WWSD / floor targets take effect after restart
+        # without waiting for the first outdoor change or 15-minute interval.
+        if self.enabled:
+            await self._apply_setpoints()
 
     @callback
     def async_unload(self) -> None:
@@ -3081,6 +3085,8 @@ class ZoneShutdownTempEntity(RestoreNumber):
         self._controller.params.zone_shutdown_temps[self._zone_key] = value
         self.async_write_ha_state()
         self._persist_to_options(value)
+        if self._controller.enabled:
+            await self._controller._apply_setpoints()
 
     @callback
     def _persist_to_options(self, value: float) -> None:
