@@ -24,7 +24,12 @@ from homeassistant.const import UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval, async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_track_point_in_time,
+    async_track_state_change_event,
+    async_track_time_interval,
+)
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .night_setback import (
@@ -633,6 +638,12 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                     {"entity_id": entity_id},
                     blocking=True,
                 )
+                continue
+
+            # Manual setpoint hold: leave the zone's setpoint alone.
+            # Safety logic above (WWSD shutdown, floor-max cap) still applies.
+            if self.params.setpoint_hold.get(zone_name, False):
+                _LOGGER.debug("Skipping %s - manual setpoint hold is on", zone_name)
                 continue
 
             zone_target = self._resolve_zone_target(
@@ -1387,6 +1398,7 @@ class OutdoorResetParams:
         self.zone_floor_sensor_bias: dict[str, float] = {}
         self.zone_offsets: dict[str, float] = {}
         self.floor_control_enabled: dict[str, bool] = {}
+        self.setpoint_hold: dict[str, bool] = {}  # zone_key -> True skips commanded setpoints
         self.floor_targets: dict[str, float] = {}
         self.floor_boost: float = DEFAULT_FLOOR_BOOST
         # Supply water temperature reset
@@ -1826,6 +1838,11 @@ def get_switch_entities(
         zone_name = thm.name.lower().replace(" ", "_")
         entities.append(
             OutdoorResetFloorModeSwitch(
+                coordinator, controller, zone_name, thm.name, thm, entry_id,
+            )
+        )
+        entities.append(
+            ZoneSetpointHoldSwitch(
                 coordinator, controller, zone_name, thm.name, thm, entry_id,
             )
         )
@@ -2399,6 +2416,118 @@ class OutdoorResetFloorModeSwitch(SwitchEntity, RestoreEntity):
         if entry is None:
             return
         key = f"floor_mode_{self._zone_key}"
+        new_options = dict(entry.options)
+        new_options[key] = enabled
+        self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
+        self.hass.config_entries.async_update_entry(entry, options=new_options)
+
+
+class ZoneSetpointHoldSwitch(SwitchEntity, RestoreEntity):
+    """Per-zone switch: when ON, the outdoor reset stops commanding this zone's
+    setpoint, so a manually chosen temperature (via HA or the thermostat) sticks.
+    Safety logic (WWSD shutdown, floor-max cap) still applies while held.
+    The hold auto-releases at the next 3:00 AM local time."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:hand-back-right"
+
+    def __init__(
+        self,
+        coordinator: SensorlinxCoordinator,
+        controller: OutdoorResetController,
+        zone_key: str,
+        zone_name: str,
+        thm_device: SensorlinxDeviceData | None = None,
+        entry_id: str | None = None,
+    ) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._zone_key = zone_key
+        self._thm_device = thm_device
+        self._entry_id = entry_id
+        self._attr_name = f"Setpoint Hold: {zone_name}"
+        self._attr_unique_id = f"sensorlinx_outdoor_reset_setpoint_hold_{zone_key}"
+        self._release_unsub = None
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        if self._thm_device:
+            return thm_device_info(self._coordinator, self._thm_device)
+        return {
+            "identifiers": {(DOMAIN, "outdoor_reset")},
+            "name": "SensorLinx Outdoor Reset",
+            "manufacturer": "HBX Controls",
+            "model": "Heating Curve Controller",
+        }
+
+    @property
+    def is_on(self) -> bool:
+        return self._controller.params.setpoint_hold.get(self._zone_key, False)
+
+    async def async_added_to_hass(self) -> None:
+        """Restore hold state from config entry options."""
+        await super().async_added_to_hass()
+        if self._entry_id:
+            entry = self.hass.config_entries.async_get_entry(self._entry_id)
+            if entry:
+                key = f"setpoint_hold_{self._zone_key}"
+                saved = entry.options.get(key)
+                if saved is not None:
+                    self._controller.params.setpoint_hold[self._zone_key] = bool(saved)
+        if self.is_on:
+            self._schedule_release()
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self._controller.params.setpoint_hold[self._zone_key] = True
+        self.async_write_ha_state()
+        self._persist_to_options(True)
+        self._schedule_release()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self._cancel_release()
+        self._controller.params.setpoint_hold[self._zone_key] = False
+        self.async_write_ha_state()
+        self._persist_to_options(False)
+        await self._controller._apply_setpoints()
+
+    def _schedule_release(self) -> None:
+        """Schedule the hold to auto-release at the next 3:00 AM local time."""
+        self._cancel_release()
+        now = dt_util.now()
+        release_at = now.replace(hour=3, minute=0, second=0, microsecond=0)
+        if release_at <= now:
+            release_at += timedelta(days=1)
+        self._release_unsub = async_track_point_in_time(
+            self.hass, self._auto_release, release_at
+        )
+        _LOGGER.debug(
+            "Setpoint hold for %s will auto-release at %s",
+            self._zone_key, release_at,
+        )
+
+    def _cancel_release(self) -> None:
+        """Cancel a pending auto-release, if any."""
+        if self._release_unsub is not None:
+            self._release_unsub()
+            self._release_unsub = None
+
+    async def _auto_release(self, _now: datetime) -> None:
+        """Release the hold at 3 AM and hand control back to the reset curve."""
+        self._release_unsub = None
+        _LOGGER.info(
+            "Auto-releasing setpoint hold for %s at 3 AM", self._zone_key
+        )
+        await self.async_turn_off()
+
+    @callback
+    def _persist_to_options(self, enabled: bool) -> None:
+        """Save hold state to config entry options."""
+        if not self._entry_id:
+            return
+        entry = self.hass.config_entries.async_get_entry(self._entry_id)
+        if entry is None:
+            return
+        key = f"setpoint_hold_{self._zone_key}"
         new_options = dict(entry.options)
         new_options[key] = enabled
         self.hass.data.setdefault(DOMAIN, {})[f"{self._entry_id}_skip_reload"] = True
