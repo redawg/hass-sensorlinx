@@ -107,6 +107,9 @@ class NightSetbackMixin:
             floor_target = ns.night_floor_targets.get(
                 zone_name, DEFAULT_NIGHT_FLOOR_TARGETS.get(zone_name, 70.0)
             )
+            if zone is not None and getattr(zone, "thm_floor_mode", False):
+                # Device holds its own floor probe at the setpoint overnight.
+                return self._device_floor_setpoint(zone_name, floor_target)
             if zone is not None and zone.direct_floor_thermostat:
                 return self._compute_direct_floor_setpoint(
                     floor_temp, floor_target, zone_name

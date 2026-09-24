@@ -111,6 +111,21 @@ DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 FLOOR_CONTROL_GAIN = 3.0  # degrees to overshoot room setpoint when floor is below target
 MIN_VALID_HEAT_SETPOINT = 60.0  # THM may report ~41F after turn_off; always re-command
 
+# Ecobee room-temp trim: per-zone air sensors (ecobee remotes) used to
+# average the room air temp and slowly trim floor-mode setpoints so rooms
+# stay comfortable as weather changes. The trim is a bounded integral
+# correction on top of the probe-bias feedforward.
+ROOM_TRIM_SENSOR_ENTITIES: dict[str, str] = {
+    "living_room": "sensor.living_room_temperature",
+    "main_area": "sensor.family_room_temperature",
+    "main_office": "sensor.office_temperature",
+}
+ROOM_TRIM_LOW = 71.0  # room avg below this -> nudge setpoint up
+ROOM_TRIM_HIGH = 75.0  # room avg above this -> nudge setpoint down
+ROOM_TRIM_STEP = 0.5  # degrees per control cycle
+ROOM_TRIM_MIN = -2.0  # trim bounds (degrees)
+ROOM_TRIM_MAX = 6.0
+
 # Supply water temperature reset defaults
 DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
@@ -546,6 +561,9 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 outdoor, self.params.shutdown,
             )
 
+        # Ecobee room-temp trim adapts setpoints to actual room comfort.
+        self._update_room_trims(outdoor)
+
         for zone in self.get_heating_zones():
             zone_name = zone.zone_key
             entity_id = zone.climate_entity_id
@@ -685,16 +703,113 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 zone_name, default_floor_target(zone_name)
             )
             floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
-            if zone.direct_floor_thermostat:
-                return self._compute_direct_floor_setpoint(
+            if zone is not None and zone.thm_floor_mode:
+                # Thermostat's own sensor is its floor probe: it holds the
+                # (possibly biased) probe at the setpoint, so command the
+                # floor target directly with probe-bias compensation.
+                setpoint = self._device_floor_setpoint(zone_name, floor_target)
+            elif zone.direct_floor_thermostat:
+                setpoint = self._compute_direct_floor_setpoint(
                     floor_temp, floor_target, zone_name
                 )
-            return self._compute_floor_mode_setpoint(
-                floor_temp, floor_target, zone_name
-            )
+            else:
+                setpoint = self._compute_floor_mode_setpoint(
+                    floor_temp, floor_target, zone_name
+                )
+            # Ecobee comfort trim (daytime only): nudge the setpoint so the
+            # averaged room air temp stays in the comfort band as weather
+            # changes. Bounded and slow; night setback runs untrimmed.
+            if not self.params.night_setback.active:
+                trim = self.params.zone_room_trim.get(zone_name, 0.0)
+                if trim:
+                    cap = self.zone_floor_max(zone_name)
+                    setpoint = round(max(65.0, min(setpoint + trim, cap)), 1)
+            return setpoint
 
         offset = self.params.zone_offsets.get(zone_name, 0.0)
         return self.zone_target(offset)
+
+    def _device_floor_setpoint(self, zone_name: str, floor_target: float) -> float:
+        """Setpoint for a thermostat already in floor-sensor mode.
+
+        The device drives its own (possibly biased) probe to the setpoint, so
+        compensate the known probe bias: a probe reading N degrees high needs
+        the setpoint raised N degrees for the true slab to hit the target.
+        """
+        bias = self.floor_sensor_bias(zone_name)
+        setpoint = floor_target - bias
+        cap = self.zone_floor_max(zone_name)
+        return round(max(65.0, min(setpoint, cap)), 1)
+
+    def _room_average(self, zone_name: str) -> float | None:
+        """Average room air temp: ecobee sensor + bias-corrected thermostat sensor."""
+        vals: list[float] = []
+        ecobee_entity = ROOM_TRIM_SENSOR_ENTITIES.get(zone_name)
+        if ecobee_entity:
+            st = self.hass.states.get(ecobee_entity)
+            if st is not None and st.state not in (
+                "unavailable", "unknown", "none",
+            ):
+                try:
+                    vals.append(float(st.state))
+                except (ValueError, TypeError):
+                    pass
+        th = self.hass.states.get(f"sensor.{zone_name}_room_temperature")
+        if th is not None and th.state not in ("unavailable", "unknown", "none"):
+            try:
+                vals.append(float(th.state) + self.floor_sensor_bias(zone_name))
+            except (ValueError, TypeError):
+                pass
+        if not vals:
+            return None
+        return round(sum(vals) / len(vals), 1)
+
+    def _update_room_trims(self, outdoor: float) -> None:
+        """Slow integral trim per floor-mode zone from averaged room air temp.
+
+        Keeps rooms in the comfort band as days get colder/warmer without
+        touching the probe-bias feedforward. Bounded, daytime only, and only
+        for zones actually calling for heat.
+        """
+        if self.params.night_setback.active:
+            return
+        for zone_name in ROOM_TRIM_SENSOR_ENTITIES:
+            if not self._is_floor_mode_zone(zone_name):
+                continue
+            if self.is_zone_shutdown(zone_name, outdoor):
+                continue
+            if self.params.setpoint_hold.get(zone_name, False):
+                continue
+            avg = self._room_average(zone_name)
+            if avg is None:
+                continue
+            trim = self.params.zone_room_trim.get(zone_name, 0.0)
+            new_trim = trim
+            if avg > ROOM_TRIM_HIGH:
+                new_trim = max(ROOM_TRIM_MIN, trim - ROOM_TRIM_STEP)
+            elif avg < ROOM_TRIM_LOW:
+                new_trim = min(ROOM_TRIM_MAX, trim + ROOM_TRIM_STEP)
+            if new_trim == trim:
+                continue
+            new_trim = round(new_trim, 2)
+            self.params.zone_room_trim[zone_name] = new_trim
+            self._persist_room_trim(zone_name, new_trim)
+            _LOGGER.info(
+                "Room trim %s: room avg %.1fF outside [%.1f, %.1f] -> trim %+.2fF",
+                zone_name, avg, ROOM_TRIM_LOW, ROOM_TRIM_HIGH, new_trim,
+            )
+
+    def _persist_room_trim(self, zone_name: str, value: float) -> None:
+        """Persist a trim value to the config entry options."""
+        entry = getattr(self, "_config_entry", None)
+        if entry is None:
+            return
+        try:
+            new_options = dict(entry.options)
+            new_options[f"room_trim_{zone_name}"] = value
+            self.hass.config_entries.async_update_entry(entry, options=new_options)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            _LOGGER.debug("Failed to persist room trim for %s", zone_name)
 
     def planned_zone_target(self, zone: HeatingZone) -> float | None:
         """Reference target from the heating curve (not applied for schedule-managed zones)."""
@@ -1396,6 +1511,7 @@ class OutdoorResetParams:
         self.floor_max: float = DEFAULT_FLOOR_MAX
         self.zone_floor_max: dict[str, float] = {}
         self.zone_floor_sensor_bias: dict[str, float] = {}
+        self.zone_room_trim: dict[str, float] = {}  # ecobee comfort trim per zone
         self.zone_offsets: dict[str, float] = {}
         self.floor_control_enabled: dict[str, bool] = {}
         self.setpoint_hold: dict[str, bool] = {}  # zone_key -> True skips commanded setpoints
@@ -1497,6 +1613,12 @@ async def async_setup_outdoor_reset(
             zone_key = key[len("floor_bias_"):]
             try:
                 params.zone_floor_sensor_bias[zone_key] = float(value)
+            except (ValueError, TypeError):
+                pass
+        elif key.startswith("room_trim_"):
+            zone_key = key[len("room_trim_"):]
+            try:
+                params.zone_room_trim[zone_key] = float(value)
             except (ValueError, TypeError):
                 pass
         elif key.startswith("thermal_lag_"):
