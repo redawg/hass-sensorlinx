@@ -22,14 +22,22 @@ class HeatingZone:
     schedule_managed: bool = False
     floor_temp_sensor: str | None = None
     room_temp_sensor: str | None = None
+    # True when the physical thermostat's own control sensor is its floor
+    # probe (SensorLinx thmMode "Floor"). Auto-detected from device data so
+    # setpoint math matches the device whether it runs Air or Floor mode.
+    thm_floor_mode: bool = False
 
     @classmethod
     def from_thm(cls, thm: SensorlinxDeviceData) -> HeatingZone:
         zone_key = thm.name.lower().replace(" ", "_")
+        raw = getattr(thm, "raw", None) or {}
+        mode_block = raw.get("thmMode") or {}
+        mode_title = str(mode_block.get("title") or "").strip().lower()
         return cls(
             zone_key=zone_key,
             label=thm.name,
             climate_entity_id=f"climate.{zone_key}_{zone_key}",
+            thm_floor_mode=(mode_title == "floor"),
         )
 
 
