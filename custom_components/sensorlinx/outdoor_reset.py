@@ -807,6 +807,9 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         try:
             new_options = dict(entry.options)
             new_options[f"room_trim_{zone_name}"] = value
+            # Skip the config-entry reload: a trim step must not tear down and
+            # rebuild the integration (every other options persist sets this).
+            self.hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
             self.hass.config_entries.async_update_entry(entry, options=new_options)
         except Exception:  # noqa: BLE001 - persistence is best-effort
             _LOGGER.debug("Failed to persist room trim for %s", zone_name)
