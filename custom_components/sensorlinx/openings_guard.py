@@ -10,6 +10,8 @@ reports closed (or vice versa). For paired openings this guard:
 4. Exposes a validated ``any open`` binary sensor + status sensor
 5. Optionally mirrors the radiant-floor interlock (validated opening open only;
    Ecobee mode does not gate the pump — radiant heat is independent)
+6. Sets heating-zone THM **Away** while a validated opening is open, and
+   restores prior away state when everything closes
 """
 
 from __future__ import annotations
@@ -68,6 +70,15 @@ OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
 WWSD_SHUTDOWN_ENTITY = "number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp"
 DEFAULT_WWSD_SHUTDOWN = 65.0
 
+# THM away switches — set when a validated opening is open so zones stop calling
+# for heat (pump interlock alone is not enough if outdoor reset re-commands).
+HEATING_ZONE_AWAY_SWITCHES = (
+    "switch.main_area_away_mode",
+    "switch.living_room_away_mode",
+    "switch.main_office_away_mode",
+    "switch.laundry_away_mode",
+)
+
 
 @dataclass
 class OpeningReading:
@@ -97,6 +108,7 @@ class OpeningsSnapshot:
     floor_switch: str | None = None
     floor_state: str | None = None
     last_floor_action: str | None = None
+    last_away_action: str | None = None
     last_reason: str = "startup"
 
 
@@ -120,6 +132,8 @@ class OpeningsGuard:
         self._unsub: list[Callable[[], None]] = []
         self._entities: list[Any] = []
         self._refreshing = False
+        # Previous away states when we latched openings-away (restore on close).
+        self._away_snapshot: dict[str, bool] | None = None
 
     async def async_setup(self) -> None:
         """Start listeners, refresh contacts, and take over floor interlock."""
@@ -188,6 +202,7 @@ class OpeningsGuard:
             self._evaluate(reason=reason)
             if self.control_floor:
                 await self._async_enforce_floor()
+            await self._async_enforce_away_for_openings()
             self._notify_entities()
             return self.snapshot
         finally:
@@ -311,6 +326,7 @@ class OpeningsGuard:
             floor_switch=self.floor_switch,
             floor_state=floor.state if floor else None,
             last_floor_action=self.snapshot.last_floor_action,
+            last_away_action=self.snapshot.last_away_action,
             last_reason=reason,
         )
         if open_names or conflict_names:
@@ -379,6 +395,59 @@ class OpeningsGuard:
             self.snapshot.last_floor_action = "turn_on (all closed, heating season)"
             _LOGGER.info("Openings guard enabled floor: openings closed, below WWSD")
 
+    async def _async_enforce_away_for_openings(self) -> None:
+        """Put heating zones in Away while a validated opening is open.
+
+        Restores prior away state for each zone when everything closes again.
+        WWSD-only pump blocks do not latch away — only door/window openings.
+        """
+        if self.snapshot.any_open:
+            if self._away_snapshot is not None:
+                return
+            snap: dict[str, bool] = {}
+            for entity_id in HEATING_ZONE_AWAY_SWITCHES:
+                state = self.hass.states.get(entity_id)
+                if state is None or state.state in ("unavailable", "unknown"):
+                    continue
+                was_away = state.state == STATE_ON
+                snap[entity_id] = was_away
+                if not was_away:
+                    await self.hass.services.async_call(
+                        "switch",
+                        "turn_on",
+                        {"entity_id": entity_id},
+                        blocking=True,
+                    )
+            if not snap:
+                return
+            self._away_snapshot = snap
+            names = ",".join(self.snapshot.open_names) or "open"
+            self.snapshot.last_away_action = f"away_on ({names})"
+            _LOGGER.info(
+                "Openings guard set floor zones Away: %s",
+                self.snapshot.open_names,
+            )
+            return
+
+        # All closed — restore only zones we forced into Away.
+        if self._away_snapshot is None:
+            return
+        for entity_id, was_away in self._away_snapshot.items():
+            if was_away:
+                continue
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state != STATE_ON:
+                continue
+            await self.hass.services.async_call(
+                "switch",
+                "turn_off",
+                {"entity_id": entity_id},
+                blocking=True,
+            )
+        self._away_snapshot = None
+        self.snapshot.last_away_action = "away_restored (all closed)"
+        _LOGGER.info("Openings guard restored floor away modes (all openings closed)")
+
     async def _async_disable_legacy_automation(self) -> None:
         """Disable the UI automation that trusted raw stuck contacts."""
         state = self.hass.states.get(LEGACY_FLOOR_AUTOMATION)
@@ -423,6 +492,8 @@ class OpeningsGuard:
             "floor_switch": snap.floor_switch,
             "floor_state": snap.floor_state,
             "last_floor_action": snap.last_floor_action,
+            "last_away_action": snap.last_away_action,
+            "away_latched": self._away_snapshot is not None,
             "last_reason": snap.last_reason,
             "readings": [
                 {

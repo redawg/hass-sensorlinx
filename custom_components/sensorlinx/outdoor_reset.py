@@ -325,6 +325,12 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
 
     async def _ensure_zone_ready_for_heat(self, zone_name: str) -> None:
         """Clear THM away mode so commanded setpoints can call for heat."""
+        # Leave Away alone while openings guard has doors/windows open.
+        openings = self.hass.states.get(
+            "binary_sensor.sensorlinx_openings_guard_openings_open"
+        )
+        if openings is not None and openings.state == "on":
+            return
         zone = zone_for_key(zone_name, self.coordinator, self.params.external_zones)
         if zone is not None and zone.direct_floor_thermostat:
             return
@@ -539,6 +545,15 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         """Set temperature on each climate entity based on the curve."""
         if self._main_hvac_cooling():
             await self._async_suppress_floor_heating_for_hvac_cool()
+            return
+
+        openings = self.hass.states.get(
+            "binary_sensor.sensorlinx_openings_guard_openings_open"
+        )
+        if openings is not None and openings.state == "on":
+            _LOGGER.debug(
+                "Openings open — skipping outdoor-reset setpoints (away owned by openings guard)"
+            )
             return
 
         outdoor = self.outdoor_temp
