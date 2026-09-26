@@ -15,5 +15,5 @@
   "requirements": [
     "pysensorlinx>=0.5.5"
   ],
-  "version": "0.1.71"
+  "version": "0.1.72"
 }
