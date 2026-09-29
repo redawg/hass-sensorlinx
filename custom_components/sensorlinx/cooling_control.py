@@ -364,7 +364,14 @@ class CoolingControlMixin:
             self._upstairs_bias_active = False
             self._last_cool_adjustment = 0.0
             await self._async_turn_off_cooling_fans()
-            await self._async_stop_furnace_circulation_fan()
+            # Only stop ROI furnace fan when LEAVING cool — not on every
+            # Ecobee attribute poll while HVAC is off/heat. Calling stop here
+            # while the orchestrator is in circulate fights fan=on↔auto and
+            # short-cycles the Bryant blower (~10s when Ecobee updates often).
+            left_cool = old_state is not None and old_state.state == "cool"
+            orch_mode = getattr(self, "_orchestrator_active_mode", None)
+            if left_cool and orch_mode not in ("circulate", "heat", "cool"):
+                await self._async_stop_furnace_circulation_fan()
             return
 
         old_temp = None
@@ -1002,6 +1009,13 @@ class CoolingControlMixin:
 
     async def _async_stop_furnace_circulation_fan(self) -> None:
         if not self._furnace_fan_circulation_active:
+            return
+        # Orchestrator owns the blower in these modes — never yank it for ROI.
+        orch_mode = getattr(self, "_orchestrator_active_mode", None)
+        if orch_mode in ("circulate", "heat", "cool"):
+            _LOGGER.debug(
+                "Furnace circulation stop skipped — orchestrator in %s", orch_mode
+            )
             return
         # Never yank the blower during orchestrator min-run (heat/cool/circulate).
         remaining = getattr(self, "_orchestrator_min_run_remaining", lambda: None)()
