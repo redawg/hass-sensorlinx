@@ -109,6 +109,7 @@ DEFAULT_ZONE_FLOOR_SENSOR_BIAS: dict[str, float] = {
 
 DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
 DEFAULT_FLOOR_CONTROL_GAIN = 3.0  # default degrees to overshoot room setpoint when floor is below target
+DEFAULT_FLOOR_CONTROL_BACKOFF = 2.0  # default degrees to undershoot room setpoint when floor is above target
 MIN_VALID_HEAT_SETPOINT = 60.0  # THM may report ~41F after turn_off; always re-command
 
 # Ecobee room-temp trim: per-zone air sensors (ecobee remotes) used to
@@ -876,7 +877,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             setpoint = floor_target + self.params.floor_control_gain
         elif error < -1.0:
             # Floor is too warm — back off
-            setpoint = floor_target - 2.0
+            setpoint = floor_target - self.params.floor_control_backoff
         else:
             # Floor is close to target — maintain
             setpoint = floor_target + 1.0
@@ -1536,6 +1537,7 @@ class OutdoorResetParams:
         self.floor_targets: dict[str, float] = {}
         self.floor_boost: float = DEFAULT_FLOOR_BOOST
         self.floor_control_gain: float = DEFAULT_FLOOR_CONTROL_GAIN  # room-setpoint overshoot when slab is cold
+        self.floor_control_backoff: float = DEFAULT_FLOOR_CONTROL_BACKOFF  # room-setpoint undershoot when slab is warm
         # Supply water temperature reset
         self.supply_temp_min: float = DEFAULT_SUPPLY_TEMP_MIN
         self.supply_temp_max: float = DEFAULT_SUPPLY_TEMP_MAX
@@ -1810,6 +1812,11 @@ def get_number_entities(
             "mdi:thermometer-chevron-up",
         ),
         OutdoorResetNumberEntity(
+            coordinator, controller, "floor_control_backoff",
+            "Floor Control: Back-off", DEFAULT_FLOOR_CONTROL_BACKOFF, 0, 4, 0.5,
+            "mdi:thermometer-chevron-down",
+        ),
+        OutdoorResetNumberEntity(
             coordinator, controller, "supply_temp_min",
             "Supply Water: Min Temp (Mild)", DEFAULT_SUPPLY_TEMP_MIN, 80, 130, 5,
             "mdi:water-thermometer-outline",
@@ -2070,6 +2077,8 @@ class OutdoorResetNumberEntity(RestoreNumber):
             params.floor_boost = self._attr_native_value
         elif self._key == "floor_control_gain":
             params.floor_control_gain = self._attr_native_value
+        elif self._key == "floor_control_backoff":
+            params.floor_control_backoff = self._attr_native_value
         elif self._key == "supply_temp_min":
             params.supply_temp_min = self._attr_native_value
         elif self._key == "supply_temp_max":
