@@ -8,10 +8,12 @@ reports closed (or vice versa). For paired openings this guard:
 3. Treats the opening as **closed when any paired sensor says closed**
    (open only when every available sensor says open)
 4. Exposes a validated ``any open`` binary sensor + status sensor
-5. Optionally mirrors the radiant-floor interlock (validated opening open only;
-   Ecobee mode does not gate the pump — radiant heat is independent)
-6. Sets heating-zone THM **Away** while a validated opening is open, and
+5. Sets heating-zone THM **Away** while a validated opening is open, and
    restores prior away state when everything closes
+
+The Tapo radiant-floor controller plug is **not** toggled here — it is for
+power metering and manual/remote emergency shutoff only. Heat demand is
+stopped via zone Away, not by cutting controller power.
 """
 
 from __future__ import annotations
@@ -66,12 +68,9 @@ DEFAULT_FLOOR_SWITCH = "switch.radiant_floor_contoller"
 LEGACY_FLOOR_AUTOMATION = (
     "automation.sensorlinx_disable_floor_when_openings_open_or_thermostat_off"
 )
-OUTDOOR_TEMP_ENTITY = "sensor.quail_creek_ames_lake_279th_ct_ne_temperature"
-WWSD_SHUTDOWN_ENTITY = "number.sensorlinx_outdoor_reset_heating_curve_shutdown_temp"
-DEFAULT_WWSD_SHUTDOWN = 65.0
 
 # THM away switches — set when a validated opening is open so zones stop calling
-# for heat (pump interlock alone is not enough if outdoor reset re-commands).
+# for heat. Controller plug power is left alone.
 HEATING_ZONE_AWAY_SWITCHES = (
     "switch.main_area_away_mode",
     "switch.living_room_away_mode",
@@ -107,13 +106,12 @@ class OpeningsSnapshot:
     hvac_mode: str | None = None
     floor_switch: str | None = None
     floor_state: str | None = None
-    last_floor_action: str | None = None
     last_away_action: str | None = None
     last_reason: str = "startup"
 
 
 class OpeningsGuard:
-    """Refresh, validate, and optionally enforce opening interlocks."""
+    """Refresh, validate, and latch zone Away while openings are open."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
@@ -127,7 +125,6 @@ class OpeningsGuard:
         self.hvac_entity = entry.options.get(
             CONF_MAIN_HVAC_CLIMATE, DEFAULT_MAIN_HVAC_CLIMATE
         )
-        self.control_floor = True
         self.snapshot = OpeningsSnapshot()
         self._unsub: list[Callable[[], None]] = []
         self._entities: list[Any] = []
@@ -136,7 +133,7 @@ class OpeningsGuard:
         self._away_snapshot: dict[str, bool] | None = None
 
     async def async_setup(self) -> None:
-        """Start listeners, refresh contacts, and take over floor interlock."""
+        """Start listeners, refresh contacts, and take over openings Away."""
         watch = list(
             dict.fromkeys(
                 self.contacts
@@ -169,11 +166,11 @@ class OpeningsGuard:
 
     @callback
     def _async_on_state_change(self, event: Event) -> None:
-        """Re-evaluate when a watched entity changes (after a short debounce path)."""
+        """Re-evaluate when a watched entity changes."""
         if self._refreshing:
             return
         entity_id = event.data.get("entity_id")
-        # Floor switch changes from our own actions should not recurse.
+        # Floor plug is monitored for status only — never controlled here.
         if entity_id == self.floor_switch:
             new_state = event.data.get("new_state")
             if new_state is not None:
@@ -191,7 +188,7 @@ class OpeningsGuard:
     async def async_refresh(
         self, *, force_update: bool = True, reason: str = "manual"
     ) -> OpeningsSnapshot:
-        """Optionally update entities, validate openings, enforce floor interlock."""
+        """Optionally update entities, validate openings, latch zone Away."""
         if self._refreshing:
             return self.snapshot
         self._refreshing = True
@@ -200,8 +197,6 @@ class OpeningsGuard:
                 await self._async_update_entities()
                 self.snapshot.refreshed_at = datetime.now().astimezone()
             self._evaluate(reason=reason)
-            if self.control_floor:
-                await self._async_enforce_floor()
             await self._async_enforce_away_for_openings()
             self._notify_entities()
             return self.snapshot
@@ -325,7 +320,6 @@ class OpeningsGuard:
             hvac_mode=hvac.state if hvac else None,
             floor_switch=self.floor_switch,
             floor_state=floor.state if floor else None,
-            last_floor_action=self.snapshot.last_floor_action,
             last_away_action=self.snapshot.last_away_action,
             last_reason=reason,
         )
@@ -337,69 +331,11 @@ class OpeningsGuard:
                 conflict_names or "none",
             )
 
-    def _outdoor_temp(self) -> float | None:
-        state = self.hass.states.get(OUTDOOR_TEMP_ENTITY)
-        if state is None or state.state in ("unavailable", "unknown"):
-            return None
-        try:
-            return float(state.state)
-        except (TypeError, ValueError):
-            return None
-
-    def _wwsd_shutdown_temp(self) -> float:
-        state = self.hass.states.get(WWSD_SHUTDOWN_ENTITY)
-        if state is not None and state.state not in ("unavailable", "unknown"):
-            try:
-                return float(state.state)
-            except (TypeError, ValueError):
-                pass
-        return DEFAULT_WWSD_SHUTDOWN
-
-    def _floor_blocked_reason(self) -> str | None:
-        """Return why the radiant pump must stay off, or None when allowed."""
-        if self.snapshot.any_open:
-            return f"open:{','.join(self.snapshot.open_names)}"
-        outdoor = self._outdoor_temp()
-        shutdown = self._wwsd_shutdown_temp()
-        if outdoor is not None and outdoor >= shutdown:
-            return f"wwsd:outdoor {outdoor:.0f}F >= {shutdown:.0f}F"
-        return None
-
-    async def _async_enforce_floor(self) -> None:
-        """Turn radiant floor off for open openings or warm-weather shutdown."""
-        if not self.control_floor:
-            return
-        floor_state = self.hass.states.get(self.floor_switch)
-        if floor_state is None:
-            return
-        block_reason = self._floor_blocked_reason()
-        should_disable = block_reason is not None
-        should_enable = block_reason is None and floor_state.state == STATE_OFF
-
-        if should_disable and floor_state.state == STATE_ON:
-            await self.hass.services.async_call(
-                "switch",
-                "turn_off",
-                {"entity_id": self.floor_switch},
-                blocking=True,
-            )
-            self.snapshot.last_floor_action = f"turn_off ({block_reason})"
-            _LOGGER.info("Openings guard disabled floor: %s", block_reason)
-        elif should_enable:
-            await self.hass.services.async_call(
-                "switch",
-                "turn_on",
-                {"entity_id": self.floor_switch},
-                blocking=True,
-            )
-            self.snapshot.last_floor_action = "turn_on (all closed, heating season)"
-            _LOGGER.info("Openings guard enabled floor: openings closed, below WWSD")
-
     async def _async_enforce_away_for_openings(self) -> None:
         """Put heating zones in Away while a validated opening is open.
 
         Restores prior away state for each zone when everything closes again.
-        WWSD-only pump blocks do not latch away — only door/window openings.
+        Does not touch the radiant controller power plug.
         """
         if self.snapshot.any_open:
             if self._away_snapshot is not None:
@@ -487,11 +423,9 @@ class OpeningsGuard:
                 snap.refreshed_at.isoformat() if snap.refreshed_at else None
             ),
             "hvac_mode": snap.hvac_mode,
-            "floor_allowed": self._floor_blocked_reason() is None,
-            "floor_block_reason": self._floor_blocked_reason(),
             "floor_switch": snap.floor_switch,
             "floor_state": snap.floor_state,
-            "last_floor_action": snap.last_floor_action,
+            "floor_plug_controlled": False,
             "last_away_action": snap.last_away_action,
             "away_latched": self._away_snapshot is not None,
             "last_reason": snap.last_reason,
