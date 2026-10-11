@@ -1,9 +1,11 @@
-"""Outdoor Reset Heating Curve for HBX SensorLinx radiant floors.
+"""Outdoor Reset and floor-zone control for HBX SensorLinx radiant floors.
 
-Adjusts THM zone setpoints based on outdoor temperature using a linear
-heating curve. Includes a floor temperature safety cap for wood floors.
+Outdoor reset primarily adjusts tankless supply-water temperature from
+outdoor conditions. Floor-mode zones are commanded to their configured
+floor targets (no drive-gain overshoot). In cold weather, if room air
+lags comfort, the floor target may rise by at most +2F.
 
-Formula:
+Legacy room-mode heating curve (when floor control is off):
   target = base + overshoot * ((shutdown - T_outdoor) / (shutdown - design_outdoor))
   Clamped to [base, base + overshoot]
 """
@@ -107,28 +109,29 @@ DEFAULT_ZONE_FLOOR_SENSOR_BIAS: dict[str, float] = {
     "living_room": -5.0,
 }
 
-DEFAULT_FLOOR_BOOST = 2.0  # extra degrees added at design outdoor (cold)
-DEFAULT_FLOOR_CONTROL_GAIN = 3.0  # default degrees to overshoot room setpoint when floor is below target
+DEFAULT_FLOOR_BOOST = 2.0  # max floor-target nudge at design outdoor when room lags
+MAX_FLOOR_BOOST = 2.0  # hard cap: outdoor reset may raise floor target at most 2F
+DEFAULT_FLOOR_CONTROL_GAIN = 0.0  # unused: zone SP stays at floor target (no drive overshoot)
 MIN_VALID_HEAT_SETPOINT = 60.0  # THM may report ~41F after turn_off; always re-command
 
-# Ecobee room-temp trim: per-zone air sensors (ecobee remotes) used to
-# average the room air temp and slowly trim floor-mode setpoints so rooms
-# stay comfortable as weather changes. The trim is a bounded integral
-# correction on top of the probe-bias feedforward.
+# Ecobee room-temp sensors: detect lag (slow to reach comfort) for cold-weather
+# floor-target boost, and allow a small negative trim when rooms run hot.
 ROOM_TRIM_SENSOR_ENTITIES: dict[str, str] = {
     "living_room": "sensor.living_room_temperature",
     "main_area": "sensor.family_room_temperature",
     "main_office": "sensor.office_temperature",
 }
-ROOM_TRIM_LOW = 71.0  # room avg below this -> nudge setpoint up
+ROOM_TRIM_LOW = 71.0  # room avg below this in cold weather -> allow floor-target boost
 ROOM_TRIM_HIGH = 75.0  # room avg above this -> nudge setpoint down
-ROOM_TRIM_STEP = 0.5  # degrees per control cycle
-ROOM_TRIM_MIN = -2.0  # trim bounds (degrees)
-ROOM_TRIM_MAX = 6.0
+ROOM_TRIM_STEP = 0.5  # degrees per control cycle (negative trim only)
+ROOM_TRIM_MIN = -2.0  # trim bounds (degrees) — never raise SP via trim
+ROOM_TRIM_MAX = 0.0
+ROOM_LAG_FULL_BOOST_DELTA = 2.0  # F below ROOM_TRIM_LOW for full available boost
 
 # Supply water temperature reset defaults
-DEFAULT_SUPPLY_TEMP_MIN = 100.0  # mild weather supply water temp
+DEFAULT_SUPPLY_TEMP_MIN = 80.0  # mild weather supply (tankless hardware floor)
 DEFAULT_SUPPLY_TEMP_MAX = 140.0  # cold weather supply water temp
+TANKLESS_MIN_TEMP = 80.0  # physical minimum the Optimal Tankless accepts
 TANKLESS_MAX_TEMP = 140.0  # physical maximum the Optimal Tankless can produce
 SUPPLY_DEADBAND = 2.0  # don't re-command if within this range
 # Supply boost: fast heat-up without holding max temp longer than needed
@@ -207,9 +210,14 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         self._boost_stable_count: int = 0
         self._boost_last_end: datetime | None = None
         self._tankless_scan_interval: int | None = None
+        self._unsub_evening_schedule = None
         self._unsub_night_schedule = None
         self._unsub_night_motion = None
         self._unsub_day_restore = None
+        self._unsub_morning_check = None
+        self._last_commanded_setpoints: dict[str, float] = {}
+        self._last_command_at: dict[str, datetime] = {}
+        self._manual_raise_learned_at: dict[str, datetime] = {}
         self._unsub_hvac_cool = None
         self._unsub_cool_interval = None
         self._unsub_cool_sensors = None
@@ -699,6 +707,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 {"entity_id": entity_id, "temperature": zone_target, "hvac_mode": "heat"},
                 blocking=True,
             )
+            self._last_commanded_setpoints[zone_name] = float(zone_target)
+            self._last_command_at[zone_name] = datetime.now()
 
     def _resolve_zone_target(
         self,
@@ -714,10 +724,17 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             return self._zone_night_target(zone_name, floor_mode, floor_temp, outdoor, zone)
 
         if floor_mode:
+            # Base floor target + optional cold-weather lag boost (max +2F).
+            # Outdoor reset still drives tankless supply water; zone SP is the
+            # floor target itself — never an extra drive-gain overshoot.
             base_floor_target = self.params.floor_targets.get(
                 zone_name, default_floor_target(zone_name)
             )
-            floor_target = self._dynamic_floor_target(base_floor_target, outdoor)
+            floor_target = round(
+                base_floor_target
+                + self._cold_weather_floor_boost(zone_name, outdoor),
+                1,
+            )
             if zone is not None and zone.thm_floor_mode:
                 # Thermostat's own sensor is its floor probe: it holds the
                 # (possibly biased) probe at the setpoint, so command the
@@ -731,14 +748,12 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 setpoint = self._compute_floor_mode_setpoint(
                     floor_temp, floor_target, zone_name
                 )
-            # Ecobee comfort trim (daytime only): nudge the setpoint so the
-            # averaged room air temp stays in the comfort band as weather
-            # changes. Bounded and slow; night setback runs untrimmed.
+            # Ecobee comfort trim (daytime only): only allow backing off when
+            # rooms run hot. Upward correction uses floor-target boost above.
             if not self.params.night_setback.active:
                 trim = self.params.zone_room_trim.get(zone_name, 0.0)
-                if trim:
-                    cap = self.zone_floor_max(zone_name)
-                    setpoint = round(max(65.0, min(setpoint + trim, cap)), 1)
+                if trim < 0:
+                    setpoint = round(max(65.0, setpoint + trim), 1)
             return setpoint
 
         offset = self.params.zone_offsets.get(zone_name, 0.0)
@@ -780,11 +795,10 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         return round(sum(vals) / len(vals), 1)
 
     def _update_room_trims(self, outdoor: float) -> None:
-        """Slow integral trim per floor-mode zone from averaged room air temp.
+        """Slow negative-only trim when floor-mode rooms run hot.
 
-        Keeps rooms in the comfort band as days get colder/warmer without
-        touching the probe-bias feedforward. Bounded, daytime only, and only
-        for zones actually calling for heat.
+        Cold-weather lag is handled by ``_cold_weather_floor_boost`` (max +2F
+        on the floor target), not by raising zone setpoints via trim.
         """
         if self.params.night_setback.active:
             return
@@ -799,19 +813,23 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             if avg is None:
                 continue
             trim = self.params.zone_room_trim.get(zone_name, 0.0)
+            # Decay any legacy positive trim toward 0; only accumulate negative.
             new_trim = trim
-            if avg > ROOM_TRIM_HIGH:
+            if trim > ROOM_TRIM_MAX:
+                new_trim = max(ROOM_TRIM_MAX, trim - ROOM_TRIM_STEP)
+            elif avg > ROOM_TRIM_HIGH:
                 new_trim = max(ROOM_TRIM_MIN, trim - ROOM_TRIM_STEP)
-            elif avg < ROOM_TRIM_LOW:
-                new_trim = min(ROOM_TRIM_MAX, trim + ROOM_TRIM_STEP)
+            elif avg < ROOM_TRIM_HIGH and trim < 0:
+                # Rooms cooled back into band — release negative trim slowly
+                new_trim = min(0.0, trim + ROOM_TRIM_STEP)
             if new_trim == trim:
                 continue
             new_trim = round(new_trim, 2)
             self.params.zone_room_trim[zone_name] = new_trim
             self._persist_room_trim(zone_name, new_trim)
             _LOGGER.info(
-                "Room trim %s: room avg %.1fF outside [%.1f, %.1f] -> trim %+.2fF",
-                zone_name, avg, ROOM_TRIM_LOW, ROOM_TRIM_HIGH, new_trim,
+                "Room trim %s: room avg %.1fF -> trim %+.2fF",
+                zone_name, avg, new_trim,
             )
 
     def _persist_room_trim(self, zone_name: str, value: float) -> None:
@@ -839,68 +857,84 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         )
         return self._resolve_zone_target(zone, zone.zone_key, floor_temp, outdoor)
 
-    def _dynamic_floor_target(self, base_target: float, outdoor: float) -> float:
-        """Compute dynamic floor target: base in mild weather, base+boost in cold.
-
-        At shutdown temp: floor target = base (e.g. 70F)
-        At design outdoor: floor target = base + boost (e.g. 72F)
-        Linear interpolation between.
-        """
+    def _outdoor_boost_fraction(self, outdoor: float) -> float:
+        """0 at WWSD shutdown (mild), 1 at design outdoor (cold / OR max)."""
         temp_range = self.params.shutdown - self.params.design_outdoor
         if temp_range <= 0:
-            return base_target
+            return 0.0
         if outdoor >= self.params.shutdown:
-            return base_target
+            return 0.0
         if outdoor <= self.params.design_outdoor:
-            return base_target + self.params.floor_boost
-        ratio = (self.params.shutdown - outdoor) / temp_range
-        return round(base_target + self.params.floor_boost * ratio, 1)
+            return 1.0
+        return (self.params.shutdown - outdoor) / temp_range
+
+    def _cold_weather_floor_boost(self, zone_name: str, outdoor: float) -> float:
+        """Raise floor target up to +2F when cold outdoors and room air lags.
+
+        Outdoor reset still sets tankless supply water. This only nudges the
+        configured floor target when ecobee room air stays below comfort —
+        i.e. the room is taking longer to get to temp in cold weather.
+        """
+        max_boost = min(float(self.params.floor_boost), MAX_FLOOR_BOOST)
+        if max_boost <= 0:
+            return 0.0
+        outdoor_frac = self._outdoor_boost_fraction(outdoor)
+        if outdoor_frac <= 0:
+            return 0.0
+        avg = self._room_average(zone_name)
+        if avg is None or avg >= ROOM_TRIM_LOW:
+            return 0.0
+        lag = ROOM_TRIM_LOW - avg
+        lag_frac = min(1.0, lag / ROOM_LAG_FULL_BOOST_DELTA)
+        boost = round(max_boost * outdoor_frac * lag_frac, 1)
+        if boost > 0:
+            _LOGGER.debug(
+                "Cold-weather floor boost %s: +%.1fF (outdoor_frac=%.2f lag=%.1fF room=%.1fF)",
+                zone_name, boost, outdoor_frac, lag, avg,
+            )
+        return boost
+
+    def _dynamic_floor_target(self, base_target: float, outdoor: float) -> float:
+        """Reference floor target vs outdoor (display / planning).
+
+        Full configured boost at design outdoor; actual commanded boost also
+        requires room lag via ``_cold_weather_floor_boost``.
+        """
+        max_boost = min(float(self.params.floor_boost), MAX_FLOOR_BOOST)
+        return round(base_target + max_boost * self._outdoor_boost_fraction(outdoor), 1)
 
     def _compute_floor_mode_setpoint(
         self, floor_temp: float | None, floor_target: float, zone_name: str
     ) -> float:
-        """Compute the THM room setpoint to achieve a desired floor temperature.
+        """Command the configured floor target as the THM setpoint.
 
-        Since the THM controls based on room temp, we adjust the room setpoint
-        to drive the floor to the desired temperature:
-        - Floor below target: set room setpoint higher to call for more heat
-        - Floor at target: set room setpoint to maintain
-        - Floor above target: reduce room setpoint to let it coast down
+        Hydronic capacity in cold weather comes from outdoor-reset supply
+        water temperature, not from raising the zone setpoint above the
+        floor target. When the slab is already warm, drop the setpoint so
+        the valve releases and the floor can coast down.
         """
-        if floor_temp is None:
-            return floor_target + self.params.floor_control_gain
-
-        error = floor_target - floor_temp
-        if error > 1.0:
-            # Floor is cold — drive harder
-            setpoint = floor_target + self.params.floor_control_gain
-        elif error < -1.0:
-            # Floor is too warm — back off
-            setpoint = floor_target - 2.0
-        else:
-            # Floor is close to target — maintain
-            setpoint = floor_target + 1.0
-
-        # Clamp to reasonable range below zone safety cap
         cap = self.zone_floor_max(zone_name)
-        return round(max(65.0, min(setpoint, cap - 2)), 1)
+        target = round(max(65.0, min(floor_target, cap)), 1)
+        if floor_temp is None:
+            return target
+
+        if floor_temp > floor_target + 1.0:
+            # Floor is too warm — back off below target so heat call clears
+            return round(max(65.0, min(floor_target - 2.0, floor_temp - 1.0)), 1)
+        return target
 
     def _compute_direct_floor_setpoint(
         self, floor_temp: float | None, floor_target: float, zone_name: str
     ) -> float:
         """Setpoint for direct floor thermostats (e.g. Watts Home Sunstat)."""
         cap = self.zone_floor_max(zone_name)
+        target = round(max(65.0, min(floor_target, cap)), 1)
         if floor_temp is None:
-            return round(min(floor_target + 2.0, cap), 1)
+            return target
 
-        error = floor_target - floor_temp
-        if error > 1.0:
-            setpoint = min(floor_target + 3.0, cap)
-        elif error < -1.0:
-            setpoint = max(floor_target - 2.0, 65.0)
-        else:
-            setpoint = floor_target
-        return round(max(65.0, min(setpoint, cap)), 1)
+        if floor_temp > floor_target + 1.0:
+            return round(max(65.0, min(floor_target - 2.0, floor_temp - 1.0)), 1)
+        return target
 
     @property
     def supply_boost_active(self) -> bool:
@@ -937,6 +971,81 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             await self._async_start_supply_boost()
         elif was_heating and not is_heating and not self._any_zone_heating():
             await self._async_end_supply_boost(cancelled=True)
+        await self._maybe_learn_manual_setpoint_raise(event)
+
+    async def _maybe_learn_manual_setpoint_raise(self, event) -> None:
+        """If HA/app raises a zone SP while cold, bump floor target (max +2F).
+
+        Manual raises mean the slab/comfort wasn't warm enough — fold that into
+        the persisted floor target so outdoor-reset / morning recovery learn.
+        """
+        entity_id = event.data.get("entity_id")
+        new_state = event.data.get("new_state")
+        old_state = event.data.get("old_state")
+        if not entity_id or new_state is None or old_state is None:
+            return
+        try:
+            new_sp = float(new_state.attributes.get("temperature"))
+            old_sp = float(old_state.attributes.get("temperature"))
+        except (TypeError, ValueError):
+            return
+        if new_sp < old_sp + 0.9:
+            return
+
+        zone_key = None
+        for zone in self.get_heating_zones():
+            if zone.climate_entity_id == entity_id:
+                zone_key = zone.zone_key
+                break
+        if zone_key is None or self.is_schedule_managed_zone(zone_key):
+            return
+
+        commanded = self._last_commanded_setpoints.get(zone_key)
+        commanded_at = self._last_command_at.get(zone_key)
+        if commanded is not None and abs(new_sp - commanded) < 0.6:
+            return
+        if commanded_at is not None and datetime.now() - commanded_at < timedelta(seconds=45):
+            return
+
+        outdoor = self.outdoor_temp
+        if outdoor is None or outdoor >= self.params.shutdown:
+            return
+
+        last_learn = self._manual_raise_learned_at.get(zone_key)
+        if last_learn is not None and datetime.now() - last_learn < timedelta(minutes=30):
+            return
+
+        base = default_floor_target(zone_key)
+        current = float(
+            self.params.floor_targets.get(zone_key, base)
+        )
+        cap = base + MAX_FLOOR_BOOST
+        new_target = round(min(cap, max(current, current + 0.5), new_sp), 1)
+        if new_target <= current:
+            return
+
+        self.params.floor_targets[zone_key] = new_target
+        self._manual_raise_learned_at[zone_key] = datetime.now()
+        self._last_commanded_setpoints[zone_key] = new_sp
+        self._persist_floor_target_option(zone_key, new_target)
+        _LOGGER.info(
+            "Manual raise learned %s: SP %.1f→%.1fF outdoor=%.1fF "
+            "floor_target %.1f→%.1fF (cap %.1f)",
+            zone_key, old_sp, new_sp, outdoor, current, new_target, cap,
+        )
+
+    def _persist_floor_target_option(self, zone_key: str, value: float) -> None:
+        """Persist a learned floor target without reloading the integration."""
+        entry = getattr(self, "_config_entry", None)
+        if entry is None:
+            return
+        try:
+            new_options = dict(entry.options)
+            new_options[f"floor_target_{zone_key}"] = value
+            self.hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
+            self.hass.config_entries.async_update_entry(entry, options=new_options)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("Failed to persist learned floor target for %s", zone_key)
 
     @callback
     def _async_on_inlet_temp_change(self, event) -> None:
@@ -961,8 +1070,11 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         return min(self.params.supply_temp_max, TANKLESS_MAX_TEMP)
 
     def _clamp_supply_temp(self, temp: float) -> float:
-        """Never command above tankless physical max or configured ceiling."""
-        return round(min(temp, self._effective_supply_max(), TANKLESS_MAX_TEMP), 1)
+        """Clamp to tankless hardware range [80, 140] and configured max."""
+        return round(
+            max(TANKLESS_MIN_TEMP, min(temp, self._effective_supply_max())),
+            1,
+        )
 
     def _compute_boost_target(self, optimal: float) -> float:
         """Boost only as hot as needed — optimal + headroom, capped at tankless max."""
@@ -1133,7 +1245,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
             return False
 
         set_value = round(target) if entity_id.startswith("water_heater.") else target
-        set_value = min(set_value, TANKLESS_MAX_TEMP) if entity_id.startswith("water_heater.") else set_value
+        if entity_id.startswith("water_heater."):
+            set_value = max(TANKLESS_MIN_TEMP, min(set_value, TANKLESS_MAX_TEMP))
         _LOGGER.info("Setting supply %s to %sF (was %.1fF)", entity_id, set_value, current)
 
         if entity_id.startswith("climate."):
@@ -1162,8 +1275,8 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
     def _compute_supply_water_temp(self, outdoor: float) -> float:
         """Compute target supply water temperature based on outdoor temp.
 
-        Linear interpolation:
-        - At shutdown (65F outdoor): supply = supply_temp_min (100F)
+        Linear interpolation across the tankless range:
+        - At shutdown (65F outdoor): supply = supply_temp_min (80F)
         - At design outdoor (25F): supply = supply_temp_max (140F)
         """
         temp_range = self.params.shutdown - self.params.design_outdoor
@@ -1535,7 +1648,7 @@ class OutdoorResetParams:
         self.setpoint_hold: dict[str, bool] = {}  # zone_key -> True skips commanded setpoints
         self.floor_targets: dict[str, float] = {}
         self.floor_boost: float = DEFAULT_FLOOR_BOOST
-        self.floor_control_gain: float = DEFAULT_FLOOR_CONTROL_GAIN  # room-setpoint overshoot when slab is cold
+        self.floor_control_gain: float = DEFAULT_FLOOR_CONTROL_GAIN  # legacy; zone SP no longer overshoots
         # Supply water temperature reset
         self.supply_temp_min: float = DEFAULT_SUPPLY_TEMP_MIN
         self.supply_temp_max: float = DEFAULT_SUPPLY_TEMP_MAX
@@ -1801,17 +1914,17 @@ def get_number_entities(
         ),
         OutdoorResetNumberEntity(
             coordinator, controller, "floor_boost",
-            "Floor Boost (Cold Weather)", DEFAULT_FLOOR_BOOST, 0, 5, 0.5,
+            "Floor Boost (Cold Weather, max)", DEFAULT_FLOOR_BOOST, 0, MAX_FLOOR_BOOST, 0.5,
             "mdi:thermometer-chevron-up",
         ),
         OutdoorResetNumberEntity(
             coordinator, controller, "floor_control_gain",
-            "Floor Control: Drive Gain", DEFAULT_FLOOR_CONTROL_GAIN, 0, 6, 0.5,
+            "Floor Control: Drive Gain (unused)", DEFAULT_FLOOR_CONTROL_GAIN, 0, 6, 0.5,
             "mdi:thermometer-chevron-up",
         ),
         OutdoorResetNumberEntity(
             coordinator, controller, "supply_temp_min",
-            "Supply Water: Min Temp (Mild)", DEFAULT_SUPPLY_TEMP_MIN, 80, 130, 5,
+            "Supply Water: Min Temp (Mild)", DEFAULT_SUPPLY_TEMP_MIN, TANKLESS_MIN_TEMP, 130, 5,
             "mdi:water-thermometer-outline",
         ),
         OutdoorResetNumberEntity(
@@ -2067,11 +2180,13 @@ class OutdoorResetNumberEntity(RestoreNumber):
         elif self._key == "floor_temp_max":
             params.floor_max = self._attr_native_value
         elif self._key == "floor_boost":
-            params.floor_boost = self._attr_native_value
+            params.floor_boost = min(float(self._attr_native_value), MAX_FLOOR_BOOST)
         elif self._key == "floor_control_gain":
             params.floor_control_gain = self._attr_native_value
         elif self._key == "supply_temp_min":
-            params.supply_temp_min = self._attr_native_value
+            params.supply_temp_min = max(
+                TANKLESS_MIN_TEMP, min(float(self._attr_native_value), TANKLESS_MAX_TEMP)
+            )
         elif self._key == "supply_temp_max":
             params.supply_temp_max = self._attr_native_value
         elif self._key == "thermal_lag":
@@ -2427,9 +2542,13 @@ class OutdoorResetZoneTargetSensor(SensorEntity):
                 self._zone_key, default_floor_target(self._zone_key)
             )
             outdoor = self._controller.outdoor_temp
-            if outdoor is not None:
-                return self._controller._dynamic_floor_target(base, outdoor)
-            return base
+            if outdoor is None:
+                return base
+            # Show commanded target: base + lag-gated cold boost (≤ +2F)
+            return round(
+                base + self._controller._cold_weather_floor_boost(self._zone_key, outdoor),
+                1,
+            )
         offset = self._controller.params.zone_offsets.get(self._zone_key, 0.0)
         return self._controller.zone_target(offset)
 
@@ -2941,6 +3060,7 @@ class SupplyWaterTargetSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         return {
             "supply_min": self._controller.params.supply_temp_min,
+            "tankless_min": TANKLESS_MIN_TEMP,
             "supply_max": self._controller._effective_supply_max(),
             "tankless_max": TANKLESS_MAX_TEMP,
             "supply_entity_id": self._controller.params.supply_entity_id or "not configured",

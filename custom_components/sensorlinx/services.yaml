@@ -33,13 +33,16 @@ set_forecast_entity:
 apply_night_setback:
   name: Apply Night Setback
   description: >-
-    Lower heated floor zones to night targets. Normally runs automatically at
-    11:45 PM when night setback is enabled.
+    Lower heated floor zones to deep-night targets (default 66F). Evening step
+    to 70F runs at 11:00 PM; deep night at midnight. Morning recovery to 72F
+    starts early enough for an 8:00 AM wake using slab lag, outdoor temp, and
+    supply/return delta-T.
 
 restore_day_setback:
   name: Restore Day Setback
   description: >-
-    Return zones to daytime outdoor-reset targets. Runs automatically at 6 AM.
+    Return zones to daytime outdoor-reset / floor targets. Runs automatically
+    at 8:00 AM wake (morning recovery may raise to 72F earlier).
 
 refresh_openings:
   name: Refresh Openings
