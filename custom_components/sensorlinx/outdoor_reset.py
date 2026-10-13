@@ -158,8 +158,10 @@ DEFAULT_ELECTRICITY_COST = 0.105  # $/kWh (10.5 cents)
 WATER_BTU_FACTOR = 500  # BTU/hr per GPM per degree F delta-T
 
 # WWSD shutdown deadband: once shut off at threshold, don't restart until
-# outdoor drops this many degrees below the shutdown temp (prevents cycling)
-SHUTDOWN_DEADBAND = 2.0  # degrees F hysteresis
+# outdoor drops this many degrees below the shutdown temp (prevents cycling
+# when outdoor rides 64–66F around a 65F WWSD). Latch is also persisted so
+# reloads cannot clear hysteresis mid-bounce.
+SHUTDOWN_DEADBAND = 4.0  # degrees F hysteresis (restart only below WWSD-4)
 
 SIGNAL_FLOOR_MODE_CHANGED = f"{DOMAIN}_floor_mode_changed"
 
@@ -271,28 +273,104 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         """Effective WWSD shutdown temp for a zone (per-zone override or system-wide)."""
         return self.params.zone_shutdown_temps.get(zone_name, self.params.shutdown)
 
+    def wwsd_restart_temp(self, zone_name: str) -> float:
+        """Outdoor temp that must be reached before a latched WWSD zone restarts."""
+        return self.zone_shutdown_temp(zone_name) - SHUTDOWN_DEADBAND
+
     def is_zone_shutdown(self, zone_name: str, outdoor: float) -> bool:
         """Determine if zone should be in shutdown with deadband hysteresis.
 
         Once a zone shuts down (outdoor >= threshold), it stays off until
-        outdoor drops SHUTDOWN_DEADBAND degrees below threshold. This prevents
-        rapid cycling when outdoor temp oscillates near the boundary.
+        outdoor drops SHUTDOWN_DEADBAND degrees below threshold. Latch is
+        persisted so HA reloads cannot re-arm heat during a shoulder-season
+        bounce around WWSD.
         """
         threshold = self.zone_shutdown_temp(zone_name)
+        restart = self.wwsd_restart_temp(zone_name)
         was_shutdown = self._zone_in_shutdown.get(zone_name, False)
 
         if was_shutdown:
-            # Already in shutdown: require outdoor to drop below threshold - deadband
-            if outdoor < (threshold - SHUTDOWN_DEADBAND):
+            if outdoor < restart:
                 self._zone_in_shutdown[zone_name] = False
+                self._persist_wwsd_latch(zone_name, False)
+                _LOGGER.info(
+                    "WWSD latch cleared %s: outdoor %.1fF < restart %.1fF "
+                    "(WWSD %.1fF, deadband %.1fF)",
+                    zone_name, outdoor, restart, threshold, SHUTDOWN_DEADBAND,
+                )
                 return False
             return True
-        else:
-            # Not in shutdown: trigger when outdoor reaches threshold
-            if outdoor >= threshold:
+
+        if outdoor >= threshold:
+            self._zone_in_shutdown[zone_name] = True
+            self._persist_wwsd_latch(zone_name, True)
+            return True
+        return False
+
+    def _persist_wwsd_latch(self, zone_name: str, latched: bool) -> None:
+        """Persist per-zone WWSD latch across reloads (skip config-entry reload)."""
+        entry = getattr(self, "_config_entry", None)
+        if entry is None:
+            return
+        try:
+            key = f"wwsd_latched_{zone_name}"
+            new_options = dict(entry.options)
+            if latched:
+                if new_options.get(key) is True:
+                    return
+                new_options[key] = True
+            else:
+                if key not in new_options:
+                    return
+                new_options.pop(key, None)
+            self.hass.data.setdefault(DOMAIN, {})[f"{entry.entry_id}_skip_reload"] = True
+            self.hass.config_entries.async_update_entry(entry, options=new_options)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            _LOGGER.debug("Failed to persist WWSD latch for %s", zone_name)
+
+    def _restore_wwsd_latches(self) -> None:
+        """Restore WWSD latch from options and current outdoor (startup harden)."""
+        entry = getattr(self, "_config_entry", None)
+        outdoor = self.outdoor_temp
+        for zone in self.get_heating_zones():
+            zone_name = zone.zone_key
+            threshold = self.zone_shutdown_temp(zone_name)
+            restart = self.wwsd_restart_temp(zone_name)
+            saved = False
+            if entry is not None:
+                saved = bool(entry.options.get(f"wwsd_latched_{zone_name}", False))
+
+            climate = self.hass.states.get(zone.climate_entity_id)
+            climate_off = climate is not None and climate.state == "off"
+
+            if outdoor is not None and outdoor >= threshold:
+                # Still at/above WWSD — force latch on
                 self._zone_in_shutdown[zone_name] = True
-                return True
-            return False
+                if not saved:
+                    self._persist_wwsd_latch(zone_name, True)
+            elif outdoor is not None and outdoor < restart:
+                self._zone_in_shutdown[zone_name] = False
+                if saved:
+                    self._persist_wwsd_latch(zone_name, False)
+            elif saved:
+                # In deadband with persisted latch — stay off
+                self._zone_in_shutdown[zone_name] = True
+            elif outdoor is not None and climate_off:
+                # In deadband, latch lost (reload), zone already off — re-latch
+                # so shoulder-season bounce cannot flap heat back on.
+                self._zone_in_shutdown[zone_name] = True
+                self._persist_wwsd_latch(zone_name, True)
+            else:
+                self._zone_in_shutdown[zone_name] = False
+
+            if self._zone_in_shutdown.get(zone_name):
+                _LOGGER.info(
+                    "WWSD latch restored %s: outdoor=%s WWSD=%.1f restart=%.1f",
+                    zone_name,
+                    f"{outdoor:.1f}F" if outdoor is not None else "?",
+                    threshold,
+                    restart,
+                )
 
     def zone_floor_max(self, zone_name: str) -> float:
         """Per-zone floor safety cap (wood default 80F, tile zones higher)."""
@@ -468,6 +546,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         await self._setup_night_setback()
         await self._setup_cooling_control()
         await self._setup_night_air_mix()
+        self._restore_wwsd_latches()
         if self._main_hvac_cooling():
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC already in cool mode"
@@ -607,7 +686,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                         outdoor,
                         zone_name,
                         zone_sd,
-                        zone_sd - SHUTDOWN_DEADBAND,
+                        self.wwsd_restart_temp(zone_name),
                     )
                     await self.hass.services.async_call(
                         "climate",
@@ -647,7 +726,7 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 _LOGGER.info(
                     "WWSD: outdoor %.1f°F, zone %s (%s mode) shutdown at %.1f°F "
                     "(restart below %.1f°F)",
-                    outdoor, zone_name, mode, zone_sd, zone_sd - SHUTDOWN_DEADBAND,
+                    outdoor, zone_name, mode, zone_sd, self.wwsd_restart_temp(zone_name),
                 )
                 await self.hass.services.async_call(
                     "climate", "turn_off",
@@ -912,16 +991,26 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         water temperature, not from raising the zone setpoint above the
         floor target. When the slab is already warm, drop the setpoint so
         the valve releases and the floor can coast down.
+
+        ``floor_temp`` is bias-corrected (true slab). If the zone probe runs
+        hot (negative bias), translate the commanded setpoint so the device
+        holds the probe at target - bias (e.g. true 73F -> probe SP 78F).
         """
         cap = self.zone_floor_max(zone_name)
-        target = round(max(65.0, min(floor_target, cap)), 1)
+        bias = self.floor_sensor_bias(zone_name)
+
+        def command_for_true(true_target: float) -> float:
+            if bias:
+                return self._device_floor_setpoint(zone_name, true_target)
+            return round(max(65.0, min(true_target, cap)), 1)
+
         if floor_temp is None:
-            return target
+            return command_for_true(floor_target)
 
         if floor_temp > floor_target + 1.0:
-            # Floor is too warm — back off below target so heat call clears
-            return round(max(65.0, min(floor_target - 2.0, floor_temp - 1.0)), 1)
-        return target
+            true_backoff = min(floor_target - 2.0, floor_temp - 1.0)
+            return command_for_true(true_backoff)
+        return command_for_true(floor_target)
 
     def _compute_direct_floor_setpoint(
         self, floor_temp: float | None, floor_target: float, zone_name: str

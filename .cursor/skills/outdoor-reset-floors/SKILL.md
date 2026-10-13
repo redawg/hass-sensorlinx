@@ -48,6 +48,7 @@ Prefer local weather (Ames Lake / Quail Creek), not remote sites:
 Classify day:
 
 - **Above WWSD (≥65°F)** → heat off / preheat only if forecast drops
+- **WWSD latch** → once off at ≥65°F, stays off until outdoor &lt; **61°F** (4°F deadband); latch persists across reloads so shoulder-season 64–66°F bounce cannot flap valves
 - **Mild (WWSD → ~45°F)** → shallow supply; floors near base targets
 - **Cold (→ design 25°F)** → supply toward max; allow lag boost ≤+2°F if rooms lag
 - **At/below design** → supply at max (140°F cap)
@@ -90,7 +91,9 @@ Single closed loop from the tankless; zone **valves** open/close individual floo
 
 | Zone | Climate | Floor target | Loops (valves) | Entity |
 |------|---------|--------------|----------------|--------|
-| Living | `climate.living_room_living_room` | 69 | **3** | `number.sensorlinx_outdoor_reset_valve_count_living_room` |
+| Living | `climate.living_room_living_room` | 73 (day) | **3** | `number.sensorlinx_outdoor_reset_valve_count_living_room` |
+
+**Living room floor probe bias −5°F** (`number.living_room_floor_sensor_bias_living_room`): sensor reads ~5°F **hot** (near supply/manifold). Always use **true slab ≈ raw − 5** for decisions; integration commands thermostat SP = **floor target + 5** (e.g. true **73°F** → climate set **78°F**). Room air: `sensor.living_room_temperature` (~71°F) is more representative of comfort than the floor probe.
 | Main area | `climate.main_area_main_area` | 72 | **5** | `..._valve_count_main_area` |
 | Main office | `climate.main_office_main_office` | 69 | **1** | `..._valve_count_main_office` |
 | Laundry | `climate.laundry_laundry` | 72 | **1** (single loop) | `..._valve_count_laundry` |
