@@ -547,12 +547,22 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
         await self._setup_cooling_control()
         await self._setup_night_air_mix()
         self._restore_wwsd_latches()
+        # Zones may not be ready at first setup — re-sync latch shortly after.
+        self.hass.loop.call_later(
+            30, lambda: self.hass.async_create_task(self._async_resync_wwsd_latches())
+        )
         if self._main_hvac_cooling():
             await self._async_suppress_floor_heating_for_hvac_cool(
                 "HVAC already in cool mode"
             )
         # Apply immediately so WWSD / floor targets take effect after restart
         # without waiting for the first outdoor change or 15-minute interval.
+        if self.enabled:
+            await self._apply_setpoints()
+
+    async def _async_resync_wwsd_latches(self) -> None:
+        """Re-apply WWSD latch after climates are available; enforce shutdown."""
+        self._restore_wwsd_latches()
         if self.enabled:
             await self._apply_setpoints()
 
@@ -642,6 +652,9 @@ class OutdoorResetController(HvacOrchestratorMixin, CoolingControlMixin, NightSe
                 "Openings open — skipping outdoor-reset setpoints (away owned by openings guard)"
             )
             return
+
+        # Keep WWSD hysteresis in sync (survives lost in-memory latch / late zones)
+        self._restore_wwsd_latches()
 
         outdoor = self.outdoor_temp
         if outdoor is None:
