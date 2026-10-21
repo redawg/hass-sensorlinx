@@ -45,7 +45,7 @@ DEFAULT_ORCHESTRATOR_ENABLED = True
 DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0  # hot-day whole-house average target (°F)
 DEFAULT_RADIANT_FIRST_ENABLED = True
-DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 1.0  # supplement forced air when main is this far below target
+DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 2.0  # supplement forced air when main is this far below target
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -1293,6 +1293,9 @@ def get_orchestrator_number_entities(coordinator, controller: OutdoorResetContro
     oc = controller.params.orchestrator
     entities: list[NumberEntity] = [
         OrchestratorHeatSetpointNumber(coordinator, controller, oc.heat_setpoint),
+        OrchestratorHeatSupplementMarginNumber(
+            coordinator, controller, oc.heat_supplement_indoor_margin
+        ),
         OrchestratorCoolSetpointNumber(coordinator, controller, oc.cool_setpoint),
         OrchestratorPrecoolLeadNumber(coordinator, controller, oc.precool_lead_minutes),
         OrchestratorEveningCutoffNumber(
@@ -1399,6 +1402,71 @@ class OrchestratorHeatSetpointNumber(RestoreNumber):
         self._attr_native_value = value
         self._controller.params.orchestrator.heat_setpoint = float(value)
         self.async_write_ha_state()
+
+
+class OrchestratorHeatSupplementMarginNumber(RestoreNumber):
+    """How far below the heat setpoint the main floor must fall before the
+    forced-air furnace supplements the radiant floors.
+
+    Live slider: changing it updates the orchestrator immediately and
+    re-runs orchestration so the new threshold takes effect right away.
+    Restored across restarts via RestoreNumber (same pattern as the
+    orchestrator heat setpoint).
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Heat Supplement Margin"
+    _attr_native_unit_of_measurement = UnitOfTemperature.FAHRENHEIT
+    _attr_mode = NumberMode.SLIDER
+    _attr_icon = "mdi:thermometer-minus"
+
+    def __init__(self, coordinator, controller, initial: float) -> None:
+        self._coordinator = coordinator
+        self._controller = controller
+        self._attr_unique_id = "sensorlinx_orchestrator_heat_supplement_margin"
+        self._attr_native_min_value = 0
+        self._attr_native_max_value = 5
+        self._attr_native_step = 0.5
+        self._attr_native_value = initial
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        return {
+            "identifiers": {(DOMAIN, "hvac_orchestrator")},
+            "name": "SensorLinx HVAC Orchestrator",
+            "manufacturer": "HBX Controls",
+            "model": "Actual-Temp Mode Control",
+        }
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        oc = self._controller.params.orchestrator
+        return {
+            "heat_setpoint": oc.heat_setpoint,
+            "supplement_below": oc.heat_setpoint - oc.heat_supplement_indoor_margin,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_state()) and last.state not in (
+            "unknown",
+            "unavailable",
+        ):
+            try:
+                self._attr_native_value = float(last.state)
+                self._controller.params.orchestrator.heat_supplement_indoor_margin = float(
+                    last.state
+                )
+            except (TypeError, ValueError):
+                pass
+
+    async def async_set_native_value(self, value: float) -> None:
+        self._attr_native_value = value
+        self._controller.params.orchestrator.heat_supplement_indoor_margin = float(value)
+        self.async_write_ha_state()
+        await self._controller._async_orchestrate_hvac_mode(
+            force=True, trigger="heat_supplement_margin_change"
+        )
 
 
 class OrchestratorCoolSetpointNumber(RestoreNumber):
