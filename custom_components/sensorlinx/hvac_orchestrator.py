@@ -46,6 +46,11 @@ DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0  # hot-day whole-house average target (°F)
 DEFAULT_RADIANT_FIRST_ENABLED = True
 DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 2.0  # supplement forced air when main is this far below target
+# Forced-air supplement killed per user request 2026-10-28: the furnace
+# must never be set to heat by the orchestrator. Radiant floors only;
+# the orchestrator still manages floor zones and fan circulation.
+# To restore the supplement, set this back to True.
+HEAT_SUPPLEMENT_ENABLED = False
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -491,7 +496,8 @@ class HvacOrchestratorMixin:
         comfort_target = oc.heat_setpoint
         supplement_below = comfort_target - oc.heat_supplement_indoor_margin
         need_heat_supplement = (
-            oc.radiant_first_enabled
+            HEAT_SUPPLEMENT_ENABLED
+            and oc.radiant_first_enabled
             and main is not None
             and main < supplement_below
         )
@@ -1407,6 +1413,11 @@ class OrchestratorHeatSetpointNumber(RestoreNumber):
 class OrchestratorHeatSupplementMarginNumber(RestoreNumber):
     """How far below the heat setpoint the main floor must fall before the
     forced-air furnace supplements the radiant floors.
+
+    NOTE: the supplement itself is disabled (HEAT_SUPPLEMENT_ENABLED = False,
+    per user request 2026-10-28), so this slider currently has no effect on
+    furnace firing. It is kept so the threshold is still visible and the
+    supplement can be restored by flipping that flag back to True.
 
     Live slider: changing it updates the orchestrator immediately and
     re-runs orchestration so the new threshold takes effect right away.
