@@ -46,11 +46,12 @@ DEFAULT_ORCHESTRATOR_HEAT_SETPOINT = 72.0
 DEFAULT_ORCHESTRATOR_COOL_SETPOINT = 74.0  # hot-day whole-house average target (°F)
 DEFAULT_RADIANT_FIRST_ENABLED = True
 DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 2.0  # supplement forced air when main is this far below target
-# Forced-air supplement killed per user request 2026-10-28: the furnace
-# must never be set to heat by the orchestrator. Radiant floors only;
-# the orchestrator still manages floor zones and fan circulation.
-# To restore the supplement, set this back to True.
-HEAT_SUPPLEMENT_ENABLED = False
+# Forced-air supplement RESTORED per user request 2026-11-18: with the
+# supplement killed (2026-10-28, v0.1.80) the radiant floors alone could
+# not hold the house in cold weather — main floor fell to 62-63F with
+# outdoor lows near 32F. The furnace may again supplement the floors
+# when the main floor falls below the supplement threshold.
+HEAT_SUPPLEMENT_ENABLED = True
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -1414,10 +1415,10 @@ class OrchestratorHeatSupplementMarginNumber(RestoreNumber):
     """How far below the heat setpoint the main floor must fall before the
     forced-air furnace supplements the radiant floors.
 
-    NOTE: the supplement itself is disabled (HEAT_SUPPLEMENT_ENABLED = False,
-    per user request 2026-10-28), so this slider currently has no effect on
-    furnace firing. It is kept so the threshold is still visible and the
-    supplement can be restored by flipping that flag back to True.
+    NOTE: the supplement was disabled in v0.1.80 (HEAT_SUPPLEMENT_ENABLED =
+    False, per user request 2026-10-28) and restored in v0.1.81 (per user
+    request 2026-11-18, house too cold on radiant alone). With the
+    supplement enabled, this slider sets the threshold live again.
 
     Live slider: changing it updates the orchestrator immediately and
     re-runs orchestration so the new threshold takes effect right away.
