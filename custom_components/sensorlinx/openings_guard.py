@@ -47,6 +47,14 @@ _LOGGER = logging.getLogger(__name__)
 
 REFRESH_INTERVAL = timedelta(minutes=5)
 
+# User rule (2026-11-19): floor zones go to Away ONLY when the user says so
+# (e.g. traveling). The openings guard must never set zones Away on its own —
+# flaky Ecobee contacts (tb56/wk2n) sent false "open" blips that put all four
+# zones on Away (41F) for minutes at a time, all day. Guard monitoring
+# (contact validation, open/closed status) still runs; only the automatic
+# Away-setting is disabled.
+OPENINGS_AUTO_AWAY_ENABLED = False
+
 DEFAULT_OPENING_CONTACTS = (
     "binary_sensor.wldj_contact",  # Kitchen Window
     "binary_sensor.wpxp_contact",  # Main office
@@ -336,7 +344,12 @@ class OpeningsGuard:
 
         Restores prior away state for each zone when everything closes again.
         Does not touch the radiant controller power plug.
+
+        Disabled by user rule (2026-11-19): zones go to Away only when the
+        user says so. See OPENINGS_AUTO_AWAY_ENABLED.
         """
+        if not OPENINGS_AUTO_AWAY_ENABLED:
+            return
         if self.snapshot.any_open:
             if self._away_snapshot is not None:
                 return
