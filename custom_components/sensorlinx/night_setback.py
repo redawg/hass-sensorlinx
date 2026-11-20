@@ -2,7 +2,7 @@
 
 Schedule:
   11:00 PM  → evening 70°F
-  midnight  → deep night 66°F
+  midnight  → deep night 68°F
   (dynamic) → morning recovery to 72°F early enough for ~8:00 AM wake
   8:00 AM   → day outdoor-reset / floor targets
 
@@ -39,12 +39,12 @@ EVENING_SETBACK_MINUTE = 0
 
 # Midnight — deep night (tunable via HA number entities)
 DEFAULT_NIGHT_ROOM_TARGETS = {
-    "main_area": 66.0,
-    "living_room": 66.0,
-    "main_office": 66.0,
+    "main_area": 68.0,
+    "living_room": 68.0,
+    "main_office": 68.0,
 }
 DEFAULT_NIGHT_FLOOR_TARGETS = {
-    "laundry": 66.0,
+    "laundry": 68.0,
 }
 NIGHT_SETBACK_HOUR = 0
 NIGHT_SETBACK_MINUTE = 0
@@ -318,11 +318,11 @@ class NightSetbackMixin:
             target = ns.evening_target
         elif floor_mode:
             target = ns.night_floor_targets.get(
-                zone_name, DEFAULT_NIGHT_FLOOR_TARGETS.get(zone_name, 66.0)
+                zone_name, DEFAULT_NIGHT_FLOOR_TARGETS.get(zone_name, 68.0)
             )
         else:
             target = ns.night_room_targets.get(
-                zone_name, DEFAULT_NIGHT_ROOM_TARGETS.get(zone_name, 66.0)
+                zone_name, DEFAULT_NIGHT_ROOM_TARGETS.get(zone_name, 68.0)
             )
 
         if floor_mode:
@@ -357,7 +357,7 @@ class NightSetbackMixin:
         async_dispatcher_send(self.hass, SIGNAL_NIGHT_MODE_CHANGED)
 
     async def _async_apply_night_setback(self, reason: str) -> None:
-        """Midnight step: deep night targets (default 66°F)."""
+        """Midnight step: deep night targets (default 68°F)."""
         ns = self._night_params()
         if not ns.enabled:
             return
