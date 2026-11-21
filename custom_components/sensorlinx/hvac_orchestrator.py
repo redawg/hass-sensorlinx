@@ -52,6 +52,11 @@ DEFAULT_HEAT_SUPPLEMENT_INDOOR_MARGIN = 2.0  # supplement forced air when main i
 # outdoor lows near 32F. The furnace may again supplement the floors
 # when the main floor falls below the supplement threshold.
 HEAT_SUPPLEMENT_ENABLED = True
+# Weekend mornings — no furnace heat before 9:00 AM Sat/Sun (user 2026-11-21:
+# the 9 AM weekend wake is about the furnace heat, not just the floors).
+# The radiant floors keep working; only the forced-air supplement is gated.
+WEEKEND_HEAT_BLOCK_HOUR = 9
+WEEKEND_HEAT_BLOCK_MINUTE = 0
 DEFAULT_EVENING_COOL_CUTOFF_HOUR = 19  # fallback if sun.sun unavailable
 DEFAULT_EVENING_COOL_CUTOFF_OFFSET_MIN = -120  # minutes relative to sunset (neg = before)
 DEFAULT_EVENING_COAST_HOT_OVERRIDE = 8.0  # keep cool after cutoff only if outdoor >= cool_limit + this
@@ -72,6 +77,14 @@ def _fmt_hour(dt: datetime) -> str:
 
 def _fmt_hour_min(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _weekend_heat_blocked(now: datetime) -> bool:
+    """True on Sat/Sun before 9:00 AM — furnace heat stays off."""
+    return now.weekday() >= 5 and (now.hour, now.minute) < (
+        WEEKEND_HEAT_BLOCK_HOUR,
+        WEEKEND_HEAT_BLOCK_MINUTE,
+    )
 
 
 @dataclass
@@ -501,6 +514,7 @@ class HvacOrchestratorMixin:
             and oc.radiant_first_enabled
             and main is not None
             and main < supplement_below
+            and not _weekend_heat_blocked(now)
         )
 
         # --- Actual-temp execution (always wins over plan) ---
@@ -556,6 +570,13 @@ class HvacOrchestratorMixin:
                     reason = (
                         f"radiant holding main {main:.0f}°F — "
                         f"returning to fan circulation"
+                    )
+                elif _weekend_heat_blocked(now):
+                    want_circulate = True
+                    main_note = f"{main:.0f}°F" if main is not None else "n/a"
+                    reason = (
+                        f"weekend: no furnace heat before 9:00 AM "
+                        f"(main {main_note}, outdoor {outdoor:.0f}°F)"
                     )
             else:
                 want_heat = True
