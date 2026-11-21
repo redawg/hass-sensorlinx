@@ -4,7 +4,8 @@ Schedule:
   11:00 PM  → evening 70°F
   midnight  → deep night 68°F
   (dynamic) → morning recovery to 72°F early enough for ~8:00 AM wake
-  8:00 AM   → day outdoor-reset / floor targets
+  (9:00 AM on weekends)
+  8:00 AM   → day outdoor-reset / floor targets (9:00 AM on weekends)
 
 Morning lead time uses slab deficit × thermal lag, scaled by outdoor coldness
 and tankless supply / return (ΔT) conditions.
@@ -53,9 +54,19 @@ NIGHT_SETBACK_MINUTE = 0
 MORNING_WAKE_TARGET = 72.0
 MORNING_WAKE_HOUR = 8
 MORNING_WAKE_MINUTE = 0
+# Weekend wake — sleep in: floors at comfort by 9:00 AM Sat/Sun
+MORNING_WAKE_HOUR_WEEKEND = 9
+MORNING_WAKE_MINUTE_WEEKEND = 0
 MORNING_CHECK_INTERVAL = timedelta(minutes=5)
 MORNING_LEAD_MIN = 20.0  # never start recovery with less than this if deficit exists
 MORNING_LEAD_MAX = 240.0  # 4 h cap
+
+
+def morning_wake_time_for(now: datetime) -> tuple[int, int]:
+    """Wake clock for a given day: 9:00 AM Sat/Sun, 8:00 AM weekdays."""
+    if now.weekday() >= 5:
+        return (MORNING_WAKE_HOUR_WEEKEND, MORNING_WAKE_MINUTE_WEEKEND)
+    return (MORNING_WAKE_HOUR, MORNING_WAKE_MINUTE)
 
 PHASE_OFF = "off"
 PHASE_EVENING = "evening"
@@ -87,6 +98,7 @@ class NightSetbackMixin:
     _unsub_evening_schedule: Any
     _unsub_night_schedule: Any
     _unsub_day_restore: Any
+    _unsub_day_restore_weekend: Any
     _unsub_morning_check: Any
 
     def _night_params(self) -> NightSetbackParams:
@@ -125,8 +137,13 @@ class NightSetbackMixin:
 
         @callback
         def _on_wake_restore(now: datetime) -> None:
+            wake_hour, wake_minute = morning_wake_time_for(now)
+            if (now.hour, now.minute) != (wake_hour, wake_minute):
+                return
             self.hass.async_create_task(
-                self._async_restore_day_setback("8:00 AM wake")
+                self._async_restore_day_setback(
+                    f"{wake_hour:02d}:{wake_minute:02d} wake"
+                )
             )
 
         self._unsub_day_restore = async_track_time_change(
@@ -134,6 +151,13 @@ class NightSetbackMixin:
             _on_wake_restore,
             hour=MORNING_WAKE_HOUR,
             minute=MORNING_WAKE_MINUTE,
+            second=0,
+        )
+        self._unsub_day_restore_weekend = async_track_time_change(
+            self.hass,
+            _on_wake_restore,
+            hour=MORNING_WAKE_HOUR_WEEKEND,
+            minute=MORNING_WAKE_MINUTE_WEEKEND,
             second=0,
         )
 
@@ -154,7 +178,8 @@ class NightSetbackMixin:
         if not ns.enabled:
             return
         now = datetime.now()
-        wake_minutes = ns.morning_wake_hour * 60 + ns.morning_wake_minute
+        wake_hour, wake_minute = morning_wake_time_for(now)
+        wake_minutes = wake_hour * 60 + wake_minute
         now_minutes = now.hour * 60 + now.minute
         if now_minutes < wake_minutes:
             # Overnight — prefer night; morning check may promote to recovery
@@ -168,6 +193,7 @@ class NightSetbackMixin:
             "_unsub_evening_schedule",
             "_unsub_night_schedule",
             "_unsub_day_restore",
+            "_unsub_day_restore_weekend",
             "_unsub_morning_check",
         ):
             unsub = getattr(self, attr, None)
@@ -179,14 +205,22 @@ class NightSetbackMixin:
         """Minutes until today's (or tomorrow's) morning wake clock."""
         ns = self._night_params()
         now = now or datetime.now()
+        wake_hour, wake_minute = morning_wake_time_for(now)
         wake = now.replace(
-            hour=ns.morning_wake_hour,
-            minute=ns.morning_wake_minute,
+            hour=wake_hour,
+            minute=wake_minute,
             second=0,
             microsecond=0,
         )
         if now >= wake:
-            wake = wake + timedelta(days=1)
+            tomorrow = now + timedelta(days=1)
+            wake_hour, wake_minute = morning_wake_time_for(tomorrow)
+            wake = tomorrow.replace(
+                hour=wake_hour,
+                minute=wake_minute,
+                second=0,
+                microsecond=0,
+            )
         return (wake - now).total_seconds() / 60.0
 
     def _compute_morning_lead_minutes(self) -> float:
@@ -260,9 +294,10 @@ class NightSetbackMixin:
 
         now = datetime.now()
         # Only recover for today's wake (overnight window)
+        wake_hour, wake_minute = morning_wake_time_for(now)
         wake_today = now.replace(
-            hour=ns.morning_wake_hour,
-            minute=ns.morning_wake_minute,
+            hour=wake_hour,
+            minute=wake_minute,
             second=0,
             microsecond=0,
         )
@@ -299,7 +334,7 @@ class NightSetbackMixin:
             ns.morning_wake_target,
         )
         await self._async_apply_morning_wake(
-            f"lead {lead:.0f} min (wake {ns.morning_wake_hour:02d}:{ns.morning_wake_minute:02d})"
+            f"lead {lead:.0f} min (wake {wake_hour:02d}:{wake_minute:02d})"
         )
 
     def _zone_night_target(
@@ -503,13 +538,12 @@ class NightModeActiveSwitch(SwitchEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         ns = self._controller.params.night_setback
+        wake_hour, wake_minute = morning_wake_time_for(datetime.now())
         return {
             "phase": ns.phase,
             "evening_target": ns.evening_target,
             "morning_wake_target": ns.morning_wake_target,
-            "morning_wake_time": (
-                f"{ns.morning_wake_hour:02d}:{ns.morning_wake_minute:02d}"
-            ),
+            "morning_wake_time": f"{wake_hour:02d}:{wake_minute:02d}",
             "morning_lead_minutes": ns.last_morning_lead_minutes,
         }
 
